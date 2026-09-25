@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+*.bak
+*.json
+!*.example.json
+config.inc.sh
+.pytest_cache/
+.coverage

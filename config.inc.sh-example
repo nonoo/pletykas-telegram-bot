@@ -1,0 +1,30 @@
+# Telegram Bot Token from @BotFather
+BOT_TOKEN=""
+# Authorized Telegram Group Chat ID (e.g. -1001234567890)
+GROUP_CHAT_ID=""
+# Authorized Admin User IDs, comma-separated (e.g. "12345678,98765432")
+ADMIN_USERIDS=""
+
+# Primary Conversational Model
+MODEL_NAME="deepseek-flash"
+MODEL_API_KEY=""
+MODEL_API_BASE="https://api.deepseek.com"
+# Thinking level (e.g. minimal, low, medium, high, 0; empty instructs model not to think)
+MODEL_THINKING_LEVEL=""
+
+# Large Multimodal Model for vision/images
+MODEL_LARGE_NAME="gemini-flash-latest"
+MODEL_LARGE_API_KEY=""
+MODEL_LARGE_API_BASE="https://generativelanguage.googleapis.com/v1beta/openai/"
+MODEL_LARGE_THINKING_LEVEL=""
+
+# Image Generation/Editing Model
+MODEL_IMAGE_NAME="gemini-3.1-flash-lite-image"
+MODEL_IMAGE_API_KEY=""
+MODEL_IMAGE_API_BASE=""
+MODEL_IMAGE_SIZE="1K"
+MODEL_IMAGE_THINKING_LEVEL=""
+
+# State and Memory File Paths
+STATE_FILE="pletykas-state.json"
+MEMORY_FILE="pletykas-memory.json"

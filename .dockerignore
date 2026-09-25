@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+*.bak
+*.json
+config.inc.sh
+tests
+.pytest_cache
+.git
