@@ -341,9 +341,18 @@ class LLMClient:
             trigger_instruction = "You are directly addressed or replied to in the chat. Provide your in-character response to the group now."
         else:
             if talkativeness <= 2:
-                level_str = "Extremely quiet. Only enter if directly addressed or if a critical remark is required. Default heavily to <NO_REPLY> or <REACTION:emoji>."
+                level_str = (
+                    "EXTREMELY QUIET & PASSIVE. Your default output MUST BE <NO_REPLY> in 95% of cases. "
+                    "Do NOT output a text reply unless someone explicitly mentions you or asks a question directly targeted at you. "
+                    "Do NOT overuse emojis—react with <REACTION:emoji> VERY RARELY (less than 5% of messages). "
+                    "Never do both (text + reaction) when talkativeness is this low."
+                )
             elif talkativeness <= 4:
-                level_str = "Reserved. Only chime in occasionally when you have something genuinely witty or valuable. Favor <NO_REPLY>."
+                level_str = (
+                    "Reserved. Default heavily to <NO_REPLY> in most cases (~80%). "
+                    "Only chime in with text or an emoji reaction if a topic directly aligns with your core interests. "
+                    "Prefer <NO_REPLY> over reacting."
+                )
             elif talkativeness <= 6:
                 level_str = "Balanced (Default). Participate naturally when you have something relevant, witty, or helpful to say. Otherwise output <NO_REPLY>."
             elif talkativeness <= 8:
@@ -352,8 +361,11 @@ class LLMClient:
                 level_str = "Hyperactive & outspoken. Jump into almost every conversation with jokes, gossip, reactions, or banter; rarely stay silent."
 
             trigger_instruction = (
-                f"You are passively observing the ongoing group chat. Your talkativeness setting is {talkativeness}/10 ({level_str}).\n"
-                "Decide whether to reply, react with an emoji, do both, request an image generation, or remain silent."
+                f"You are passively observing the ongoing group chat. Your talkativeness setting is {talkativeness}/10.\n"
+                f"Behavior instructions: {level_str}\n\n"
+                "EVALUATION STEP:\n"
+                "1. Ask yourself: Was I directly mentioned or asked something? If NO, your response should almost certainly be <NO_REPLY>.\n"
+                "2. Choose EXACTLY ONE action: Output <NO_REPLY>, OR output a single <REACTION:emoji>, OR write a text reply. DO NOT combine text and reaction unless explicitly needed."
             )
 
         instructions = f"""[Instruction]
