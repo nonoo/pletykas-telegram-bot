@@ -79,8 +79,10 @@ EMOJI_REACTION_MAP = {
     "😠": "😡", "👿": "😈",
     "🤐": "😐", "😶": "😐", "😑": "😐",
     "😮": "😱", "😯": "😱", "😲": "😱",
+    "😏": "😈", "😉": "😘", "😜": "🤪", "😝": "🤪", "😋": "😍", "🤤": "😍",
+    "🤭": "🙈", "🙄": "🤨", "😒": "🤨", "😬": "🥴", "🫠": "🥴", "🥳": "🎉",
+    "🧐": "🤔", "💪": "🔥",
 }
-
 def split_into_html_pre_chunks(raw_text: str, header: str = "", max_escaped_len: int = 3500) -> List[str]:
     """Splits raw text into chunks safely wrapped in <pre> tags without exceeding Telegram's 4096-char limit."""
     lines = raw_text.splitlines(keepends=True)

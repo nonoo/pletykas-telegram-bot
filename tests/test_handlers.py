@@ -473,7 +473,9 @@ def test_resolve_reaction_emoji():
     assert BotHandlers.resolve_reaction_emoji("❤️") == "❤"
     assert BotHandlers.resolve_reaction_emoji("🥺") == "😢"
     assert BotHandlers.resolve_reaction_emoji("💀") == "👻"
-
+    assert BotHandlers.resolve_reaction_emoji("😏") == "😈"
+    assert BotHandlers.resolve_reaction_emoji("😉") == "😘"
+    assert BotHandlers.resolve_reaction_emoji("🙄") == "🤨"
     # Unsupported emoji
     assert BotHandlers.resolve_reaction_emoji("🚀") is None
 
