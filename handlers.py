@@ -209,12 +209,12 @@ class BotHandlers:
     # --- Spontaneous Messages & Inactivity Timer ---
 
     def schedule_spontaneous_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Schedules spontaneous revival message at a random interval between min_hours and max_hours."""
         if not self.state.is_spontaneous_enabled():
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
                     job.schedule_removal()
             self._next_spontaneous_time = None
+            self.state.set_spontaneous_next_fire_time(None)
             return
 
         if not context.job_queue:
@@ -234,8 +234,20 @@ class BotHandlers:
         if max_hours < min_hours:
             max_hours = min_hours
 
-        delay_sec = random.uniform(min_hours * 3600.0, max_hours * 3600.0)
-        self._next_spontaneous_time = datetime.now(self.state.get_tzinfo()) + timedelta(seconds=delay_sec)
+        now = datetime.now(self.state.get_tzinfo())
+        persisted_dt = self.state.get_spontaneous_next_fire_time()
+
+        if persisted_dt and persisted_dt > now:
+            delay_sec = (persisted_dt - now).total_seconds()
+            target_dt = persisted_dt
+            logger.info("Resuming scheduled spontaneous revival in %.2f hours (%.0f seconds)", delay_sec / 3600.0, delay_sec)
+        else:
+            delay_sec = random.uniform(min_hours * 3600.0, max_hours * 3600.0)
+            target_dt = now + timedelta(seconds=delay_sec)
+            self.state.set_spontaneous_next_fire_time(target_dt)
+            logger.info("Scheduled new spontaneous revival in %.2f hours (%.0f seconds)", delay_sec / 3600.0, delay_sec)
+
+        self._next_spontaneous_time = target_dt
 
         context.job_queue.run_once(
             self._spontaneous_callback,
@@ -243,7 +255,6 @@ class BotHandlers:
             name="spontaneous_revival",
             data={"group_chat_id": self.params.group_chat_id},
         )
-        logger.info("Scheduled spontaneous revival in %.2f hours (%.0f seconds)", delay_sec / 3600.0, delay_sec)
     def get_next_spontaneous_time(self, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[datetime]:
         """Returns the datetime of the next scheduled spontaneous revival message, if any."""
         if not self.state.is_spontaneous_enabled():
@@ -264,10 +275,12 @@ class BotHandlers:
         """Triggered periodically at random intervals to post spontaneous messages."""
         if self.state.is_sleeping():
             logger.info("Spontaneous trigger fired during sleep hours; skipping and rescheduling.")
+            self.state.set_spontaneous_next_fire_time(None)
             self.schedule_spontaneous_job(context)
             return
 
         await self.trigger_spontaneous_message(context)
+        self.state.set_spontaneous_next_fire_time(None)
         self.schedule_spontaneous_job(context)
 
     async def trigger_spontaneous_message(self, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, str]:
@@ -1269,11 +1282,12 @@ class BotHandlers:
                 for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
                     job.schedule_removal()
             self._next_spontaneous_time = None
+            self.state.set_spontaneous_next_fire_time(None)
             await update.effective_message.reply_text("✅ Spontaneous revival messages turned <b>OFF</b>.", parse_mode=ParseMode.HTML)
         elif mode == "on":
             self.state.set_spontaneous_settings(enabled=True)
+            self.state.set_spontaneous_next_fire_time(None)
             self.schedule_spontaneous_job(context)
-            spont = self.state.get_spontaneous_settings()
             min_h = spont.get("min_hours", 2.0)
             max_h = spont.get("max_hours", 4.0)
             await update.effective_message.reply_text(
@@ -1298,6 +1312,7 @@ class BotHandlers:
 
         self.state.set_spontaneous_interval(min_hours, max_hours)
         if self.state.is_spontaneous_enabled():
+            self.state.set_spontaneous_next_fire_time(None)
             self.schedule_spontaneous_job(context)
         await update.effective_message.reply_text(
             f"✅ Spontaneous message interval updated: <b>{min_hours:g} - {max_hours:g} hours</b>.",
@@ -1341,6 +1356,9 @@ class BotHandlers:
         status_msg = await update.effective_message.reply_text("⏳ Generating spontaneous message for the group...")
         success, detail = await self.trigger_spontaneous_message(context)
         if success:
+            if self.state.is_spontaneous_enabled():
+                self.state.set_spontaneous_next_fire_time(None)
+                self.schedule_spontaneous_job(context)
             await status_msg.edit_text(
                 f"✅ <b>Spontaneous message dispatched to group:</b>\n\n{html.escape(detail)}",
                 parse_mode=ParseMode.HTML,

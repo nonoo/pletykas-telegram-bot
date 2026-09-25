@@ -246,3 +246,32 @@ def test_state_spontaneous_settings():
         assert sm2.is_spontaneous_enabled() is False
         assert sm2.get_spontaneous_settings()["min_hours"] == 3.5
         assert sm2.get_spontaneous_settings()["max_hours"] == 6.0
+
+def test_state_spontaneous_next_fire_time():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        # Default is None
+        assert sm.get_spontaneous_next_fire_time() is None
+
+        # Persist a datetime
+        dt = datetime(2026, 9, 25, 20, 15, 30, tzinfo=sm.get_tzinfo())
+        sm.set_spontaneous_next_fire_time(dt)
+        assert sm.get_spontaneous_next_fire_time() == dt
+
+        # Reload from disk and verify persistence across restarts
+        sm2 = StateManager(sf)
+        sm2.load()
+        restored = sm2.get_spontaneous_next_fire_time()
+        assert restored is not None
+        assert restored == dt
+
+        # Clear it
+        sm2.set_spontaneous_next_fire_time(None)
+        assert sm2.get_spontaneous_next_fire_time() is None
+
+        sm3 = StateManager(sf)
+        sm3.load()
+        assert sm3.get_spontaneous_next_fire_time() is None

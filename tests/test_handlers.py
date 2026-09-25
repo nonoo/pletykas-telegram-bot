@@ -602,6 +602,51 @@ async def test_status_cmd_shows_next_spontaneous_firing_timestamp(test_setup):
     await handlers.cmd_status(mock_update, mock_context)
     status_reply = mock_msg.reply_text.call_args[0][0]
     assert "• Spontaneous Messages: <code>ON (every 2-4h, random) (Next: 2026-09-25 18:30:00)</code>" in status_reply
+
+@pytest.mark.asyncio
+async def test_spontaneous_job_persists_and_resumes_across_restarts(test_setup):
+    from datetime import timedelta
+    p, s, m, llm, handlers = test_setup
+    mock_context = MagicMock()
+    mock_context.job_queue.get_jobs_by_name.return_value = []
+    mock_context.job_queue.run_once = MagicMock()
+
+    s.set_spontaneous_settings(enabled=True, min_hours=2.0, max_hours=4.0)
+
+    # 1. Initial scheduling persists next_fire_time to state
+    handlers.schedule_spontaneous_job(mock_context)
+    saved_fire_time = s.get_spontaneous_next_fire_time()
+    assert saved_fire_time is not None
+    assert saved_fire_time > datetime.now(s.get_tzinfo())
+
+    # 2. Simulate restart: future timestamp is preserved, delay is remaining seconds
+    future_time = datetime.now(s.get_tzinfo()) + timedelta(seconds=1800)
+    s.set_spontaneous_next_fire_time(future_time)
+    mock_context.job_queue.run_once.reset_mock()
+
+    handlers.schedule_spontaneous_job(mock_context)
+    mock_context.job_queue.run_once.assert_called_once()
+    when_arg = mock_context.job_queue.run_once.call_args[1]["when"]
+    # when_arg should be approximately 1800 seconds
+    assert 1790 <= when_arg <= 1805
+    # The persisted fire time should NOT have been overwritten with a new random interval
+    assert s.get_spontaneous_next_fire_time() == future_time
+
+    # 3. Simulate restart with past timestamp: schedules a new one
+    past_time = datetime.now(s.get_tzinfo()) - timedelta(seconds=600)
+    s.set_spontaneous_next_fire_time(past_time)
+    mock_context.job_queue.run_once.reset_mock()
+
+    handlers.schedule_spontaneous_job(mock_context)
+    mock_context.job_queue.run_once.assert_called_once()
+    when_arg = mock_context.job_queue.run_once.call_args[1]["when"]
+    # New random interval between 2h and 4h (7200s to 14400s)
+    assert 7200 <= when_arg <= 14400
+    # A new future fire time is persisted
+    new_fire_time = s.get_spontaneous_next_fire_time()
+    assert new_fire_time is not None
+    assert new_fire_time > datetime.now(s.get_tzinfo())
+    assert new_fire_time != past_time
 @pytest.mark.asyncio
 async def test_photo_reply_and_reference_triggers_vision(test_setup):
     p, s, m, llm, handlers = test_setup

@@ -47,6 +47,7 @@ class StateManager:
                 "enabled": True,
                 "min_hours": 2.0,
                 "max_hours": 4.0,
+                "next_fire_time": None,
             },
             "chat_history": [],
             "memory_history": [],
@@ -80,6 +81,7 @@ class StateManager:
                             "enabled": True,
                             "min_hours": 2.0,
                             "max_hours": 4.0,
+                            "next_fire_time": None,
                         }
                     else:
                         if "enabled" not in spont:
@@ -88,6 +90,8 @@ class StateManager:
                             spont["min_hours"] = 2.0
                         if "max_hours" not in spont:
                             spont["max_hours"] = 4.0
+                        if "next_fire_time" not in spont:
+                            spont["next_fire_time"] = None
                     if not isinstance(loaded.get("chat_history"), list):
                         loaded["chat_history"] = []
                     if not isinstance(loaded.get("memory_history"), list):
@@ -278,11 +282,12 @@ class StateManager:
     def get_spontaneous_settings(self) -> Dict[str, Any]:
         spont = self.data.get("spontaneous_messages")
         if not isinstance(spont, dict):
-            return {"enabled": False, "min_hours": 2.0, "max_hours": 4.0}
+            return {"enabled": False, "min_hours": 2.0, "max_hours": 4.0, "next_fire_time": None}
         return {
             "enabled": bool(spont.get("enabled", False)),
             "min_hours": float(spont.get("min_hours", 2.0)),
             "max_hours": float(spont.get("max_hours", 4.0)),
+            "next_fire_time": spont.get("next_fire_time"),
         }
 
     def is_spontaneous_enabled(self) -> bool:
@@ -293,6 +298,7 @@ class StateManager:
         enabled: Optional[bool] = None,
         min_hours: Optional[float] = None,
         max_hours: Optional[float] = None,
+        next_fire_time: Optional[Any] = None,
     ) -> None:
         spont = self.data.setdefault("spontaneous_messages", {})
         if enabled is not None:
@@ -301,6 +307,46 @@ class StateManager:
             spont["min_hours"] = float(min_hours)
         if max_hours is not None:
             spont["max_hours"] = float(max_hours)
+        if next_fire_time is not None:
+            spont["next_fire_time"] = next_fire_time
+        self.save()
+
+    def get_spontaneous_next_fire_time(self) -> Optional[datetime]:
+        """Returns the persisted next spontaneous message fire time as a localized datetime, or None."""
+        spont = self.data.get("spontaneous_messages")
+        if not isinstance(spont, dict):
+            return None
+        val = spont.get("next_fire_time")
+        if not val:
+            return None
+        tz = self.get_tzinfo()
+        if isinstance(val, (int, float)):
+            try:
+                return datetime.fromtimestamp(val, tz=timezone.utc).astimezone(tz)
+            except Exception:
+                return None
+        if isinstance(val, str):
+            try:
+                dt = datetime.fromisoformat(val)
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=tz)
+                return dt.astimezone(tz)
+            except Exception:
+                return None
+        return None
+
+    def set_spontaneous_next_fire_time(self, dt: Optional[datetime]) -> None:
+        """Persists the next spontaneous message fire time into state."""
+        spont = self.data.setdefault("spontaneous_messages", {})
+        if dt is None:
+            spont["next_fire_time"] = None
+        else:
+            tz = self.get_tzinfo()
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=tz)
+            else:
+                dt = dt.astimezone(tz)
+            spont["next_fire_time"] = dt.isoformat()
         self.save()
 
     def set_spontaneous_interval(self, min_hours: float, max_hours: float) -> None:
@@ -308,7 +354,6 @@ class StateManager:
         spont["min_hours"] = float(min_hours)
         spont["max_hours"] = float(max_hours)
         self.save()
-
     # Debug Mode
     def is_debug_mode(self) -> bool:
         return bool(self.data.get("debug", False))
