@@ -77,7 +77,9 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
     "sleep_end": "07:00"
   },
   "spontaneous_messages": {
-    "enabled": false
+    "enabled": false,
+    "min_hours": 2.0,
+    "max_hours": 4.0
   },
   "chat_history": [],
   "memory_history": [],

@@ -41,6 +41,10 @@ def test_params_cli_parsing():
     assert p.is_admin(999) is False
     assert p.is_group_authorized(-100987654321) is True
     assert p.is_group_authorized(-100000000000) is False
+    # Matches when configured without -100 prefix
+    p.group_chat_id = -1941958689
+    assert p.is_group_authorized(-1001941958689) is True
+    assert p.is_group_authorized(-100999999999) is False
 
 
 def test_params_env_parsing(monkeypatch):

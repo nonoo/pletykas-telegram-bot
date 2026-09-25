@@ -88,7 +88,8 @@ podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-tel
 | `/language` | `[lang]` | Views or updates active conversation language (e.g. `English`, `Hungarian`) |
 | `/timezone` | `[tz]` | Views or sets the IANA timezone (e.g. `Europe/Budapest`) |
 | `/sleep` | `[on\|off] [start] [end]` | Configures quiet hours (e.g. `/sleep on 23:00 07:00`) |
-| `/spontaneous` | `[on\|off\|now]` | Enables, disables, or views morning chat revival schedule |
+| `/spontaneous` | `[on\|off\|now]` | Enables, disables, or views periodic spontaneous messages |
+| `/spontaneous_interval` | `[min] [max]` | Views or adjusts the random timer interval in hours (default: `2 4`) |
 | `/spontaneous_now` | — | Instantly generates and dispatches a spontaneous message or poll to the group |
 | `/prompt` | `[load\|reset]` | Uploads system prompt file as-is, expects a text file upload to replace prompt, or resets to default |
 | `/grounding` | `[on\|off]` | Toggles Google Search grounding tool |

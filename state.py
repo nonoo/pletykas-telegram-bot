@@ -45,6 +45,8 @@ class StateManager:
             },
             "spontaneous_messages": {
                 "enabled": True,
+                "min_hours": 2.0,
+                "max_hours": 4.0,
             },
             "chat_history": [],
             "memory_history": [],
@@ -72,9 +74,20 @@ class StateManager:
                             loaded[k] = v
                     loaded.pop("llm_usage", None)
                     loaded.pop("stats", None)
-                    if isinstance(loaded.get("spontaneous_messages"), dict):
-                        loaded["spontaneous_messages"].pop("min_hours", None)
-                        loaded["spontaneous_messages"].pop("max_hours", None)
+                    spont = loaded.get("spontaneous_messages")
+                    if not isinstance(spont, dict):
+                        loaded["spontaneous_messages"] = {
+                            "enabled": True,
+                            "min_hours": 2.0,
+                            "max_hours": 4.0,
+                        }
+                    else:
+                        if "enabled" not in spont:
+                            spont["enabled"] = True
+                        if "min_hours" not in spont:
+                            spont["min_hours"] = 2.0
+                        if "max_hours" not in spont:
+                            spont["max_hours"] = 4.0
                     if not isinstance(loaded.get("chat_history"), list):
                         loaded["chat_history"] = []
                     if not isinstance(loaded.get("memory_history"), list):
@@ -263,13 +276,37 @@ class StateManager:
 
     # Spontaneous Messages
     def get_spontaneous_settings(self) -> Dict[str, Any]:
-        return self.data.get("spontaneous_messages", {"enabled": False})
+        spont = self.data.get("spontaneous_messages")
+        if not isinstance(spont, dict):
+            return {"enabled": False, "min_hours": 2.0, "max_hours": 4.0}
+        return {
+            "enabled": bool(spont.get("enabled", False)),
+            "min_hours": float(spont.get("min_hours", 2.0)),
+            "max_hours": float(spont.get("max_hours", 4.0)),
+        }
 
     def is_spontaneous_enabled(self) -> bool:
         return bool(self.get_spontaneous_settings().get("enabled", False))
 
-    def set_spontaneous_settings(self, enabled: bool) -> None:
-        self.data["spontaneous_messages"] = {"enabled": bool(enabled)}
+    def set_spontaneous_settings(
+        self,
+        enabled: Optional[bool] = None,
+        min_hours: Optional[float] = None,
+        max_hours: Optional[float] = None,
+    ) -> None:
+        spont = self.data.setdefault("spontaneous_messages", {})
+        if enabled is not None:
+            spont["enabled"] = bool(enabled)
+        if min_hours is not None:
+            spont["min_hours"] = float(min_hours)
+        if max_hours is not None:
+            spont["max_hours"] = float(max_hours)
+        self.save()
+
+    def set_spontaneous_interval(self, min_hours: float, max_hours: float) -> None:
+        spont = self.data.setdefault("spontaneous_messages", {})
+        spont["min_hours"] = float(min_hours)
+        spont["max_hours"] = float(max_hours)
         self.save()
 
     # Debug Mode

@@ -221,3 +221,28 @@ def test_state_image_interpretation_large_model():
         sm2.set_image_interpretation_large_model(True)
         assert sm2.is_image_interpretation_large_model() is True
 
+
+def test_state_spontaneous_settings():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        spont = sm.get_spontaneous_settings()
+        assert spont["enabled"] is True
+        assert spont["min_hours"] == 2.0
+        assert spont["max_hours"] == 4.0
+
+        sm.set_spontaneous_interval(3.5, 6.0)
+        assert sm.get_spontaneous_settings()["min_hours"] == 3.5
+        assert sm.get_spontaneous_settings()["max_hours"] == 6.0
+
+        sm.set_spontaneous_settings(enabled=False)
+        assert sm.is_spontaneous_enabled() is False
+
+        # Reload from disk
+        sm2 = StateManager(sf)
+        sm2.load()
+        assert sm2.is_spontaneous_enabled() is False
+        assert sm2.get_spontaneous_settings()["min_hours"] == 3.5
+        assert sm2.get_spontaneous_settings()["max_hours"] == 6.0

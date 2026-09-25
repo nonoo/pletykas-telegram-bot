@@ -43,7 +43,8 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 /language [lang] - View or change bot communication language (e.g. English, Hungarian)
 /timezone [tz] - View or adjust timezone (e.g. Europe/Budapest)
 /sleep [on|off] [start] [end] - View or configure night quiet hours (e.g. /sleep on 23:00 07:00)
-/spontaneous [on|off] - View or toggle morning chat revival when sleep ends
+/spontaneous [on|off] - View or toggle periodic spontaneous messages
+/spontaneous_interval [min] [max] - Adjust random timer interval in hours (e.g. /spontaneous_interval 2 4)
 /spontaneous_now - Instantly trigger a spontaneous message or poll to the group
 
 <b>Prompt, Grounding & Vision</b>
@@ -195,12 +196,17 @@ class BotHandlers:
                     logger.error("Failed to leave unauthorized chat %d: %s", chat.id, e)
                 return False
 
+            # Auto-normalize if chat ID has -100 prefix but was configured without it
+            if self.params.group_chat_id != chat.id:
+                logger.info("Normalizing group_chat_id from %d to full Telegram supergroup ID %d", self.params.group_chat_id, chat.id)
+                self.params.group_chat_id = chat.id
+                self.state.set_group_chat_id(chat.id)
         return True
 
     # --- Spontaneous Messages & Inactivity Timer ---
 
     def schedule_spontaneous_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Schedules the chat revival message to trigger when sleep ends (wake-up time)."""
+        """Schedules spontaneous revival message at a random interval between min_hours and max_hours."""
         if not self.state.is_spontaneous_enabled():
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
@@ -215,19 +221,15 @@ class BotHandlers:
         for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
             job.schedule_removal()
 
-        sched = self.state.get_sleep_schedule()
-        end_str = sched.get("sleep_end", "07:00")
-        try:
-            h, m = [int(p) for p in end_str.split(":")]
-        except Exception:
-            h, m = 7, 0
+        spont = self.state.get_spontaneous_settings()
+        min_hours = float(spont.get("min_hours", 2.0))
+        max_hours = float(spont.get("max_hours", 4.0))
+        if min_hours <= 0:
+            min_hours = 2.0
+        if max_hours < min_hours:
+            max_hours = min_hours
 
-        now = self.state.get_current_time()
-        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-
-        delay_sec = max(1.0, (target - now).total_seconds())
+        delay_sec = random.uniform(min_hours * 3600.0, max_hours * 3600.0)
 
         context.job_queue.run_once(
             self._spontaneous_callback,
@@ -235,11 +237,11 @@ class BotHandlers:
             name="spontaneous_revival",
             data={"group_chat_id": self.params.group_chat_id},
         )
-        logger.info("Scheduled spontaneous revival at %s (in %.2f hours)", target.strftime("%Y-%m-%d %H:%M:%S"), delay_sec / 3600.0)
+        logger.info("Scheduled spontaneous revival in %.2f hours (%.0f seconds)", delay_sec / 3600.0, delay_sec)
     async def _spontaneous_callback(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Triggered when chat has been inactive for the configured duration."""
+        """Triggered periodically at random intervals to post spontaneous messages."""
         if self.state.is_sleeping():
-            logger.info("Spontaneous trigger fired during sleep hours. Rescheduling...")
+            logger.info("Spontaneous trigger fired during sleep hours; skipping and rescheduling.")
             self.schedule_spontaneous_job(context)
             return
 
@@ -1003,7 +1005,9 @@ class BotHandlers:
         spont = self.state.get_spontaneous_settings()
         is_sleep = "Yes" if self.state.is_sleeping() else "No"
         sleep_status = f"{'ON' if sched.get('enabled') else 'OFF'} ({sched.get('sleep_start')} - {sched.get('sleep_end')}) (Sleeping: {is_sleep})"
-        spont_status = f"{'ON' if spont.get('enabled') else 'OFF'} (at wake-up: {sched.get('sleep_end', '07:00')})"
+        min_h = spont.get("min_hours", 2.0)
+        max_h = spont.get("max_hours", 4.0)
+        spont_status = f"{'ON' if spont.get('enabled') else 'OFF'} (every {min_h:g}-{max_h:g}h, random)"
         grounding_status = "ON" if self.state.is_search_grounding_active() else "OFF"
         debug_status = "ON" if self.state.is_debug_mode() else "OFF"
         nicks = self.state.get_nicknames()
@@ -1189,20 +1193,46 @@ class BotHandlers:
             return
 
         args = context.args or []
+        spont = self.state.get_spontaneous_settings()
+        min_h = spont.get("min_hours", 2.0)
+        max_h = spont.get("max_hours", 4.0)
         if not args:
-            spont = self.state.get_spontaneous_settings()
-            sched = self.state.get_sleep_schedule()
             status = "ON" if spont.get("enabled") else "OFF"
             await update.effective_message.reply_text(
-                f"🎲 Spontaneous revival messages: <b>{status}</b> (triggers at wake-up: {sched.get('sleep_end', '07:00')})",
+                f"🎲 Spontaneous revival messages: <b>{status}</b>\n"
+                f"• Interval: <b>{min_h:g} - {max_h:g} hours</b> (random)\n\n"
+                f"Usage:\n"
+                f"• <code>/spontaneous on</code>\n"
+                f"• <code>/spontaneous off</code>\n"
+                f"• <code>/spontaneous now</code>\n"
+                f"• <code>/spontaneous_interval &lt;min_hours&gt; &lt;max_hours&gt;</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
+
+        # Direct numeric shortcut: e.g. /spontaneous 2 4
+        if len(args) == 2:
+            try:
+                n_min = float(args[0])
+                n_max = float(args[1])
+                await self._handle_set_spontaneous_interval(update, context, n_min, n_max)
+                return
+            except ValueError:
+                pass
 
         mode = args[0].lower()
         if mode in ("now", "trigger", "send"):
             await self.cmd_spontaneous_now(update, context)
             return
+        elif mode in ("interval", "range", "timer") and len(args) >= 3:
+            try:
+                n_min = float(args[1])
+                n_max = float(args[2])
+                await self._handle_set_spontaneous_interval(update, context, n_min, n_max)
+                return
+            except ValueError:
+                await update.effective_message.reply_text("❌ Please specify valid numbers for min and max hours.", parse_mode=ParseMode.HTML)
+                return
         elif mode == "off":
             self.state.set_spontaneous_settings(enabled=False)
             if context.job_queue:
@@ -1212,13 +1242,64 @@ class BotHandlers:
         elif mode == "on":
             self.state.set_spontaneous_settings(enabled=True)
             self.schedule_spontaneous_job(context)
-            sched = self.state.get_sleep_schedule()
+            spont = self.state.get_spontaneous_settings()
+            min_h = spont.get("min_hours", 2.0)
+            max_h = spont.get("max_hours", 4.0)
             await update.effective_message.reply_text(
-                f"✅ Spontaneous revival enabled (triggers at wake-up: <b>{sched.get('sleep_end', '07:00')}</b>).",
+                f"✅ Spontaneous revival enabled (every <b>{min_h:g} - {max_h:g} hours</b>, random).",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await update.effective_message.reply_text("❌ Usage: <code>/spontaneous [on|off|now]</code>", parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/spontaneous [on|off|now]</code> or <code>/spontaneous_interval &lt;min_hours&gt; &lt;max_hours&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+    async def _handle_set_spontaneous_interval(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, min_hours: float, max_hours: float
+    ) -> None:
+        if min_hours <= 0 or max_hours <= 0:
+            await update.effective_message.reply_text("❌ Interval values must be positive numbers greater than 0.", parse_mode=ParseMode.HTML)
+            return
+        if min_hours > max_hours:
+            await update.effective_message.reply_text("❌ Minimum hours cannot be greater than maximum hours.", parse_mode=ParseMode.HTML)
+            return
+
+        self.state.set_spontaneous_interval(min_hours, max_hours)
+        if self.state.is_spontaneous_enabled():
+            self.schedule_spontaneous_job(context)
+        await update.effective_message.reply_text(
+            f"✅ Spontaneous message interval updated: <b>{min_hours:g} - {max_hours:g} hours</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def cmd_spontaneous_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update.effective_user.id if update.effective_user else None):
+            return
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+
+        args = context.args or []
+        spont = self.state.get_spontaneous_settings()
+        min_h = spont.get("min_hours", 2.0)
+        max_h = spont.get("max_hours", 4.0)
+        if len(args) < 2:
+            await update.effective_message.reply_text(
+                f"⚙️ Current spontaneous interval: <b>{min_h:g} to {max_h:g} hours</b> (random)\n\n"
+                f"Usage: <code>/spontaneous_interval &lt;min_hours&gt; &lt;max_hours&gt;</code>\n"
+                f"Example: <code>/spontaneous_interval 2 4</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        try:
+            n_min = float(args[0])
+            n_max = float(args[1])
+        except ValueError:
+            await update.effective_message.reply_text("❌ Please specify valid numbers for min and max hours (e.g. <code>/spontaneous_interval 2 4</code>).", parse_mode=ParseMode.HTML)
+            return
+
+        await self._handle_set_spontaneous_interval(update, context, n_min, n_max)
 
     async def cmd_spontaneous_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_admin(update.effective_user.id if update.effective_user else None):
@@ -1568,6 +1649,7 @@ class BotHandlers:
         application.add_handler(CommandHandler("sleep", self.cmd_sleep))
         application.add_handler(CommandHandler("spontaneous", self.cmd_spontaneous))
         application.add_handler(CommandHandler(["spontaneous_now", "spontaneousnow"], self.cmd_spontaneous_now))
+        application.add_handler(CommandHandler(["spontaneous_interval", "spontaneousinterval"], self.cmd_spontaneous_interval))
         application.add_handler(CommandHandler("prompt", self.cmd_prompt))
         application.add_handler(CommandHandler("grounding", self.cmd_grounding))
         application.add_handler(CommandHandler("debug", self.cmd_debug))

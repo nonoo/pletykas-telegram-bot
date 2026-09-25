@@ -108,6 +108,13 @@ def main():
 
     state = StateManager(params.state_file, group_chat_id=params.group_chat_id)
     state.load()
+
+    # Synchronize group_chat_id between config params and state
+    state_chat_id = state.get_group_chat_id()
+    if state_chat_id != 0 and params.is_group_authorized(state_chat_id):
+        params.group_chat_id = state_chat_id
+    elif params.group_chat_id != 0:
+        state.set_group_chat_id(params.group_chat_id)
     if state.is_debug_mode():
         logging.getLogger().setLevel(logging.DEBUG)
         logger.info("Debug mode is active (state.debug=True).")

@@ -86,6 +86,30 @@ async def test_supergroup_migration(test_setup):
     assert s.get_group_chat_id() == -100555666777
 
 
+@pytest.mark.asyncio
+async def test_supergroup_id_auto_normalization(test_setup):
+    p, s, m, llm, handlers = test_setup
+    p.group_chat_id = -1941958689
+    s.set_group_chat_id(-1941958689)
+
+    mock_chat = MagicMock()
+    mock_chat.id = -1001941958689
+    mock_chat.type = "supergroup"
+    mock_chat.title = "Dirr"
+
+    mock_update = MagicMock()
+    mock_update.effective_chat = mock_chat
+    mock_update.effective_message = MagicMock(migrate_to_chat_id=None)
+
+    mock_context = MagicMock()
+    mock_context.bot = MagicMock()
+
+    allowed = await handlers._check_group_authorization(mock_update, mock_context)
+    assert allowed is True
+    assert p.group_chat_id == -1001941958689
+    assert s.get_group_chat_id() == -1001941958689
+    mock_context.bot.leave_chat.assert_not_called()
+
 def test_is_direct_trigger(test_setup):
     p, s, m, llm, handlers = test_setup
 
@@ -224,6 +248,18 @@ async def test_admin_commands_private_chat(test_setup):
     mock_context.args = ["off"]
     await handlers.cmd_spontaneous(mock_update, mock_context)
     assert s.is_spontaneous_enabled() is False
+
+    # /spontaneous_interval
+    mock_context.args = ["3", "5"]
+    await handlers.cmd_spontaneous_interval(mock_update, mock_context)
+    assert s.get_spontaneous_settings()["min_hours"] == 3.0
+    assert s.get_spontaneous_settings()["max_hours"] == 5.0
+
+    # /spontaneous shortcut with numbers: /spontaneous 1.5 3.5
+    mock_context.args = ["1.5", "3.5"]
+    await handlers.cmd_spontaneous(mock_update, mock_context)
+    assert s.get_spontaneous_settings()["min_hours"] == 1.5
+    assert s.get_spontaneous_settings()["max_hours"] == 3.5
 
     # /spontaneous_now (text message)
     with patch.object(llm, "generate_spontaneous_message", AsyncMock(return_value="Hey everyone, did you know that honey never spoils?")):
@@ -486,6 +522,37 @@ async def test_trigger_spontaneous_message_errors(test_setup):
         ok, err = await handlers.trigger_spontaneous_message(mock_context)
         assert ok is False
         assert "API timeout" in err
+
+@pytest.mark.asyncio
+async def test_spontaneous_random_timer_and_sleep_callback(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_context = MagicMock()
+    mock_context.job_queue.get_jobs_by_name.return_value = []
+    mock_context.job_queue.run_once = MagicMock()
+
+    s.set_spontaneous_settings(enabled=True, min_hours=2.0, max_hours=4.0)
+
+    # 1. schedule_spontaneous_job schedules within 2 to 4 hours (7200s to 14400s)
+    handlers.schedule_spontaneous_job(mock_context)
+    mock_context.job_queue.run_once.assert_called_once()
+    when_arg = mock_context.job_queue.run_once.call_args[1]["when"]
+    assert 7200.0 <= when_arg <= 14400.0
+
+    # 2. _spontaneous_callback during sleep: does not trigger message, reschedules timer
+    with patch.object(s, "is_sleeping", return_value=True):
+        with patch.object(handlers, "trigger_spontaneous_message", AsyncMock()) as mock_trigger:
+            with patch.object(handlers, "schedule_spontaneous_job") as mock_resched:
+                await handlers._spontaneous_callback(mock_context)
+                mock_trigger.assert_not_called()
+                mock_resched.assert_called_once_with(mock_context)
+
+    # 3. _spontaneous_callback while awake: triggers message and reschedules timer
+    with patch.object(s, "is_sleeping", return_value=False):
+        with patch.object(handlers, "trigger_spontaneous_message", AsyncMock()) as mock_trigger:
+            with patch.object(handlers, "schedule_spontaneous_job") as mock_resched:
+                await handlers._spontaneous_callback(mock_context)
+                mock_trigger.assert_called_once_with(mock_context)
+                mock_resched.assert_called_once_with(mock_context)
 @pytest.mark.asyncio
 async def test_photo_reply_and_reference_triggers_vision(test_setup):
     p, s, m, llm, handlers = test_setup

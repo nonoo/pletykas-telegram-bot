@@ -233,4 +233,12 @@ class Params:
         return user_id in self.admin_user_ids
 
     def is_group_authorized(self, chat_id: int) -> bool:
-        return chat_id == self.group_chat_id
+        if chat_id == self.group_chat_id:
+            return True
+        # Support Telegram supergroup/channel IDs where the user configured the ID
+        # without the Telegram -100 prefix (e.g. -1941958689 vs -1001941958689)
+        s_target = str(abs(self.group_chat_id))
+        s_chat = str(abs(chat_id))
+        if s_chat.startswith("100") and s_chat[3:] == s_target:
+            return True
+        return False
