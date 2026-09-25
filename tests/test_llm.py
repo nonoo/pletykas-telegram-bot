@@ -313,7 +313,7 @@ async def test_describe_and_reply_image_large_model_default():
     client = LLMClient(p, s)
 
     with patch.object(client, "_call_vision_model", AsyncMock(return_value=("<IMAGE_DESCRIPTION>A cute puppy</IMAGE_DESCRIPTION>Look at this dog!", 50, 10))) as mock_vision:
-        text, reaction, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -346,7 +346,7 @@ async def test_describe_and_reply_image_small_model_when_disabled():
         return "<IMAGE_DESCRIPTION>Large model desc</IMAGE_DESCRIPTION>Large model text", 100, 20
 
     with patch.object(client, "_call_vision_model", AsyncMock(side_effect=mock_vision_call)):
-        text, reaction, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -378,7 +378,7 @@ async def test_describe_and_reply_image_small_model_fallback_to_large():
         return "<IMAGE_DESCRIPTION>High res details</IMAGE_DESCRIPTION>Identified with large model!", 100, 20
 
     with patch.object(client, "_call_vision_model", AsyncMock(side_effect=mock_vision_call)):
-        text, reaction, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -391,6 +391,47 @@ async def test_describe_and_reply_image_small_model_fallback_to_large():
         assert calls == ["small-model", "large-model"]
         assert text == "Identified with large model!"
         assert desc == "High res details"
+
+@pytest.mark.asyncio
+async def test_describe_and_reply_image_with_generate_image():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_large_name = "large-model"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    vision_resp = """<REACTION:😈>
+
+<GENERATE_IMAGE>
+Prompt: Close-up of smiling RoboCop with hair
+Caption: Here is your smiling RoboCop!
+Source: reply
+Mode: modify
+</GENERATE_IMAGE>
+
+<IMAGE_DESCRIPTION>
+Original RoboCop figure
+</IMAGE_DESCRIPTION>"""
+
+    with patch.object(client, "_call_vision_model", AsyncMock(return_value=(vision_resp, 100, 50))):
+        text, reaction, img_spec, desc = await client.describe_and_reply_image(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=True,
+            talkativeness=5,
+            image_bytes=b"fake-image-bytes",
+            caption="make him smile",
+        )
+        assert reaction == ("😈", None)
+        assert img_spec is not None
+        assert img_spec["prompt"] == "Close-up of smiling RoboCop with hair"
+        assert img_spec["caption"] == "Here is your smiling RoboCop!"
+        assert img_spec["mode"] == "modify"
+        assert img_spec["source"] == "reply"
+        assert desc == "Original RoboCop figure"
+        assert text is None  # Since all content was extracted into tags
 
 @pytest.mark.asyncio
 async def test_curate_memory_json_extraction():

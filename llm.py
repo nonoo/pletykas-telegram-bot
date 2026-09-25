@@ -576,8 +576,8 @@ Timezone: {timezone_str}
         talkativeness: int,
         image_bytes: bytes,
         caption: str,
-    ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], str]:
-        """Dispatches photo to Large Multimodal Model to generate a reply, reaction, and visual description."""
+    ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]], str]:
+        """Dispatches photo to Large Multimodal Model to generate a reply, reaction, image spec, and visual description."""
         current_time_str = self.state.get_current_time_str()
         timezone_str = self.state.get_timezone()
         instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
@@ -658,7 +658,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
 
         raw_trimmed = raw_response.strip()
         cleaned_text, image_description = self._extract_image_description(raw_trimmed)
-        cleaned_text, _ = self._extract_generate_image(cleaned_text)
+        cleaned_text, image_spec = self._extract_generate_image(cleaned_text)
         cleaned_text, reaction = self._extract_reaction(cleaned_text)
 
         if cleaned_text == "<NO_REPLY>" or not cleaned_text:
@@ -666,7 +666,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         else:
             text = cleaned_text
 
-        return text, reaction, image_description
+        return text, reaction, image_spec, image_description
 
     def _extract_image_from_interaction(self, interaction: Any) -> Optional[bytes]:
         """Extracts decoded image bytes from a Google Interactions API response."""

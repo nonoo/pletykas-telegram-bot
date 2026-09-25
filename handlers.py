@@ -584,7 +584,7 @@ class BotHandlers:
                 # Multimodal evaluation via Vision Model
                 photo_bytes = base64.b64decode(photo_entry["media_b64"])
                 user_caption = trigger_entry.get("text", "").replace("[Photo]", "").strip() if trigger_entry else ""
-                reply_text, reaction, img_desc = await self.llm.describe_and_reply_image(
+                reply_text, reaction, image_spec, img_desc = await self.llm.describe_and_reply_image(
                     system_prompt=sys_prompt,
                     memory_context=memory_ctx,
                     transcript=transcript,
@@ -651,15 +651,18 @@ class BotHandlers:
 
                 base_image_bytes = None
                 if mode == "modify" or source == "reply":
-                    # Search for source image in recent chat history
-                    for item in reversed(self.state.get_chat_history()):
-                        if (source == "reply" and item.get("media_type") == "photo") or (
-                            str(item.get("id")) == str(source) and item.get("media_type") == "photo"
-                        ):
-                            if item.get("media_b64"):
-                                base_image_bytes = base64.b64decode(item["media_b64"])
-                                break
-
+                    # If a photo_entry was already detected in current context, prioritize it
+                    if photo_entry and photo_entry.get("media_b64"):
+                        base_image_bytes = base64.b64decode(photo_entry["media_b64"])
+                    else:
+                        # Search for source image in recent chat history
+                        for item in reversed(self.state.get_chat_history()):
+                            if (source == "reply" and item.get("media_type") == "photo") or (
+                                str(item.get("id")) == str(source) and item.get("media_type") == "photo"
+                            ):
+                                if item.get("media_b64"):
+                                    base_image_bytes = base64.b64decode(item["media_b64"])
+                                    break
                 try:
                     logger.info(
                         "Generating/modifying image with model '%s' (mode=%s, source=%s, prompt=%s)",

@@ -588,7 +588,7 @@ async def test_photo_reply_and_reference_triggers_vision(test_setup):
     }
     s.append_chat_message(text_msg)
 
-    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=("Két cica van a képen!", None, "Két cica"))) as mock_vision:
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=("Két cica van a képen!", None, None, "Két cica"))) as mock_vision:
         await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=101)
         mock_vision.assert_awaited_once()
         kwargs = mock_vision.call_args.kwargs
@@ -596,6 +596,80 @@ async def test_photo_reply_and_reference_triggers_vision(test_setup):
         assert kwargs["caption"] == "szoval mi van a kepen?"
         mock_bot.send_message.assert_awaited()
         assert "Két cica van a képen!" in mock_bot.send_message.call_args.kwargs["text"]
+
+@pytest.mark.asyncio
+async def test_image_modify_via_multimodal_vision(test_setup):
+    import base64
+    from PIL import Image
+    import io
+    p, s, m, llm, handlers = test_setup
+
+    # Create valid dummy PNG image bytes
+    img = Image.new("RGB", (100, 100), color="blue")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    fake_img_bytes = buf.getvalue()
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.set_message_reaction = AsyncMock()
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=63614))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=63615))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    # 1. Historical photo message
+    photo_msg = {
+        "id": 63612,
+        "from_user_id": 133687316,
+        "from_user_name": "Norbert",
+        "text": "[Photo: RoboCop action figure]",
+        "media_type": "photo",
+        "media_b64": base64.b64encode(fake_img_bytes).decode("utf-8"),
+    }
+    s.append_chat_message(photo_msg)
+
+    # 2. User modification request
+    req_msg = {
+        "id": 63613,
+        "from_user_id": 133687316,
+        "from_user_name": "Norbert",
+        "text": "pletyi, szerkeszd a kepet, vigyorogjon a robocop es legyen haja",
+        "media_type": "none",
+    }
+    s.append_chat_message(req_msg)
+
+    vision_eval = (
+        None,
+        ("😈", None),
+        {
+            "prompt": "Smiling RoboCop with hair",
+            "caption": "Itt a vigyorgó robocop!",
+            "source": "reply",
+            "mode": "modify",
+        },
+        "RoboCop action figure",
+    )
+
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)), \
+         patch.object(llm, "generate_image", AsyncMock(return_value=fake_img_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=63613)
+
+        # Verify reaction was dispatched
+        mock_bot.set_message_reaction.assert_awaited_once()
+        assert mock_bot.set_message_reaction.call_args.kwargs["reaction"][0].emoji == "😈"
+
+        # Verify generate_image was called with prompt and base image bytes
+        mock_gen.assert_awaited_once()
+        assert mock_gen.call_args.kwargs["prompt"] == "Smiling RoboCop with hair"
+        assert mock_gen.call_args.kwargs["base_image_bytes"] == fake_img_bytes
+
+        # Verify send_photo was called with the generated photo and caption
+        mock_bot.send_photo.assert_awaited_once()
+        photo_kwargs = mock_bot.send_photo.call_args.kwargs
+        assert photo_kwargs["chat_id"] == p.group_chat_id
+        assert photo_kwargs["caption"] == "Itt a vigyorgó robocop!"
 @pytest.mark.asyncio
 async def test_debug_mode_logs_group_messages(test_setup):
     p, s, m, llm, handlers = test_setup
