@@ -158,3 +158,8 @@ Testing guidelines:
 - Mocks should avoid network I/O.
 - Telegram `Update` and `Message` mocks must specify valid attributes (e.g., `migrate_to_chat_id=None`, `date=None`).
 - When testing `LLMClient._call_genai`, ensure `params.model_api_base = ""` and a supported model name is set.
+
+---
+
+## 6. Git & Workflow Policy
+- **Git Commits**: Do git commits ONLY with explicit user approval. Never auto-commit or commit proactively without the user asking or confirming.

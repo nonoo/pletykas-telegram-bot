@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 import html
 import os
 import tempfile
@@ -555,6 +556,52 @@ async def test_spontaneous_random_timer_and_sleep_callback(test_setup):
                 await handlers._spontaneous_callback(mock_context)
                 mock_trigger.assert_called_once_with(mock_context)
                 mock_resched.assert_called_once_with(mock_context)
+
+@pytest.mark.asyncio
+async def test_status_cmd_shows_next_spontaneous_firing_timestamp(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_msg = AsyncMock()
+    mock_update = MagicMock()
+    mock_update.effective_user.id = 999
+    mock_update.effective_chat.type = "private"
+    mock_update.effective_message = mock_msg
+
+    mock_context = MagicMock()
+    mock_context.job_queue.get_jobs_by_name.return_value = []
+    mock_context.job_queue.run_once = MagicMock()
+
+    # 1. Spontaneous disabled -> Next: None
+    s.set_spontaneous_settings(enabled=False)
+    await handlers.cmd_status(mock_update, mock_context)
+    status_reply = mock_msg.reply_text.call_args[0][0]
+    assert "• Spontaneous Messages: <code>OFF (every 2-4h, random) (Next: None)</code>" in status_reply
+
+    # 2. Spontaneous enabled & scheduled
+    s.set_spontaneous_settings(enabled=True, min_hours=2.0, max_hours=4.0)
+    handlers.schedule_spontaneous_job(mock_context)
+    mock_msg.reply_text.reset_mock()
+    await handlers.cmd_status(mock_update, mock_context)
+    status_reply = mock_msg.reply_text.call_args[0][0]
+    assert "• Spontaneous Messages: <code>ON (every 2-4h, random) (Next: 20" in status_reply
+
+    # 3. /spontaneous with no args shows Next Firing timestamp
+    mock_context.args = []
+    mock_msg.reply_text.reset_mock()
+    await handlers.cmd_spontaneous(mock_update, mock_context)
+    spont_reply = mock_msg.reply_text.call_args[0][0]
+    assert "🎲 Spontaneous revival messages: <b>ON</b>" in spont_reply
+    assert "• Next Firing: <b>20" in spont_reply
+
+    # 4. Job with next_t attribute from APScheduler is used directly
+    specific_time = datetime(2026, 9, 25, 18, 30, 0, tzinfo=s.get_tzinfo())
+    mock_job = MagicMock()
+    mock_job.removed = False
+    mock_job.next_t = specific_time
+    mock_context.job_queue.get_jobs_by_name.return_value = [mock_job]
+    mock_msg.reply_text.reset_mock()
+    await handlers.cmd_status(mock_update, mock_context)
+    status_reply = mock_msg.reply_text.call_args[0][0]
+    assert "• Spontaneous Messages: <code>ON (every 2-4h, random) (Next: 2026-09-25 18:30:00)</code>" in status_reply
 @pytest.mark.asyncio
 async def test_photo_reply_and_reference_triggers_vision(test_setup):
     p, s, m, llm, handlers = test_setup

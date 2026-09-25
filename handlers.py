@@ -145,6 +145,7 @@ class BotHandlers:
         self._active_evaluations: set[int] = set()
         self._waiting_for_memory_upload: set[int] = set()
         self._waiting_for_prompt_upload: set[int] = set()
+        self._next_spontaneous_time: Optional[datetime] = None
     def _log_debug_group_msg(self, direction: str, text: str) -> None:
         if self.state.is_debug_mode():
             banner = f"TELEGRAM GROUP {direction.upper()}"
@@ -213,10 +214,12 @@ class BotHandlers:
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
                     job.schedule_removal()
+            self._next_spontaneous_time = None
             return
 
         if not context.job_queue:
             logger.debug("JobQueue not initialized, cannot schedule spontaneous job")
+            self._next_spontaneous_time = None
             return
 
         # Cancel any existing spontaneous jobs
@@ -232,6 +235,7 @@ class BotHandlers:
             max_hours = min_hours
 
         delay_sec = random.uniform(min_hours * 3600.0, max_hours * 3600.0)
+        self._next_spontaneous_time = datetime.now(self.state.get_tzinfo()) + timedelta(seconds=delay_sec)
 
         context.job_queue.run_once(
             self._spontaneous_callback,
@@ -240,6 +244,22 @@ class BotHandlers:
             data={"group_chat_id": self.params.group_chat_id},
         )
         logger.info("Scheduled spontaneous revival in %.2f hours (%.0f seconds)", delay_sec / 3600.0, delay_sec)
+    def get_next_spontaneous_time(self, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[datetime]:
+        """Returns the datetime of the next scheduled spontaneous revival message, if any."""
+        if not self.state.is_spontaneous_enabled():
+            return None
+        if context and context.job_queue:
+            jobs = context.job_queue.get_jobs_by_name("spontaneous_revival")
+            for job in jobs:
+                if getattr(job, "removed", False):
+                    continue
+                try:
+                    next_t = job.next_t
+                    if next_t:
+                        return next_t
+                except Exception:
+                    pass
+        return getattr(self, "_next_spontaneous_time", None)
     async def _spontaneous_callback(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Triggered periodically at random intervals to post spontaneous messages."""
         if self.state.is_sleeping():
@@ -1012,7 +1032,9 @@ class BotHandlers:
         sleep_status = f"{'ON' if sched.get('enabled') else 'OFF'} ({sched.get('sleep_start')} - {sched.get('sleep_end')}) (Sleeping: {is_sleep})"
         min_h = spont.get("min_hours", 2.0)
         max_h = spont.get("max_hours", 4.0)
-        spont_status = f"{'ON' if spont.get('enabled') else 'OFF'} (every {min_h:g}-{max_h:g}h, random)"
+        next_spont_dt = self.get_next_spontaneous_time(context)
+        next_spont_str = self.state.format_time(next_spont_dt) if next_spont_dt else "None"
+        spont_status = f"{'ON' if spont.get('enabled') else 'OFF'} (every {min_h:g}-{max_h:g}h, random) (Next: {next_spont_str})"
         grounding_status = "ON" if self.state.is_search_grounding_active() else "OFF"
         debug_status = "ON" if self.state.is_debug_mode() else "OFF"
         nicks = self.state.get_nicknames()
@@ -1203,10 +1225,13 @@ class BotHandlers:
         max_h = spont.get("max_hours", 4.0)
         if not args:
             status = "ON" if spont.get("enabled") else "OFF"
+            next_spont_dt = self.get_next_spontaneous_time(context)
+            next_spont_str = self.state.format_time(next_spont_dt) if next_spont_dt else "None"
+            next_line = f"• Next Firing: <b>{next_spont_str}</b>\n" if spont.get("enabled") else ""
             await update.effective_message.reply_text(
                 f"🎲 Spontaneous revival messages: <b>{status}</b>\n"
-                f"• Interval: <b>{min_h:g} - {max_h:g} hours</b> (random)\n\n"
-                f"Usage:\n"
+                f"• Interval: <b>{min_h:g} - {max_h:g} hours</b> (random)\n"
+                f"{next_line}\n"
                 f"• <code>/spontaneous on</code>\n"
                 f"• <code>/spontaneous off</code>\n"
                 f"• <code>/spontaneous now</code>\n"
@@ -1243,6 +1268,7 @@ class BotHandlers:
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
                     job.schedule_removal()
+            self._next_spontaneous_time = None
             await update.effective_message.reply_text("✅ Spontaneous revival messages turned <b>OFF</b>.", parse_mode=ParseMode.HTML)
         elif mode == "on":
             self.state.set_spontaneous_settings(enabled=True)
