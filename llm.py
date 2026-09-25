@@ -125,11 +125,15 @@ class LLMClient:
         if self.state.is_debug_mode():
             self._log_debug_payload(f"LLM REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
 
+        is_retry = False
+        final_resp_text = ""
+        final_status = 200
+
         async with session.post(url, headers=headers, json=payload) as resp:
             resp_text = await resp.text()
-            if self.state.is_debug_mode():
-                self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
             if resp.status == 400:
+                if self.state.is_debug_mode():
+                    self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
                 text_err = resp_text
                 retry_needed = False
 
@@ -155,23 +159,35 @@ class LLMClient:
                         self._log_debug_payload(f"LLM RETRY REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
                     async with session.post(url, headers=headers, json=payload) as retry_resp:
                         retry_text = await retry_resp.text()
-                        if self.state.is_debug_mode():
-                            self._log_debug_payload(f"LLM RETRY RESPONSE ({retry_resp.status}): {url}", retry_text)
                         if retry_resp.status != 200:
+                            if self.state.is_debug_mode():
+                                self._log_debug_payload(f"LLM RETRY RESPONSE ({retry_resp.status}): {url}", retry_text)
                             raise RuntimeError(f"OpenAI compatible API error {retry_resp.status}: {retry_text}")
                         data = json.loads(retry_text)
+                        final_status = retry_resp.status
+                        final_resp_text = retry_text
+                        is_retry = True
                 else:
                     raise RuntimeError(f"OpenAI compatible API error {resp.status}: {text_err}")
             elif resp.status != 200:
+                if self.state.is_debug_mode():
+                    self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
                 raise RuntimeError(f"OpenAI compatible API error {resp.status}: {resp_text}")
             else:
                 data = json.loads(resp_text)
+                final_status = resp.status
+                final_resp_text = resp_text
 
         content = ""
         choices = data.get("choices", [])
         if choices:
             content = choices[0].get("message", {}).get("content", "") or ""
 
+        if self.state.is_debug_mode():
+            raw_clean = final_resp_text.rstrip("\r\n")
+            dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
+            title = f"LLM RETRY RESPONSE ({final_status}): {url}" if is_retry else f"LLM RESPONSE ({final_status}): {url}"
+            self._log_debug_payload(title, dbg_text)
         usage = data.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", 0) or 0
         completion_tokens = usage.get("completion_tokens", 0) or 0
@@ -244,7 +260,14 @@ class LLMClient:
 
         content = response.text or ""
         if self.state.is_debug_mode():
-            self._log_debug_payload(f"GENAI SDK RESPONSE ({model_name})", content)
+            raw_resp = ""
+            try:
+                raw_resp = response.model_dump_json(exclude_none=True)
+            except Exception:
+                raw_resp = str(response)
+            raw_clean = raw_resp.rstrip("\r\n")
+            dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
+            self._log_debug_payload(f"GENAI SDK RESPONSE ({model_name})", dbg_text)
 
         p_tokens = 0
         c_tokens = 0

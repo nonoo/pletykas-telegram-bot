@@ -504,6 +504,56 @@ async def test_debug_mode_stdout_logging(capsys):
     captured = capsys.readouterr()
     assert "--- [DEBUG TEST_REQ] ---" in captured.out
     assert '{"prompt": "hello"}' in captured.out
+
+@pytest.mark.asyncio
+async def test_debug_mode_openai_compatible_response_with_content(capsys):
+    p = Params()
+    s = StateManager("test.json")
+    s.set_debug_mode(True)
+    client = LLMClient(p, s)
+
+    raw_json = '{"id": "chatcmpl-test", "choices": [{"message": {"content": "Hello, world!"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}'
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=lambda url, headers=None, json=None: AsyncMock(
+        __aenter__=AsyncMock(return_value=MagicMock(
+            status=200,
+            text=AsyncMock(return_value=raw_json)
+        )),
+        __aexit__=AsyncMock()
+    ))
+
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        content, p_tok, c_tok = await client._call_openai_compatible("https://api.test", "key", "model", [{"role": "user", "content": "hi"}])
+        assert content == "Hello, world!"
+        captured = capsys.readouterr()
+        assert "--- [DEBUG LLM RESPONSE (200): https://api.test/chat/completions] ---" in captured.out
+        expected_section = f"{raw_json}\nHello, world!"
+        assert expected_section in captured.out
+
+@pytest.mark.asyncio
+async def test_debug_mode_genai_response_with_content(capsys):
+    p = Params()
+    s = StateManager("test.json")
+    s.set_debug_mode(True)
+    client = LLMClient(p, s)
+
+    mock_resp = MagicMock()
+    mock_resp.text = "GenAI reply text!"
+    mock_resp.model_dump_json.return_value = '{"candidates": [{"content": "raw"}]}'
+    mock_resp.usage_metadata.prompt_token_count = 15
+    mock_resp.usage_metadata.candidates_token_count = 8
+
+    mock_genai_client = AsyncMock()
+    mock_genai_client.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+
+    with patch.object(client, "_get_genai_client", return_value=mock_genai_client):
+        content, p_tok, c_tok = await client._call_genai("api-key", "gemini-2.5-flash", [{"role": "user", "parts": ["hi"]}])
+        assert content == "GenAI reply text!"
+        captured = capsys.readouterr()
+        assert "--- [DEBUG GENAI SDK RESPONSE (gemini-2.5-flash)] ---" in captured.out
+        expected_section = '{"candidates": [{"content": "raw"}]}\nGenAI reply text!'
+        assert expected_section in captured.out
 @pytest.mark.asyncio
 async def test_generate_image_passes_image_size():
     p = Params()
