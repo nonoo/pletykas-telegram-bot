@@ -389,3 +389,206 @@ def test_state_scheduled_replies_migration():
         sm.load()
         assert sm.get_scheduled_replies() == []
         assert sm.format_scheduled_replies_context() == "None"
+def test_state_separated_files_persistence():
+    import json
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        chf = os.path.join(td, "pletykas-chathistory.json")
+        memf = os.path.join(td, "pletykas-memhistory.json")
+        pf = os.path.join(td, "pletykas-sysprompt.txt")
+        scf = os.path.join(td, "pletykas-sched.json")
+
+        assert os.path.exists(chf)
+        assert os.path.exists(memf)
+        assert os.path.exists(pf)
+        assert os.path.exists(scf)
+
+        # Mutate chat history
+        sm.append_chat_message({"id": 100, "text": "hello"})
+        with open(chf, "r", encoding="utf-8") as f:
+            ch_data = json.load(f)
+        assert len(ch_data) == 1
+        assert ch_data[0]["id"] == 100
+
+        # Mutate memory history
+        sm.append_memory_message({"id": 200, "text": "mem hello"})
+        with open(memf, "r", encoding="utf-8") as f:
+            mem_data = json.load(f)
+        assert len(mem_data) == 1
+        assert mem_data[0]["id"] == 200
+
+        # Mutate system prompt
+        sm.set_system_prompt("Custom test prompt persona")
+        with open(pf, "r", encoding="utf-8") as f:
+            p_data = f.read()
+        assert p_data == "Custom test prompt persona"
+
+        # Mutate scheduled replies
+        s_id = sm.add_scheduled_reply({"type": "oneshot", "target_time": "2026-09-27T12:00:00Z", "description": "task 1"})
+        with open(scf, "r", encoding="utf-8") as f:
+            sc_data = json.load(f)
+        assert len(sc_data) == 1
+        assert sc_data[0]["id"] == s_id
+
+        # Verify state.json does NOT contain chat_history, memory_history, system_prompt, scheduled_replies
+        with open(sf, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+        assert "chat_history" not in state_data
+        assert "memory_history" not in state_data
+        assert "system_prompt" not in state_data
+        assert "scheduled_replies" not in state_data
+
+        # Reload in a new StateManager instance
+        sm2 = StateManager(sf)
+        sm2.load()
+        assert len(sm2.get_chat_history()) == 1
+        assert sm2.get_chat_history()[0]["id"] == 100
+        assert len(sm2.get_memory_history()) == 1
+        assert sm2.get_memory_history()[0]["id"] == 200
+        assert sm2.get_system_prompt() == "Custom test prompt persona"
+        assert len(sm2.get_scheduled_replies()) == 1
+        assert sm2.get_scheduled_replies()[0]["id"] == s_id
+
+
+def test_state_migration_from_monolithic_state():
+    import json
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        chf = os.path.join(td, "pletykas-chathistory.json")
+        memf = os.path.join(td, "pletykas-memhistory.json")
+        pf = os.path.join(td, "pletykas-sysprompt.txt")
+        scf = os.path.join(td, "pletykas-sched.json")
+
+        # Write legacy monolithic state.json
+        legacy_data = {
+            "version": 1,
+            "group_chat_id": -100123,
+            "language": "English",
+            "chat_history": [{"id": 1, "text": "legacy msg"}],
+            "memory_history": [{"id": 10, "text": "legacy mem"}],
+            "system_prompt": "Legacy prompt persona",
+            "scheduled_replies": [{"id": "sched_legacy", "type": "oneshot", "description": "legacy task"}],
+        }
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump(legacy_data, f)
+
+        assert not os.path.exists(chf)
+        assert not os.path.exists(memf)
+        assert not os.path.exists(pf)
+        assert not os.path.exists(scf)
+
+        sm = StateManager(sf)
+        sm.load()
+
+        # Check in-memory values
+        assert len(sm.get_chat_history()) == 1
+        assert sm.get_chat_history()[0]["text"] == "legacy msg"
+        assert len(sm.get_memory_history()) == 1
+        assert sm.get_memory_history()[0]["text"] == "legacy mem"
+        assert sm.get_system_prompt() == "Legacy prompt persona"
+        assert len(sm.get_scheduled_replies()) == 1
+        assert sm.get_scheduled_replies()[0]["id"] == "sched_legacy"
+
+        # Check auxiliary files were written
+        assert os.path.exists(chf)
+        assert os.path.exists(memf)
+        assert os.path.exists(pf)
+        assert os.path.exists(scf)
+
+        with open(chf, "r", encoding="utf-8") as f:
+            assert json.load(f)[0]["id"] == 1
+        with open(memf, "r", encoding="utf-8") as f:
+            assert json.load(f)[0]["id"] == 10
+        with open(pf, "r", encoding="utf-8") as f:
+            assert f.read() == "Legacy prompt persona"
+        with open(scf, "r", encoding="utf-8") as f:
+            assert json.load(f)[0]["id"] == "sched_legacy"
+
+        # Check state.json was cleaned
+        with open(sf, "r", encoding="utf-8") as f:
+            cleaned_state = json.load(f)
+        assert "chat_history" not in cleaned_state
+        assert "memory_history" not in cleaned_state
+        assert "system_prompt" not in cleaned_state
+        assert "scheduled_replies" not in cleaned_state
+
+
+def test_state_legacy_history_file_migration():
+    import json
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        old_hf = os.path.join(td, "pletykas-history.json")
+        new_chf = os.path.join(td, "pletykas-chathistory.json")
+
+        # Write old pletykas-history.json
+        with open(old_hf, "w", encoding="utf-8") as f:
+            json.dump([{"id": 42, "text": "from old history file"}], f)
+
+        sm = StateManager(sf)
+        sm.load()
+
+        assert len(sm.get_chat_history()) == 1
+        assert sm.get_chat_history()[0]["id"] == 42
+        assert os.path.exists(new_chf)
+        assert not os.path.exists(old_hf)
+
+
+def test_state_separated_files_error_handling():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        chf = os.path.join(td, "pletykas-chathistory.json")
+        memf = os.path.join(td, "pletykas-memhistory.json")
+        pf = os.path.join(td, "pletykas-sysprompt.txt")
+        scf = os.path.join(td, "pletykas-sched.json")
+
+        # Write corrupted files
+        with open(sf, "w", encoding="utf-8") as f:
+            f.write('{"version": 1}')
+        with open(chf, "r" if False else "w", encoding="utf-8") as f:
+            f.write("corrupted json {[[")
+        with open(memf, "w", encoding="utf-8") as f:
+            f.write("not a json")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write("   \n  ")  # empty
+        with open(scf, "w", encoding="utf-8") as f:
+            f.write('{"not": "a list"}')
+
+        sm = StateManager(sf)
+        sm.load()
+
+        assert sm.get_chat_history() == []
+        assert sm.get_memory_history() == []
+        from state import DEFAULT_SYSTEM_PROMPT
+        assert sm.get_system_prompt() == DEFAULT_SYSTEM_PROMPT
+        assert sm.get_scheduled_replies() == []
+
+
+def test_state_custom_file_paths():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "my-state.json")
+        chf = os.path.join(td, "custom-ch.json")
+        memf = os.path.join(td, "custom-mem.json")
+        pf = os.path.join(td, "custom-p.txt")
+        scf = os.path.join(td, "custom-s.json")
+
+        sm = StateManager(
+            file_path=sf,
+            chathistory_file_path=chf,
+            memhistory_file_path=memf,
+            sysprompt_file_path=pf,
+            sched_file_path=scf,
+        )
+        sm.load()
+
+        assert sm.chathistory_file_path == os.path.abspath(chf)
+        assert sm.memhistory_file_path == os.path.abspath(memf)
+        assert sm.sysprompt_file_path == os.path.abspath(pf)
+        assert sm.sched_file_path == os.path.abspath(scf)
+
+        assert os.path.exists(chf)
+        assert os.path.exists(memf)
+        assert os.path.exists(pf)
+        assert os.path.exists(scf)

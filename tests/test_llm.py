@@ -7,6 +7,9 @@ from llm import LLMClient, compress_image
 from params import Params
 from state import StateManager
 
+@pytest.fixture(autouse=True)
+def isolate_test_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
 
 def test_compress_image():
     # Create large 2000x1500 test image in memory

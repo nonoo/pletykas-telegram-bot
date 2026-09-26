@@ -25,6 +25,10 @@ MODEL_IMAGE_API_BASE=""
 MODEL_IMAGE_SIZE="1K"
 MODEL_IMAGE_THINKING_LEVEL=""
 
-# State and Memory File Paths
+# State, Chat History, Memory History, Prompt, Scheduled Tasks, and Memory File Paths
 STATE_FILE="pletykas-state.json"
+CHATHISTORY_FILE="pletykas-chathistory.json"
+MEMHISTORY_FILE="pletykas-memhistory.json"
+SYSPROMPT_FILE="pletykas-sysprompt.txt"
+SCHED_FILE="pletykas-sched.json"
 MEMORY_FILE="pletykas-memory.json"

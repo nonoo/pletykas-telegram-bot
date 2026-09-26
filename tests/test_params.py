@@ -6,6 +6,11 @@ from params import Params
 def test_params_default_values():
     p = Params()
     assert p.state_file == "pletykas-state.json"
+    assert p.chathistory_file == "pletykas-chathistory.json"
+    assert p.history_file == "pletykas-chathistory.json"
+    assert p.memhistory_file == "pletykas-memhistory.json"
+    assert p.sysprompt_file == "pletykas-sysprompt.txt"
+    assert p.sched_file == "pletykas-sched.json"
     assert p.memory_file == "pletykas-memory.json"
     assert p.model_name == ""
     assert p.model_large_name == ""
@@ -29,6 +34,10 @@ def test_params_cli_parsing():
         "--model-thinking-level", "minimal",
         "--model-large-thinking-level", "low",
         "--model-image-thinking-level", "medium",
+        "--chathistory-file", "custom-chat.json",
+        "--memhistory-file", "custom-mem.json",
+        "--sysprompt-file", "custom-prompt.txt",
+        "--sched-file", "custom-sched.json",
     ])
     assert p.bot_token == "test-token-123"
     assert p.group_chat_id == -100987654321
@@ -45,6 +54,11 @@ def test_params_cli_parsing():
     p.group_chat_id = -1941958689
     assert p.is_group_authorized(-1001941958689) is True
     assert p.is_group_authorized(-100999999999) is False
+    assert p.chathistory_file == "custom-chat.json"
+    assert p.history_file == "custom-chat.json"
+    assert p.memhistory_file == "custom-mem.json"
+    assert p.sysprompt_file == "custom-prompt.txt"
+    assert p.sched_file == "custom-sched.json"
 
 
 def test_params_env_parsing(monkeypatch):
@@ -54,6 +68,10 @@ def test_params_env_parsing(monkeypatch):
     monkeypatch.setenv("MODEL_API_KEY", "env-key")
     monkeypatch.setenv("MODEL_IMAGE_SIZE", "512x512")
     monkeypatch.setenv("MODEL_THINKING_LEVEL", "high")
+    monkeypatch.setenv("CHATHISTORY_FILE", "env-chat.json")
+    monkeypatch.setenv("MEMHISTORY_FILE", "env-mem.json")
+    monkeypatch.setenv("SYSPROMPT_FILE", "env-prompt.txt")
+    monkeypatch.setenv("SCHED_FILE", "env-sched.json")
     p = Params()
     p.parse([])
     assert p.bot_token == "env-token"
@@ -64,6 +82,11 @@ def test_params_env_parsing(monkeypatch):
     assert p.model_thinking_level == "high"
     assert p.effective_large_thinking_level == "high"
     assert p.effective_image_thinking_level == "high"
+    assert p.chathistory_file == "env-chat.json"
+    assert p.history_file == "env-chat.json"
+    assert p.memhistory_file == "env-mem.json"
+    assert p.sysprompt_file == "env-prompt.txt"
+    assert p.sched_file == "env-sched.json"
 
 def test_params_llm_api_key_fallback(monkeypatch):
     monkeypatch.delenv("MODEL_API_KEY", raising=False)

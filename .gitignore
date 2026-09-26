@@ -8,3 +8,4 @@ __pycache__/
 config.inc.sh
 .pytest_cache/
 .coverage
+pletykas-*.txt

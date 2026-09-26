@@ -106,7 +106,14 @@ def main():
         logger.error("Configuration error: %s", e)
         sys.exit(1)
 
-    state = StateManager(params.state_file, group_chat_id=params.group_chat_id)
+    state = StateManager(
+        params.state_file,
+        group_chat_id=params.group_chat_id,
+        chathistory_file_path=params.chathistory_file,
+        memhistory_file_path=params.memhistory_file,
+        sysprompt_file_path=params.sysprompt_file,
+        sched_file_path=params.sched_file,
+    )
     state.load()
 
     # Synchronize group_chat_id between config params and state

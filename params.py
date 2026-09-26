@@ -13,8 +13,11 @@ class Params:
         self.group_chat_id: int = 0
         self.admin_user_ids: List[int] = []
         self.state_file: str = "pletykas-state.json"
+        self.chathistory_file: str = "pletykas-chathistory.json"
+        self.memhistory_file: str = "pletykas-memhistory.json"
+        self.sysprompt_file: str = "pletykas-sysprompt.txt"
+        self.sched_file: str = "pletykas-sched.json"
         self.memory_file: str = "pletykas-memory.json"
-
         # Primary conversational model
         self.model_name: str = ""
         self.model_api_key: str = ""
@@ -92,6 +95,30 @@ class Params:
             dest="state_file",
             default=os.environ.get("STATE_FILE", "pletykas-state.json"),
             help="Path to persistent state JSON file",
+        )
+        parser.add_argument(
+            "--chathistory-file",
+            "--history-file",
+            dest="chathistory_file",
+            default=os.environ.get("CHATHISTORY_FILE", os.environ.get("HISTORY_FILE", "pletykas-chathistory.json")),
+            help="Path to persistent chat history JSON file",
+        )
+        parser.add_argument(
+            "--memhistory-file",
+            dest="memhistory_file",
+            default=os.environ.get("MEMHISTORY_FILE", "pletykas-memhistory.json"),
+            help="Path to persistent memory history JSON file (for LLM curation)",
+        )
+        parser.add_argument(
+            "--sysprompt-file",
+            default=os.environ.get("SYSPROMPT_FILE", os.environ.get("PROMPT_FILE", "pletykas-sysprompt.txt")),
+            help="Path to persistent system prompt text file",
+        )
+        parser.add_argument(
+            "--sched-file",
+            dest="sched_file",
+            default=os.environ.get("SCHED_FILE", "pletykas-sched.json"),
+            help="Path to persistent scheduled replies JSON file",
         )
         parser.add_argument(
             "--memory-file",
@@ -210,8 +237,11 @@ class Params:
             raise ValueError("admin_user_ids must contain at least one valid user ID (via --admin-user-ids or ADMIN_USERIDS)")
 
         self.state_file = parsed_args.state_file.strip()
+        self.chathistory_file = parsed_args.chathistory_file.strip()
+        self.memhistory_file = parsed_args.memhistory_file.strip()
+        self.sysprompt_file = parsed_args.sysprompt_file.strip()
+        self.sched_file = parsed_args.sched_file.strip()
         self.memory_file = parsed_args.memory_file.strip()
-
         self.model_name = parsed_args.model_name.strip()
         self.model_api_key = parsed_args.model_api_key.strip()
         if not self.model_api_key:
@@ -242,3 +272,10 @@ class Params:
         if s_chat.startswith("100") and s_chat[3:] == s_target:
             return True
         return False
+    @property
+    def history_file(self) -> str:
+        return self.chathistory_file
+
+    @history_file.setter
+    def history_file(self, val: str) -> None:
+        self.chathistory_file = val

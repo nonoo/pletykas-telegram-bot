@@ -73,7 +73,6 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
     "pletyi",
     "pletyo"
   ],
-  "system_prompt": "...",
   "sleep_schedule": {
     "enabled": false,
     "sleep_start": "23:00",
@@ -85,16 +84,26 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
     "max_hours": 4.0,
     "next_fire_time": null
   },
-  "chat_history": [],
-  "memory_history": [],
-  "messages_since_last_curation": 0,
-  "scheduled_replies": []
+  "messages_since_last_curation": 0
 }
 ```
-- `chat_history`: Ring buffer of the last 20 messages injected into prompt transcripts.
-- `memory_history`: Ring buffer of the last 30 messages maintained for LLM memory curation.
 - `spontaneous_messages`: Periodic revival timer (`min_hours` to `max_hours`). Whenever a Telegram message arrives in the group, a new random timestamp is rolled and rescheduled to reset the revival window. The scheduled timestamp (`next_fire_time`) is persisted in state and resumes on restart.
-- `scheduled_replies`: List of active one-shot reminders and periodic scheduled tasks. Loaded on bot startup and resumed in `JobQueue`.
+
+### Chat History (`pletykas-chathistory.json`)
+Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
+- Ring buffer of the last 20 messages (`CHAT_HISTORY_SIZE = 20`) injected into prompt transcripts.
+
+### Memory History (`pletykas-memhistory.json`)
+Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
+- Ring buffer of the last 30 messages (`MEMORY_HISTORY_SIZE = 30`) maintained for LLM memory curation.
+
+### System Prompt (`pletykas-sysprompt.txt`)
+Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
+- UTF-8 text file defining the base persona and system prompt. Admin command `/prompt load` updates it, `/prompt` downloads it, and `/prompt reset` restores the default prompt.
+
+### Scheduled Replies (`pletykas-sched.json`)
+Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
+- JSON array of active one-shot reminders and periodic scheduled tasks. Loaded on bot startup and resumed in `JobQueue`.
 
 ### Memory (`pletykas-memory.json`)
 Managed by `MemoryManager` via atomic replacement:
