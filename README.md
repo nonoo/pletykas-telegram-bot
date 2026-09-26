@@ -16,6 +16,7 @@ An autonomous, multi-modal Telegram group chatbot designed to seamlessly integra
 - **Dynamic Memory Management**: Automatically distills facts, group dynamics, and inside jokes every 20 messages into `pletykas-memory.json` with rolling `.bak` backups.
 - **Quiet Hours & Chat Revival**: Optional sleep schedule (`/sleep`) and unprompted conversational revival with polls or banter (`/spontaneous`).
 - **Capability Escalation & Retry**: The fast primary model automatically escalates to the large model (`<RETRY_WITH_LARGE_MODEL>`) when real-time web search or capabilities beyond its reach are needed.
+- **Autonomous Scheduled Replies & Reminders**: The LLM can autonomously schedule one-shot or periodic reminders/checks (`<SCHEDULE:oneshot>`, `<SCHEDULE:periodic>`). Timers persist across restarts in `pletykas-state.json` and are viewable/cancellable via `/scheduled`.
 
 ---
 
@@ -91,6 +92,7 @@ podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-tel
 | `/spontaneous` | `[on\|off\|now]` | Enables, disables, or views periodic spontaneous messages |
 | `/spontaneous_interval` | `[min] [max]` | Views or adjusts the random timer interval in hours (default: `2 4`) |
 | `/spontaneous_now` | — | Instantly generates and dispatches a spontaneous message or poll to the group |
+| `/scheduled` | `[list\|cancel <id>]` | Views active scheduled reminders or cancels a specific timer by ID |
 | `/prompt` | `[load\|reset]` | Uploads system prompt file as-is, expects a text file upload to replace prompt, or resets to default |
 | `/grounding` | `[on\|off]` | Toggles Google Search grounding tool |
 | `/search_small` | `[on\|off]` | Toggles whether small model uses search grounding directly (default: `OFF` delegates to large model) |
@@ -108,7 +110,7 @@ Run the automated test suite with pytest:
 ```bash
 .venv/bin/pytest -v
 ```
-All 63 unit, integration, and smoke tests will execute against local mocks without requiring live API keys.
+All unit, integration, and smoke tests will execute against local mocks without requiring live API keys.
 
 ## Contributors
 

@@ -196,7 +196,7 @@ async def test_evaluate_and_reply_no_reply_behavior():
 
     # Mock _call_genai returning <NO_REPLY>
     with patch.object(client, "_call_genai", AsyncMock(return_value=("<NO_REPLY>", 100, 5))):
-        text, reaction, img_spec = await client.evaluate_and_reply(
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -206,6 +206,7 @@ async def test_evaluate_and_reply_no_reply_behavior():
         assert text is None
         assert reaction is None
         assert img_spec is None
+        assert sched_spec is None
 
 
 
@@ -252,7 +253,7 @@ async def test_evaluate_and_reply_retries_with_large_model():
             return "Here is the live search result from the web!", 50, 20
 
     with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)):
-        text, reaction, img_spec = await client.evaluate_and_reply(
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
             transcript="Who won today?",
@@ -294,7 +295,7 @@ async def test_evaluate_and_reply_retries_with_genai_search_grounding():
 
     with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)), \
          patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
-        text, reaction, img_spec = await client.evaluate_and_reply(
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
             transcript="pletyi, keress ra a neten, milyen most az idojaras budakeszin",
@@ -331,7 +332,7 @@ async def test_evaluate_and_reply_small_model_search_toggle():
             return "Large model search result", 20, 10
 
     with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
-        text, _, _ = await client.evaluate_and_reply(
+        text, _, _, _ = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
             transcript="search weather",
@@ -352,7 +353,7 @@ async def test_evaluate_and_reply_small_model_search_toggle():
         return "Direct small model search result", 15, 8
 
     with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai_direct)):
-        text, _, _ = await client.evaluate_and_reply(
+        text, _, _, _ = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
             transcript="search weather",
@@ -390,7 +391,7 @@ async def test_evaluate_and_reply_retries_with_large_model_and_chat_history_imag
     with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)), patch.object(
         client, "_call_vision_model", AsyncMock(return_value=("Két fekete cica van a képen!", 50, 10))
     ) as mock_vision:
-        text, reaction, img_spec = await client.evaluate_and_reply(
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
             transcript="szoval mi van a kepen?",
@@ -413,7 +414,7 @@ async def test_describe_and_reply_image_large_model_default():
     client = LLMClient(p, s)
 
     with patch.object(client, "_call_vision_model", AsyncMock(return_value=("<IMAGE_DESCRIPTION>A cute puppy</IMAGE_DESCRIPTION>Look at this dog!", 50, 10))) as mock_vision:
-        text, reaction, img_spec, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -446,7 +447,7 @@ async def test_describe_and_reply_image_small_model_when_disabled():
         return "<IMAGE_DESCRIPTION>Large model desc</IMAGE_DESCRIPTION>Large model text", 100, 20
 
     with patch.object(client, "_call_vision_model", AsyncMock(side_effect=mock_vision_call)):
-        text, reaction, img_spec, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -478,7 +479,7 @@ async def test_describe_and_reply_image_small_model_fallback_to_large():
         return "<IMAGE_DESCRIPTION>High res details</IMAGE_DESCRIPTION>Identified with large model!", 100, 20
 
     with patch.object(client, "_call_vision_model", AsyncMock(side_effect=mock_vision_call)):
-        text, reaction, img_spec, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -514,7 +515,7 @@ Original RoboCop figure
 </IMAGE_DESCRIPTION>"""
 
     with patch.object(client, "_call_vision_model", AsyncMock(return_value=(vision_resp, 100, 50))):
-        text, reaction, img_spec, desc = await client.describe_and_reply_image(
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
             system_prompt="sys",
             memory_context="mem",
             transcript="trans",
@@ -740,3 +741,122 @@ async def test_debug_mode_genai_response_with_search_queries(capsys):
         assert content == "17 degrees in Budakeszi!"
         captured = capsys.readouterr()
         assert "[Google Search Queries: ['weather in Budakeszi']]" in captured.out
+
+
+def test_extract_schedule():
+    p = Params()
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    # 1. Oneshot schedule
+    text1 = """Rendben, észben tartom!
+<SCHEDULE:oneshot>
+Time: in 2 hours
+Description: Remind Alice about test report
+</SCHEDULE:oneshot>"""
+    cleaned1, spec1 = client._extract_schedule(text1)
+    assert cleaned1 == "Rendben, észben tartom!"
+    assert spec1 is not None
+    assert spec1["action"] == "create"
+    assert spec1["type"] == "oneshot"
+    assert spec1["time"] == "in 2 hours"
+    assert spec1["description"] == "Remind Alice about test report"
+
+    # 2. Periodic schedule with start
+    text2 = """<SCHEDULE:periodic>
+Interval: 1 month
+Start: 2026-10-01 10:00:00
+Description: Check monthly expenses
+</SCHEDULE:periodic>
+Beállítottam a havi emlékeztetőt!"""
+    cleaned2, spec2 = client._extract_schedule(text2)
+    assert cleaned2 == "Beállítottam a havi emlékeztetőt!"
+    assert spec2 is not None
+    assert spec2["action"] == "create"
+    assert spec2["type"] == "periodic"
+    assert spec2["interval"] == "1 month"
+    assert spec2["start"] == "2026-10-01 10:00:00"
+    assert spec2["description"] == "Check monthly expenses"
+
+    # 3. Cancel with ID in tag
+    text3 = "Rendben, töröltem! <SCHEDULE:cancel:sched_1727339000_1042>"
+    cleaned3, spec3 = client._extract_schedule(text3)
+    assert cleaned3 == "Rendben, töröltem!"
+    assert spec3 is not None
+    assert spec3["action"] == "cancel"
+    assert spec3["schedule_id"] == "sched_1727339000_1042"
+
+    # 4. Cancel with body
+    text4 = "Törölve! <SCHEDULE:cancel>sched_999</SCHEDULE:cancel>"
+    cleaned4, spec4 = client._extract_schedule(text4)
+    assert cleaned4 == "Törölve!"
+    assert spec4 is not None
+    assert spec4["action"] == "cancel"
+    assert spec4["schedule_id"] == "sched_999"
+
+    # 5. No schedule
+    text5 = "Csak egy sima üzenet."
+    cleaned5, spec5 = client._extract_schedule(text5)
+    assert cleaned5 == "Csak egy sima üzenet."
+    assert spec5 is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_with_schedule_tag():
+    p = Params()
+    p.model_name = "gemini-2.5-flash"
+    p.model_api_base = ""
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    model_output = """Persze, szólok majd!
+<SCHEDULE:oneshot>
+Time: +30m
+Description: Szólj Bélának hogy indul a busz
+</SCHEDULE:oneshot>"""
+
+    with patch.object(client, "_call_genai", AsyncMock(return_value=(model_output, 50, 20))):
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=True,
+        )
+        assert text == "Persze, szólok majd!"
+        assert reaction is None
+        assert img_spec is None
+        assert sched_spec is not None
+        assert sched_spec["action"] == "create"
+        assert sched_spec["time"] == "+30m"
+        assert sched_spec["description"] == "Szólj Bélának hogy indul a busz"
+
+
+@pytest.mark.asyncio
+async def test_generate_scheduled_reply():
+    p = Params()
+    p.model_name = "gemini-2.5-flash"
+    p.model_api_base = ""
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    captured_prompt = None
+    async def mock_call_genai(api_key, model_name, contents, **kwargs):
+        nonlocal captured_prompt
+        captured_prompt = contents[0]
+        return "Hahó Béla! Indul a buszod 5 perc múlva! 🚌", 40, 15
+
+    with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
+        reply = await client.generate_scheduled_reply(
+            system_prompt="System prompt test",
+            memory_context="Memory test",
+            transcript="Transcript test",
+            scheduled_description="Szólj Bélának hogy indul a busz",
+            scheduled_type="oneshot",
+            timezone_str="Europe/Budapest",
+        )
+        assert reply == "Hahó Béla! Indul a buszod 5 perc múlva! 🚌"
+        assert captured_prompt is not None
+        assert "[Scheduled Task Execution]" in captured_prompt
+        assert "Type: oneshot" in captured_prompt
+        assert "Szólj Bélának hogy indul a busz" in captured_prompt

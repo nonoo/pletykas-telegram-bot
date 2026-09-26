@@ -136,6 +136,7 @@ def main():
                 self.bot = app.bot
 
         handlers.schedule_spontaneous_job(DummyContext(application))
+        handlers.load_and_schedule_pending_replies(DummyContext(application))
         logger.info("Pletykas bot initialized successfully.")
 
     async def post_shutdown(application: Application) -> None:

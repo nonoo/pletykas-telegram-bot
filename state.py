@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import tempfile
+import time as time_mod
 from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 import zoneinfo
@@ -53,6 +54,7 @@ class StateManager:
             "chat_history": [],
             "memory_history": [],
             "messages_since_last_curation": 0,
+            "scheduled_replies": [],
         }
 
     def load(self) -> None:
@@ -97,6 +99,8 @@ class StateManager:
                         loaded["chat_history"] = []
                     if not isinstance(loaded.get("memory_history"), list):
                         loaded["memory_history"] = []
+                    if not isinstance(loaded.get("scheduled_replies"), list):
+                        loaded["scheduled_replies"] = []
                     self.data = loaded
                 else:
                     self.data = self._create_default_state()
@@ -435,3 +439,57 @@ class StateManager:
         return {
             "uncurated_messages": self.get_messages_since_last_curation(),
         }
+
+    # Scheduled Replies
+    def get_scheduled_replies(self) -> List[Dict[str, Any]]:
+        return [dict(x) for x in self.data.get("scheduled_replies", [])]
+
+    def get_scheduled_reply(self, schedule_id: str) -> Optional[Dict[str, Any]]:
+        for r in self.data.get("scheduled_replies", []):
+            if r.get("id") == schedule_id:
+                return dict(r)
+        return None
+
+    def add_scheduled_reply(self, entry: Dict[str, Any]) -> str:
+        replies = self.data.setdefault("scheduled_replies", [])
+        entry_copy = dict(entry)
+        if not entry_copy.get("id"):
+            entry_copy["id"] = f"sched_{int(time_mod.time())}_{os.urandom(2).hex()}"
+        replies.append(entry_copy)
+        self.save()
+        return entry_copy["id"]
+
+    def remove_scheduled_reply(self, schedule_id: str) -> bool:
+        replies = self.data.get("scheduled_replies", [])
+        initial_len = len(replies)
+        self.data["scheduled_replies"] = [r for r in replies if r.get("id") != schedule_id]
+        if len(self.data["scheduled_replies"]) != initial_len:
+            self.save()
+            return True
+        return False
+
+    def update_scheduled_reply(self, schedule_id: str, updates: Dict[str, Any]) -> bool:
+        replies = self.data.get("scheduled_replies", [])
+        for r in replies:
+            if r.get("id") == schedule_id:
+                r.update(updates)
+                self.save()
+                return True
+        return False
+
+    def format_scheduled_replies_context(self) -> str:
+        replies = self.get_scheduled_replies()
+        if not replies:
+            return "None"
+        lines = []
+        for r in replies:
+            s_id = r.get("id", "")
+            s_type = r.get("type", "oneshot")
+            t_time = r.get("target_time", "")
+            desc = r.get("description", "")
+            if s_type == "periodic":
+                interval = r.get("interval_str", "")
+                lines.append(f"- ID: {s_id} | Type: periodic | Next: {t_time} | Interval: {interval} | Description: {desc}")
+            else:
+                lines.append(f"- ID: {s_id} | Type: oneshot | Due: {t_time} | Description: {desc}")
+        return "\n".join(lines)

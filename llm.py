@@ -341,6 +341,70 @@ class LLMClient:
             desc = match.group(1).strip()
             text = re.sub(pattern, "", text)
         return text.strip(), desc
+
+    def _extract_schedule(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Extracts <SCHEDULE:oneshot>...</SCHEDULE:oneshot>, <SCHEDULE:periodic>...</SCHEDULE:periodic>,
+        or <SCHEDULE:cancel:id> block and strips it from text."""
+        if not text:
+            return text, None
+
+        # 1. Check for cancellation tag
+        # e.g. <SCHEDULE:cancel:sched_123> or <SCHEDULE:cancel>sched_123</SCHEDULE:cancel>
+        cancel_pat = r"<SCHEDULE:cancel(?::\s*([^>]+))?>(?:([\s\S]*?)</SCHEDULE:cancel>)?"
+        cancel_match = re.search(cancel_pat, text, re.IGNORECASE)
+        if cancel_match:
+            sched_id = (cancel_match.group(1) or cancel_match.group(2) or "").strip()
+            text_cleaned = re.sub(cancel_pat, "", text, flags=re.IGNORECASE).strip()
+            if sched_id:
+                return text_cleaned, {"action": "cancel", "schedule_id": sched_id}
+
+        # 2. Check for creation tag
+        # e.g. <SCHEDULE:(oneshot|periodic)>...</SCHEDULE:(oneshot|periodic)>
+        create_pat = r"<SCHEDULE:(oneshot|periodic)>([\s\S]*?)(?:</SCHEDULE:(?:oneshot|periodic)>|</SCHEDULE>|$)"
+        create_match = re.search(create_pat, text, re.IGNORECASE)
+        if create_match:
+            sched_type = create_match.group(1).lower()
+            block = create_match.group(2)
+            text_cleaned = re.sub(create_pat, "", text, flags=re.IGNORECASE).strip()
+
+            time_val = ""
+            interval_val = ""
+            start_val = ""
+            desc_lines: List[str] = []
+            current_key = None
+
+            for line in block.splitlines():
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                if re.match(r"^Time:\s*", line_s, re.IGNORECASE):
+                    time_val = re.sub(r"^Time:\s*", "", line_s, flags=re.IGNORECASE).strip()
+                    current_key = "time"
+                elif re.match(r"^Interval:\s*", line_s, re.IGNORECASE):
+                    interval_val = re.sub(r"^Interval:\s*", "", line_s, flags=re.IGNORECASE).strip()
+                    current_key = "interval"
+                elif re.match(r"^Start:\s*", line_s, re.IGNORECASE):
+                    start_val = re.sub(r"^Start:\s*", "", line_s, flags=re.IGNORECASE).strip()
+                    current_key = "start"
+                elif re.match(r"^Description:\s*", line_s, re.IGNORECASE):
+                    desc_lines.append(re.sub(r"^Description:\s*", "", line_s, flags=re.IGNORECASE).strip())
+                    current_key = "desc"
+                elif current_key == "desc":
+                    desc_lines.append(line_s)
+
+            desc_val = " ".join([l for l in desc_lines if l]).strip()
+
+            spec = {
+                "action": "create",
+                "type": sched_type,
+                "time": time_val,
+                "interval": interval_val,
+                "start": start_val,
+                "description": desc_val,
+            }
+            return text_cleaned, spec
+
+        return text.strip(), None
     def _check_incapable_retry(self, response_text: str) -> Tuple[bool, str]:
         """Detects if model indicated it cannot fulfill the request (e.g. needs web search / large model)."""
         if not response_text:
@@ -411,6 +475,28 @@ Caption: <your in-character message or response in the chat language to accompan
 Source: <message ID if referring to an image in transcript, or 'reply' if replying to a photo message, or 'new'>
 Mode: <'modify' if changing an existing image, or 'generate' if creating a fresh image>
 </GENERATE_IMAGE>"""
+        schedule_section = """[Scheduled Replies & Reminders]
+If a user asks you to remind them, check something later, or schedule a periodic message/check:
+1. For one-shot replies/reminders:
+Output a schedule block:
+<SCHEDULE:oneshot>
+Time: <ISO datetime 'YYYY-MM-DD HH:MM:SS', time 'HH:MM', or relative offset e.g. '+2h', 'in 30m', 'in 3 days', 'in 2 months', 'in 1 year'>
+Description: <Comprehensive instruction detailing what to say, who requested it, and necessary context>
+</SCHEDULE:oneshot>
+
+2. For recurring / periodic replies:
+Output a schedule block:
+<SCHEDULE:periodic>
+Interval: <recurrence interval e.g. '30m', '12h', '1d', '3 days', '2 weeks', '1 month', '3 months', '1 year'>
+Start: <optional first execution time 'YYYY-MM-DD HH:MM:SS' or relative offset>
+Description: <Comprehensive instruction detailing what to say or check periodically>
+</SCHEDULE:periodic>
+
+3. To cancel an active scheduled reminder or task (refer to the IDs in [Active Scheduled Reminders & Tasks]):
+Output:
+<SCHEDULE:cancel:schedule_id>
+
+IMPORTANT: In the SAME turn, write your normal in-character reply to the user confirming that you scheduled or canceled the reminder! Never leave the reply empty when scheduling or canceling."""
 
         if can_search:
             search_section = """[Real-Time Web Search & Grounding]
@@ -429,6 +515,7 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
 
         output_rules = f"""[Output Rules]
 - You MUST select EXACTLY ONE primary action per turn: Output '<NO_REPLY>', OR output a single '<REACTION:emoji>', OR write a short text reply. DO NOT combine a text reply and an emoji reaction in the same response.
+- When scheduling or canceling a reminder via `<SCHEDULE:...>`, you MUST provide an in-character text confirmation in addition to the `<SCHEDULE:...>` block.
 - STRICT REACTION RULE: Do NOT use <REACTION:emoji> as a passive default. When talkativeness is low, '<NO_REPLY>' MUST be heavily preferred over reacting in 95% of cases. Only react if a message genuinely warrants a strong reaction.
 - To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.
@@ -438,6 +525,8 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
 {trigger_instruction}
 
 {image_capability}
+
+{schedule_section}
 
 {search_section}
 
@@ -451,9 +540,13 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
     ) -> str:
         current_time_str = self.state.get_current_time_str()
         timezone_str = self.state.get_timezone()
+        scheduled_context = self.state.format_scheduled_replies_context()
         return f"""[Context Information]
 Current Time: {current_time_str}
 Timezone: {timezone_str}
+
+[Active Scheduled Reminders & Tasks]
+{scheduled_context}
 
 [Current Memory]
 {memory_context}
@@ -472,9 +565,13 @@ Timezone: {timezone_str}
     ) -> str:
         current_time_str = self.state.get_current_time_str()
         timezone_str = self.state.get_timezone()
+        scheduled_context = self.state.format_scheduled_replies_context()
         return f"""[Context Information]
 Current Time: {current_time_str}
 Timezone: {timezone_str}
+
+[Active Scheduled Reminders & Tasks]
+{scheduled_context}
 
 [Current Memory]
 {memory_context}
@@ -502,7 +599,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         is_direct_trigger: bool,
         talkativeness: int = 5,
         image_bytes: Optional[bytes] = None,
-    ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]]]:
+    ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]], Optional[Dict[str, Any]]]:
         """Evaluates conversation and produces in-character text, emoji reaction, and/or image generation spec."""
         primary_can_search = (
             self.state.is_search_small_model()
@@ -609,9 +706,10 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
 
         raw_trimmed = raw_response.strip()
         if raw_trimmed == "<NO_REPLY>":
-            return None, None, None
+            return None, None, None, None
 
-        cleaned_text, image_spec = self._extract_generate_image(raw_trimmed)
+        cleaned_text, schedule_spec = self._extract_schedule(raw_trimmed)
+        cleaned_text, image_spec = self._extract_generate_image(cleaned_text)
         cleaned_text, reaction = self._extract_reaction(cleaned_text)
         # Clean any remaining retry tag in case large model returned one
         cleaned_text = re.sub(r"<(?:RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*[^>]*?)?>", "", cleaned_text, flags=re.IGNORECASE).strip()
@@ -619,17 +717,22 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         if cleaned_text == "<NO_REPLY>":
             text = None
         elif not cleaned_text:
-            if is_direct_trigger:
+            if schedule_spec:
+                if schedule_spec.get("action") == "cancel":
+                    text = "Rendben, töröltem az időzítőt! 👍"
+                else:
+                    text = "Rendben, jegyeztem az emlékeztetőt! 😉"
+            elif is_direct_trigger:
                 text = "hmm, ezen most kicsit gondolkodnom kell... 🤔"
             else:
                 text = None
         else:
             text = cleaned_text
 
-        if text is None and reaction is None and image_spec is None:
-            return None, None, None
+        if text is None and reaction is None and image_spec is None and schedule_spec is None:
+            return None, None, None, None
 
-        return text, reaction, image_spec
+        return text, reaction, image_spec, schedule_spec
     async def _call_vision_model(
         self,
         model_name: str,
@@ -685,8 +788,8 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         talkativeness: int,
         image_bytes: bytes,
         caption: str,
-    ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]], str]:
-        """Dispatches photo to Large Multimodal Model to generate a reply, reaction, image spec, and visual description."""
+    ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]], str, Optional[Dict[str, Any]]]:
+        """Dispatches photo to Large Multimodal Model to generate a reply, reaction, image spec, visual description, and schedule spec."""
         use_large = self.state.is_image_interpretation_large_model()
         raw_response = ""
 
@@ -754,15 +857,24 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
 
         raw_trimmed = raw_response.strip()
         cleaned_text, image_description = self._extract_image_description(raw_trimmed)
+        cleaned_text, schedule_spec = self._extract_schedule(cleaned_text)
         cleaned_text, image_spec = self._extract_generate_image(cleaned_text)
         cleaned_text, reaction = self._extract_reaction(cleaned_text)
 
-        if cleaned_text == "<NO_REPLY>" or not cleaned_text:
+        if cleaned_text == "<NO_REPLY>":
             text = None
+        elif not cleaned_text:
+            if schedule_spec:
+                if schedule_spec.get("action") == "cancel":
+                    text = "Rendben, töröltem az időzítőt! 👍"
+                else:
+                    text = "Rendben, jegyeztem az emlékeztetőt! 😉"
+            else:
+                text = None
         else:
             text = cleaned_text
 
-        return text, reaction, image_spec, image_description
+        return text, reaction, image_spec, image_description, schedule_spec
 
     def _extract_image_from_interaction(self, interaction: Any) -> Optional[bytes]:
         """Extracts decoded image bytes from a Google Interactions API response."""
@@ -1011,15 +1123,18 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
     ) -> Optional[str]:
         """Generates an unprompted spontaneous conversational message or poll."""
         current_time_str = self.state.get_current_time_str()
+        scheduled_context = self.state.format_scheduled_replies_context()
         prompt = f"""[System Prompt]
 {system_prompt}
 
 [Thinking Instruction]
 {self._get_thinking_instruction(self.params.model_thinking_level)}
-
 [Context Information]
 Current Time: {current_time_str}
 Timezone: {timezone_str}
+
+[Active Scheduled Reminders & Tasks]
+{scheduled_context}
 
 [Current Memory]
 {memory_context}
@@ -1072,6 +1187,82 @@ Rules: Do not refer to yourself as an AI or mention that this is automated. Spea
             return res if res and res != "<NO_REPLY>" else None
         except Exception as e:
             logger.error("Error generating spontaneous message: %s", e)
+            return None
+
+    async def generate_scheduled_reply(
+        self,
+        system_prompt: str,
+        memory_context: str,
+        transcript: str,
+        scheduled_description: str,
+        scheduled_type: str,
+        timezone_str: str,
+    ) -> Optional[str]:
+        """Generates a scheduled reply message based on a previously set reminder or check."""
+        current_time_str = self.state.get_current_time_str()
+        scheduled_context = self.state.format_scheduled_replies_context()
+
+        prompt = f"""[System Prompt]
+{system_prompt}
+
+[Thinking Instruction]
+{self._get_thinking_instruction(self.params.model_thinking_level)}
+
+[Context Information]
+Current Time: {current_time_str}
+Timezone: {timezone_str}
+
+[Active Scheduled Reminders & Tasks]
+{scheduled_context}
+
+[Current Memory]
+{memory_context}
+
+[Recent Conversation Transcript]
+{transcript}
+
+[Scheduled Task Execution]
+Type: {scheduled_type}
+Task Description:
+{scheduled_description}
+
+[Instruction]
+A previously scheduled reminder or check has triggered. Deliver your message, reminder, or conversational contribution to the Telegram group chat based on the task description above.
+Speak naturally in character as Pletykas, matching the ongoing tone and language of the group.
+Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak directly and naturally as a group member fulfilling what was promised or checking in."""
+
+        model_name = self.params.model_name
+        api_key = self.params.model_api_key
+        api_base = self.params.model_api_base
+
+        try:
+            if self._is_genai_model(model_name, api_base):
+                raw_response, p_tokens, c_tokens = await self._call_genai(
+                    api_key=api_key,
+                    model_name=model_name,
+                    contents=[prompt],
+                    system_instruction=f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(self.params.model_thinking_level)}",
+                    use_search_grounding=self.state.is_search_grounding_active(),
+                    thinking_level=self.params.model_thinking_level,
+                )
+            else:
+                messages = [
+                    {"role": "system", "content": f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(self.params.model_thinking_level)}"},
+                    {"role": "user", "content": prompt},
+                ]
+                raw_response, p_tokens, c_tokens = await self._call_openai_compatible(
+                    api_base=api_base,
+                    api_key=api_key,
+                    model_name=model_name,
+                    messages=messages,
+                    thinking_level=self.params.model_thinking_level,
+                )
+
+            res = raw_response.strip()
+            res = re.sub(r"<(?:NO_REPLY|RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*[^>]*?)?>", "", res, flags=re.IGNORECASE).strip()
+            return res if res else None
+        except Exception as e:
+            logger.error("Error generating scheduled reply: %s", e)
             return None
 
     async def curate_memory(self, current_memories: Dict[str, Any], recent_transcript: str) -> Dict[str, Any]:

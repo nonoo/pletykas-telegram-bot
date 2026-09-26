@@ -577,7 +577,7 @@ async def test_reaction_dispatch_and_error_handling(test_setup):
     mock_context = MagicMock(bot=mock_bot)
 
     # 1. Mapped emoji: 😄 resolves to 😁
-    eval_res = ("Nice message", ("😄", 1234), None)
+    eval_res = ("Nice message", ("😄", 1234), None, None)
     with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=eval_res)):
         await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
     mock_bot.set_message_reaction.assert_awaited_with(
@@ -829,7 +829,7 @@ async def test_photo_reply_and_reference_triggers_vision(test_setup):
     }
     s.append_chat_message(text_msg)
 
-    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=("Két cica van a képen!", None, None, "Két cica"))) as mock_vision:
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=("Két cica van a képen!", None, None, "Két cica", None))) as mock_vision:
         await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=101)
         mock_vision.assert_awaited_once()
         kwargs = mock_vision.call_args.kwargs
@@ -891,6 +891,7 @@ async def test_image_modify_via_multimodal_vision(test_setup):
             "mode": "modify",
         },
         "RoboCop action figure",
+        None,
     )
 
     with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)), \
@@ -961,7 +962,7 @@ async def test_debug_mode_logs_group_messages(test_setup):
 
         # Outgoing message logged
         mock_log_dbg.reset_mock()
-        with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("Hi Alice!", None, None))):
+        with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("Hi Alice!", None, None, None))):
             await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=12346)
             assert mock_log_dbg.call_count >= 1
             out_call = mock_log_dbg.call_args_list[0]
@@ -1124,4 +1125,343 @@ def test_split_into_html_pre_chunks():
         assert "<pre>" in c and "</pre>" in c
         assert "&lt;b&gt;" in c
 
+
+
+def test_parse_interval_relativedelta_and_helpers():
+    from handlers import (
+        parse_interval_relativedelta,
+        serialize_interval,
+        deserialize_interval,
+        parse_schedule_time,
+    )
+    from dateutil.relativedelta import relativedelta
+    import zoneinfo
+
+    # Single units
+    assert parse_interval_relativedelta("2h") == relativedelta(hours=2)
+    assert parse_interval_relativedelta("3 days") == relativedelta(days=3)
+    assert parse_interval_relativedelta("1 month") == relativedelta(months=1)
+    assert parse_interval_relativedelta("1 year") == relativedelta(years=1)
+    assert parse_interval_relativedelta("30 mins") == relativedelta(minutes=30)
+    assert parse_interval_relativedelta("2 weeks") == relativedelta(days=14)
+
+    # Compound units
+    compound = parse_interval_relativedelta("1 month 2 days 3 hours")
+    assert compound == relativedelta(months=1, days=2, hours=3)
+
+    # Clamping < 60s by default (for periodic schedules)
+    clamped = parse_interval_relativedelta("10s")
+    assert clamped == relativedelta(seconds=60)
+    clamped20 = parse_interval_relativedelta("20s")
+    assert clamped20 == relativedelta(seconds=60)
+
+    # unclamped with min_seconds=1 (for oneshot schedules)
+    unclamped = parse_interval_relativedelta("20s", min_seconds=1)
+    assert unclamped == relativedelta(seconds=20)
+    # Invalid unit returns None
+    assert parse_interval_relativedelta("blabla") is None
+    assert parse_interval_relativedelta("") is None
+
+    # Serialization / Deserialization
+    rd = relativedelta(years=1, months=2, days=3, hours=4, minutes=5, seconds=6)
+    serialized = serialize_interval(rd)
+    assert serialized == {"years": 1, "months": 2, "days": 3, "hours": 4, "minutes": 5, "seconds": 6}
+    deserialized = deserialize_interval(serialized)
+    assert deserialized == rd
+
+    # parse_schedule_time
+    tz = zoneinfo.ZoneInfo("UTC")
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=tz)
+
+    # Relative offset
+    res_rel = parse_schedule_time("in 2h", tz, now)
+    assert res_rel == datetime(2026, 9, 26, 14, 0, 0, tzinfo=tz)
+    res_rel2 = parse_schedule_time("+3 days", tz, now)
+    assert res_rel2 == datetime(2026, 9, 29, 12, 0, 0, tzinfo=tz)
+    res_rel3 = parse_schedule_time("+20s", tz, now)
+    assert res_rel3 == datetime(2026, 9, 26, 12, 0, 20, tzinfo=tz)
+    # Time-only (later today)
+    res_time = parse_schedule_time("18:30", tz, now)
+    assert res_time == datetime(2026, 9, 26, 18, 30, 0, tzinfo=tz)
+
+    # Time-only (already passed today -> next day)
+    res_time_past = parse_schedule_time("09:00", tz, now)
+    assert res_time_past == datetime(2026, 9, 27, 9, 0, 0, tzinfo=tz)
+
+    # Absolute ISO timestamp
+    res_iso = parse_schedule_time("2026-10-01T10:00:00", tz, now)
+    assert res_iso == datetime(2026, 10, 1, 10, 0, 0, tzinfo=tz)
+
+    # Invalid
+    assert parse_schedule_time("invalid_date_xyz", tz, now) is None
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_with_schedule_actions(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=2001))
+    mock_context = MagicMock(bot=mock_bot, job_queue=MagicMock())
+
+    # 1. LLM outputs oneshot schedule creation
+    sched_create_spec = {
+        "action": "create",
+        "type": "oneshot",
+        "time": "+1h",
+        "interval": "",
+        "start": "",
+        "description": "Remind Alice about meeting",
+    }
+    eval_res = ("Rendben, észben tartom!", None, None, sched_create_spec)
+
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=eval_res)):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+
+    replies = s.get_scheduled_replies()
+    assert len(replies) == 1
+    created_id = replies[0]["id"]
+    assert replies[0]["description"] == "Remind Alice about meeting"
+    assert replies[0]["type"] == "oneshot"
+    mock_context.job_queue.run_once.assert_called_once()
+
+    # 2. LLM outputs cancellation
+    sched_cancel_spec = {
+        "action": "cancel",
+        "schedule_id": created_id,
+    }
+    cancel_eval_res = ("Törölve az emlékeztető!", None, None, sched_cancel_spec)
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=cancel_eval_res)):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1235)
+
+    assert len(s.get_scheduled_replies()) == 0
+
+
+@pytest.mark.asyncio
+async def test_scheduled_reply_callback_oneshot_and_periodic(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=5001))
+    mock_context = MagicMock(bot=mock_bot, job_queue=MagicMock())
+
+    # 1. Oneshot reply execution
+    s_id = s.add_scheduled_reply({
+        "id": "sched_oneshot_1",
+        "type": "oneshot",
+        "chat_id": p.group_chat_id,
+        "target_msg_id": 42,
+        "target_time": "2026-09-26T14:00:00+00:00",
+        "interval_str": None,
+        "interval_spec": None,
+        "description": "Remind Bob to submit timesheet",
+        "created_at": "2026-09-26T12:00:00+00:00",
+    })
+
+    job_mock = MagicMock()
+    job_mock.data = {"schedule_id": s_id}
+    mock_context.job = job_mock
+
+    with patch.object(llm, "generate_scheduled_reply", AsyncMock(return_value="Hahó Bob, ne feledd a timesheetet! 😉")):
+        await handlers._scheduled_reply_callback(mock_context)
+
+    mock_bot.send_message.assert_awaited()
+    assert mock_bot.send_message.call_args.kwargs["chat_id"] == p.group_chat_id
+    assert mock_bot.send_message.call_args.kwargs["reply_to_message_id"] == 42
+    assert "timesheetet" in mock_bot.send_message.call_args.kwargs["text"]
+    # Oneshot reply is removed from state after firing
+    assert s.get_scheduled_reply(s_id) is None
+
+    # 2. Periodic reply execution
+    p_id = s.add_scheduled_reply({
+        "id": "sched_periodic_1",
+        "type": "periodic",
+        "chat_id": p.group_chat_id,
+        "target_msg_id": None,
+        "target_time": "2026-09-26T14:00:00+00:00",
+        "interval_str": "1 day",
+        "interval_spec": {"years": 0, "months": 0, "days": 1, "hours": 0, "minutes": 0, "seconds": 0},
+        "description": "Daily standup reminder",
+        "created_at": "2026-09-26T12:00:00+00:00",
+    })
+    job_mock.data = {"schedule_id": p_id}
+
+    with patch.object(llm, "generate_scheduled_reply", AsyncMock(return_value="Kezdődik a napi standup! 🚀")):
+        await handlers._scheduled_reply_callback(mock_context)
+
+    # Periodic reply is NOT removed; its target_time is updated to the future
+    updated_p = s.get_scheduled_reply(p_id)
+    assert updated_p is not None
+    assert datetime.fromisoformat(updated_p["target_time"]) > s.get_current_time()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_reply_callback_sleeping(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=6001))
+    mock_context = MagicMock(bot=mock_bot, job_queue=MagicMock())
+
+    # Enable sleep mode
+    s.set_sleep_schedule(enabled=True, sleep_start="00:00", sleep_end="23:59")
+    assert s.is_sleeping() is True
+
+    # Periodic reply during sleep hours: advances target_time, does NOT send message
+    p_id = s.add_scheduled_reply({
+        "id": "sched_periodic_quiet",
+        "type": "periodic",
+        "chat_id": p.group_chat_id,
+        "target_msg_id": None,
+        "target_time": "2026-09-26T14:00:00+00:00",
+        "interval_str": "1 day",
+        "interval_spec": {"years": 0, "months": 0, "days": 1, "hours": 0, "minutes": 0, "seconds": 0},
+        "description": "Periodic check",
+        "created_at": "2026-09-26T12:00:00+00:00",
+    })
+    job_mock = MagicMock()
+    job_mock.data = {"schedule_id": p_id}
+    mock_context.job = job_mock
+
+    await handlers._scheduled_reply_callback(mock_context)
+    mock_bot.send_message.assert_not_awaited()
+    assert s.get_scheduled_reply(p_id) is not None
+
+    # Oneshot reply during sleep hours: executes anyway (explicit user request)
+    o_id = s.add_scheduled_reply({
+        "id": "sched_oneshot_quiet",
+        "type": "oneshot",
+        "chat_id": p.group_chat_id,
+        "target_msg_id": 99,
+        "target_time": "2026-09-26T14:00:00+00:00",
+        "interval_str": None,
+        "interval_spec": None,
+        "description": "Wake up Alice",
+        "created_at": "2026-09-26T12:00:00+00:00",
+    })
+    job_mock.data = {"schedule_id": o_id}
+    with patch.object(llm, "generate_scheduled_reply", AsyncMock(return_value="Ébresztő Alice!")):
+        await handlers._scheduled_reply_callback(mock_context)
+    mock_bot.send_message.assert_awaited_once()
+
+
+def test_load_and_schedule_pending_replies(test_setup):
+    from datetime import timedelta
+    p, s, m, llm, handlers = test_setup
+    mock_jq = MagicMock()
+    mock_context = MagicMock(job_queue=mock_jq)
+
+    now = s.get_current_time()
+    tz = s.get_tzinfo()
+
+    # 1. Future oneshot (> now) -> scheduled
+    future_dt = now + timedelta(hours=2)
+    s.add_scheduled_reply({
+        "id": "sched_future",
+        "type": "oneshot",
+        "chat_id": p.group_chat_id,
+        "target_time": future_dt.isoformat(),
+        "description": "Future job",
+    })
+
+    # 2. Overdue oneshot (< 15 min ago) -> scheduled to fire immediately (delay 1.0s)
+    recent_past = now - timedelta(minutes=5)
+    s.add_scheduled_reply({
+        "id": "sched_recent_past",
+        "type": "oneshot",
+        "chat_id": p.group_chat_id,
+        "target_time": recent_past.isoformat(),
+        "description": "Recent past job",
+    })
+
+    # 3. Expired oneshot (>= 15 min ago) -> discarded
+    old_past = now - timedelta(hours=2)
+    s.add_scheduled_reply({
+        "id": "sched_expired",
+        "type": "oneshot",
+        "chat_id": p.group_chat_id,
+        "target_time": old_past.isoformat(),
+        "description": "Expired job",
+    })
+
+    # 4. Periodic in past -> advanced to future and scheduled
+    s.add_scheduled_reply({
+        "id": "sched_periodic_past",
+        "type": "periodic",
+        "chat_id": p.group_chat_id,
+        "target_time": old_past.isoformat(),
+        "interval_str": "1 day",
+        "interval_spec": {"years": 0, "months": 0, "days": 1, "hours": 0, "minutes": 0, "seconds": 0},
+        "description": "Periodic past job",
+    })
+
+    handlers.load_and_schedule_pending_replies(mock_context)
+
+    # Expired job should be removed
+    assert s.get_scheduled_reply("sched_expired") is None
+    # Other 3 should be active
+    assert s.get_scheduled_reply("sched_future") is not None
+    assert s.get_scheduled_reply("sched_recent_past") is not None
+    assert s.get_scheduled_reply("sched_periodic_past") is not None
+    assert mock_jq.run_once.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_cmd_scheduled_and_status(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_update = MagicMock()
+    mock_update.effective_user = MagicMock(id=p.admin_user_ids[0])
+    mock_update.effective_chat = MagicMock(type="private")
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock(args=[], job_queue=MagicMock())
+
+    # 1. /status with 0 scheduled replies
+    await handlers.cmd_status(mock_update, mock_context)
+    status_text = mock_msg.reply_text.call_args[0][0]
+    assert "Scheduled Replies: <code>0 active (Next: None)</code>" in status_text
+
+    # 2. /scheduled when empty
+    mock_msg.reply_text.reset_mock()
+    await handlers.cmd_scheduled(mock_update, mock_context)
+    assert "No active scheduled replies" in mock_msg.reply_text.call_args[0][0]
+
+    # 3. Add scheduled reply and list
+    s_id = s.add_scheduled_reply({
+        "id": "sched_test_101",
+        "type": "oneshot",
+        "chat_id": p.group_chat_id,
+        "target_time": "2026-10-01T10:00:00+00:00",
+        "description": "Send monthly report",
+    })
+
+    mock_msg.reply_text.reset_mock()
+    await handlers.cmd_scheduled(mock_update, mock_context)
+    list_text = mock_msg.reply_text.call_args[0][0]
+    assert "sched_test_101" in list_text
+    assert "Send monthly report" in list_text
+
+    # 4. Status now reflects 1 active
+    mock_msg.reply_text.reset_mock()
+    await handlers.cmd_status(mock_update, mock_context)
+    status_text2 = mock_msg.reply_text.call_args[0][0]
+    assert "Scheduled Replies: <code>1 active" in status_text2
+
+    # 5. Cancel scheduled reply
+    mock_msg.reply_text.reset_mock()
+    mock_context.args = ["cancel", s_id]
+    await handlers.cmd_scheduled(mock_update, mock_context)
+    cancel_text = mock_msg.reply_text.call_args[0][0]
+    assert "has been cancelled" in cancel_text
+    assert s.get_scheduled_reply(s_id) is None
+
+    # 6. Cancel nonexistent schedule
+    mock_msg.reply_text.reset_mock()
+    mock_context.args = ["cancel", "nonexistent_id"]
+    await handlers.cmd_scheduled(mock_update, mock_context)
+    assert "not found" in mock_msg.reply_text.call_args[0][0]
 

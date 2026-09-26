@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
+from dateutil import parser as dateutil_parser
+from dateutil.relativedelta import relativedelta
+
 from telegram import ReactionTypeEmoji, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -46,7 +49,7 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 /spontaneous [on|off] - View or toggle periodic spontaneous messages
 /spontaneous_interval [min] [max] - Adjust random timer interval in hours (e.g. /spontaneous_interval 2 4)
 /spontaneous_now - Instantly trigger a spontaneous message or poll to the group
-
+/scheduled [list|cancel <id>] - View or cancel active scheduled replies and reminders
 <b>Prompt, Grounding & Vision</b>
 /prompt - Upload system prompt text file as-is
 /prompt load - Expect a system prompt text file upload to validate and load
@@ -134,6 +137,103 @@ def split_into_html_pre_chunks(raw_text: str, header: str = "", max_escaped_len:
         messages.append(f"{prefix}<pre>{esc_chunk}</pre>")
     return messages
 
+
+INTERVAL_UNIT_MAP = {
+    "y": "years", "yr": "years", "yrs": "years", "year": "years", "years": "years",
+    "mo": "months", "month": "months", "months": "months",
+    "w": "weeks", "wk": "weeks", "wks": "weeks", "week": "weeks", "weeks": "weeks",
+    "d": "days", "day": "days", "days": "days",
+    "h": "hours", "hr": "hours", "hrs": "hours", "hour": "hours", "hours": "hours",
+    "m": "minutes", "min": "minutes", "mins": "minutes", "minute": "minutes", "minutes": "minutes",
+    "s": "seconds", "sec": "seconds", "secs": "seconds", "second": "seconds", "seconds": "seconds",
+}
+
+def parse_interval_relativedelta(interval_str: str, min_seconds: int = 60) -> Optional[relativedelta]:
+    if not interval_str:
+        return None
+    s = interval_str.strip()
+    matches = list(re.finditer(r"(\d+)\s*([a-zA-Z]+)", s))
+    if not matches:
+        return None
+    kwargs = {"years": 0, "months": 0, "weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0}
+    matched_any = False
+    for m in matches:
+        unit = m.group(2).lower()
+        if unit not in INTERVAL_UNIT_MAP:
+            return None
+        val = int(m.group(1))
+        kwargs[INTERVAL_UNIT_MAP[unit]] += val
+        matched_any = True
+    if not matched_any:
+        return None
+    if (
+        min_seconds > 0
+        and kwargs["years"] == 0
+        and kwargs["months"] == 0
+        and kwargs["weeks"] == 0
+        and kwargs["days"] == 0
+        and kwargs["hours"] == 0
+        and kwargs["minutes"] == 0
+        and kwargs["seconds"] < min_seconds
+    ):
+        kwargs["seconds"] = min_seconds
+    return relativedelta(**kwargs)
+
+def serialize_interval(rd: Optional[relativedelta]) -> Optional[Dict[str, int]]:
+    if rd is None:
+        return None
+    return {
+        "years": int(getattr(rd, "years", 0)),
+        "months": int(getattr(rd, "months", 0)),
+        "days": int(getattr(rd, "days", 0)),
+        "hours": int(getattr(rd, "hours", 0)),
+        "minutes": int(getattr(rd, "minutes", 0)),
+        "seconds": int(getattr(rd, "seconds", 0)),
+    }
+
+def deserialize_interval(d: Optional[Dict[str, Any]]) -> relativedelta:
+    if not d or not isinstance(d, dict):
+        return relativedelta(seconds=60)
+    return relativedelta(
+        years=int(d.get("years", 0)),
+        months=int(d.get("months", 0)),
+        days=int(d.get("days", 0)),
+        hours=int(d.get("hours", 0)),
+        minutes=int(d.get("minutes", 0)),
+        seconds=int(d.get("seconds", 0)),
+    )
+
+def parse_schedule_time(time_str: str, tz: Any, now: datetime) -> Optional[datetime]:
+    if not time_str:
+        return None
+    raw = time_str.strip()
+
+    # 1. Relative offset e.g. "in 3 days", "+2h", "in 30m", "+ 1 month"
+    rel_clean = re.sub(r"^(?:in|\+)\s*", "", raw, flags=re.IGNORECASE).strip()
+    rd = parse_interval_relativedelta(rel_clean, min_seconds=1)
+    if rd is not None:
+        return now + rd
+
+    # 2. Time-only format: HH:MM or HH:MM:SS
+    m_time = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", raw)
+    if m_time:
+        hr = int(m_time.group(1))
+        mn = int(m_time.group(2))
+        sec = int(m_time.group(3) or 0)
+        if 0 <= hr < 24 and 0 <= mn < 60 and 0 <= sec < 60:
+            target_dt = now.replace(hour=hr, minute=mn, second=sec, microsecond=0)
+            if target_dt <= now:
+                target_dt += relativedelta(days=1)
+            return target_dt
+
+    # 3. Absolute timestamp via dateutil parser
+    try:
+        parsed = dateutil_parser.parse(raw)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=tz)
+        return parsed.astimezone(tz)
+    except Exception:
+        return None
 
 
 class BotHandlers:
@@ -397,6 +497,257 @@ class BotHandlers:
             logger.error("Failed to send spontaneous message: %s", e)
             return False, f"Failed to send message: {e}"
 
+    # --- Scheduled Replies ---
+
+    def schedule_reply_job(self, context: ContextTypes.DEFAULT_TYPE, entry: Dict[str, Any]) -> None:
+        """Schedules a run_once job in JobQueue for the given schedule entry."""
+        if not context.job_queue:
+            logger.debug("JobQueue not initialized, cannot schedule reply job")
+            return
+
+        sched_id = entry.get("id")
+        if not sched_id:
+            return
+
+        job_name = f"scheduled_reply_{sched_id}"
+        # Remove any existing job with that name first
+        for j in context.job_queue.get_jobs_by_name(job_name):
+            j.schedule_removal()
+
+        raw_target = entry.get("target_time")
+        if not raw_target:
+            return
+
+        now = self.state.get_current_time()
+        tz = self.state.get_tzinfo()
+        try:
+            target_dt = datetime.fromisoformat(raw_target)
+            if target_dt.tzinfo is None:
+                target_dt = target_dt.replace(tzinfo=tz)
+            else:
+                target_dt = target_dt.astimezone(tz)
+        except Exception as e:
+            logger.error("Failed to parse target_time for schedule '%s': %s", sched_id, e)
+            return
+
+        delay_sec = max(1.0, (target_dt - now).total_seconds())
+        context.job_queue.run_once(
+            self._scheduled_reply_callback,
+            when=delay_sec,
+            name=job_name,
+            data={"schedule_id": sched_id},
+        )
+        logger.info("Scheduled reply job '%s' for %s (delay: %.1fs)", sched_id, target_dt.isoformat(), delay_sec)
+
+    def cancel_reply_job(self, context: ContextTypes.DEFAULT_TYPE, schedule_id: str) -> bool:
+        """Cancels a scheduled reply job in JobQueue by schedule ID."""
+        if not context.job_queue:
+            return False
+        job_name = f"scheduled_reply_{schedule_id}"
+        jobs = context.job_queue.get_jobs_by_name(job_name)
+        found = False
+        for j in jobs:
+            j.schedule_removal()
+            found = True
+        return found
+
+    async def _scheduled_reply_callback(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Invoked by JobQueue when a scheduled reply timer fires."""
+        job = context.job
+        schedule_id = job.data.get("schedule_id") if job and job.data else None
+        if not schedule_id:
+            logger.warning("Scheduled reply callback fired without schedule_id")
+            return
+
+        entry = self.state.get_scheduled_reply(schedule_id)
+        if not entry:
+            logger.warning("Scheduled reply entry '%s' not found in state (may have been cancelled)", schedule_id)
+            return
+
+        sched_type = entry.get("type", "oneshot")
+        sched_desc = entry.get("description", "")
+        chat_id = entry.get("chat_id") or self.params.group_chat_id
+        target_msg_id = entry.get("target_msg_id")
+
+        # Sleep schedule handling: periodic replies defer during quiet hours; oneshot execute regardless
+        if sched_type == "periodic" and self.state.is_sleeping():
+            logger.info("Periodic schedule '%s' triggered during quiet hours; advancing to next interval.", schedule_id)
+            now = self.state.get_current_time()
+            interval_rd = deserialize_interval(entry.get("interval_spec"))
+            try:
+                curr_target = datetime.fromisoformat(entry["target_time"])
+                if curr_target.tzinfo is None:
+                    curr_target = curr_target.replace(tzinfo=self.state.get_tzinfo())
+            except Exception:
+                curr_target = now
+            next_dt = curr_target + interval_rd
+            while next_dt <= now:
+                next_dt += interval_rd
+            self.state.update_scheduled_reply(schedule_id, {"target_time": next_dt.isoformat()})
+            updated_entry = self.state.get_scheduled_reply(schedule_id)
+            if updated_entry:
+                self.schedule_reply_job(context, updated_entry)
+            return
+
+        recent_transcript = self._format_transcript(self.state.get_chat_history())
+        memory_context = self.memory.format_for_context()
+        sys_prompt = self.state.get_effective_system_prompt()
+        tz_str = self.state.get_timezone()
+
+        try:
+            logger.info("Generating scheduled reply for job '%s' (type=%s, chat=%s)...", schedule_id, sched_type, chat_id)
+            reply_text = await self.llm.generate_scheduled_reply(
+                system_prompt=sys_prompt,
+                memory_context=memory_context,
+                transcript=recent_transcript,
+                scheduled_description=sched_desc,
+                scheduled_type=sched_type,
+                timezone_str=tz_str,
+            )
+
+            if reply_text:
+                sent_msg = None
+                try:
+                    sent_msg = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=reply_text,
+                        reply_to_message_id=target_msg_id,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as pe:
+                    logger.debug("Failed sending scheduled reply with HTML parse mode (%s), attempting without HTML", pe)
+                    try:
+                        sent_msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=reply_text,
+                            reply_to_message_id=target_msg_id,
+                        )
+                    except Exception as re:
+                        logger.debug("Failed sending scheduled reply with reply_to_message_id (%s), sending to root", re)
+                        try:
+                            sent_msg = await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=reply_text,
+                            )
+                        except Exception as e_send:
+                            logger.error("Failed to send scheduled reply message: %s", e_send)
+
+                if sent_msg:
+                    now_str = self.state.get_current_time_str()
+                    if self.state.is_debug_mode():
+                        reply_info = f" | Reply to msg ID: {target_msg_id}" if target_msg_id else ""
+                        self._log_debug_group_msg(
+                            "OUTGOING",
+                            f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Scheduled Reply ({sched_type})\nText: {reply_text}",
+                        )
+
+                    bot_uid = getattr(context.bot, "id", 0)
+                    bot_uname = getattr(context.bot, "first_name", "Pletykas")
+                    msg_entry = {
+                        "id": sent_msg.message_id,
+                        "from_user_id": int(bot_uid) if isinstance(bot_uid, (int, float)) else 0,
+                        "from_user_name": str(bot_uname) if isinstance(bot_uname, str) else "Pletykas",
+                        "timestamp_epoch": time.time(),
+                        "timestamp_str": now_str,
+                        "reply_to_msg_id": target_msg_id,
+                        "reply_to_user_name": None,
+                        "text": reply_text,
+                        "media_type": "none",
+                        "media_b64": None,
+                    }
+                    self.state.append_chat_message(msg_entry)
+                    self.state.append_memory_message(msg_entry)
+
+        except Exception as e:
+            logger.error("Error executing scheduled reply callback for '%s': %s", schedule_id, e, exc_info=True)
+
+        # Post-execution lifecycle:
+        if sched_type == "oneshot":
+            self.state.remove_scheduled_reply(schedule_id)
+            logger.info("Oneshot scheduled reply '%s' executed and removed from state", schedule_id)
+        elif sched_type == "periodic":
+            now = self.state.get_current_time()
+            interval_rd = deserialize_interval(entry.get("interval_spec"))
+            try:
+                curr_target = datetime.fromisoformat(entry["target_time"])
+                if curr_target.tzinfo is None:
+                    curr_target = curr_target.replace(tzinfo=self.state.get_tzinfo())
+            except Exception:
+                curr_target = now
+            next_dt = curr_target + interval_rd
+            while next_dt <= now:
+                next_dt += interval_rd
+            self.state.update_scheduled_reply(schedule_id, {"target_time": next_dt.isoformat()})
+            updated_entry = self.state.get_scheduled_reply(schedule_id)
+            if updated_entry:
+                self.schedule_reply_job(context, updated_entry)
+            logger.info("Periodic scheduled reply '%s' rescheduled for %s", schedule_id, next_dt.isoformat())
+
+    def load_and_schedule_pending_replies(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Loads and reschedules pending scheduled replies from persistent state upon bot startup."""
+        if not context.job_queue:
+            logger.warning("JobQueue not available, skipping scheduled replies restoration")
+            return
+
+        replies = self.state.get_scheduled_replies()
+        total = len(replies)
+        active_count = 0
+        now = self.state.get_current_time()
+        tz = self.state.get_tzinfo()
+
+        for entry in replies:
+            sched_id = entry.get("id")
+            if not sched_id:
+                continue
+            sched_type = entry.get("type", "oneshot")
+            raw_target = entry.get("target_time")
+            if not raw_target:
+                continue
+
+            try:
+                target_dt = datetime.fromisoformat(raw_target)
+                if target_dt.tzinfo is None:
+                    target_dt = target_dt.replace(tzinfo=tz)
+                else:
+                    target_dt = target_dt.astimezone(tz)
+            except Exception as e:
+                logger.warning("Failed to parse target_time for schedule '%s': %s", sched_id, e)
+                continue
+
+            if sched_type == "oneshot":
+                if target_dt > now:
+                    self.schedule_reply_job(context, entry)
+                    active_count += 1
+                else:
+                    elapsed = (now - target_dt).total_seconds()
+                    if elapsed < 900:  # < 15 minutes
+                        logger.info("Oneshot schedule '%s' was due %.0fs ago (<15m). Firing immediately.", sched_id, elapsed)
+                        job_name = f"scheduled_reply_{sched_id}"
+                        context.job_queue.run_once(
+                            self._scheduled_reply_callback,
+                            when=1.0,
+                            name=job_name,
+                            data={"schedule_id": sched_id},
+                        )
+                        active_count += 1
+                    else:
+                        logger.warning("Oneshot schedule '%s' expired %.0fs ago (>=15m) while offline. Discarding.", sched_id, elapsed)
+                        self.state.remove_scheduled_reply(sched_id)
+            elif sched_type == "periodic":
+                interval_rd = deserialize_interval(entry.get("interval_spec"))
+                if target_dt > now:
+                    self.schedule_reply_job(context, entry)
+                    active_count += 1
+                else:
+                    while target_dt <= now:
+                        target_dt += interval_rd
+                    self.state.update_scheduled_reply(sched_id, {"target_time": target_dt.isoformat()})
+                    entry["target_time"] = target_dt.isoformat()
+                    self.schedule_reply_job(context, entry)
+                    active_count += 1
+
+        logger.info("Loaded %d scheduled replies from state file (%d active).", total, active_count)
+
     # --- Memory Curation ---
 
     async def trigger_curation(self) -> Dict[str, Any]:
@@ -625,12 +976,13 @@ class BotHandlers:
             reply_text: Optional[str] = None
             reaction: Optional[Tuple[str, Optional[int]]] = None
             image_spec: Optional[Dict[str, str]] = None
+            schedule_spec: Optional[Dict[str, Any]] = None
 
             if photo_entry:
                 # Multimodal evaluation via Vision Model
                 photo_bytes = base64.b64decode(photo_entry["media_b64"])
                 user_caption = trigger_entry.get("text", "").replace("[Photo]", "").strip() if trigger_entry else ""
-                reply_text, reaction, image_spec, img_desc = await self.llm.describe_and_reply_image(
+                reply_text, reaction, image_spec, img_desc, schedule_spec = await self.llm.describe_and_reply_image(
                     system_prompt=sys_prompt,
                     memory_context=memory_ctx,
                     transcript=transcript,
@@ -647,7 +999,7 @@ class BotHandlers:
                     self.state.save()
             else:
                 # Standard conversational evaluation
-                reply_text, reaction, image_spec = await self.llm.evaluate_and_reply(
+                reply_text, reaction, image_spec, schedule_spec = await self.llm.evaluate_and_reply(
                     system_prompt=sys_prompt,
                     memory_context=memory_ctx,
                     transcript=transcript,
@@ -656,6 +1008,61 @@ class BotHandlers:
                     talkativeness=talkativeness,
                 )
 
+            # Handle Schedule Actions (Create or Cancel)
+            if schedule_spec:
+                action = schedule_spec.get("action")
+                if action == "create":
+                    sched_type = schedule_spec.get("type", "oneshot")
+                    time_str = schedule_spec.get("time") or schedule_spec.get("start") or ""
+                    interval_str = schedule_spec.get("interval") if sched_type == "periodic" else None
+                    interval_spec = None
+                    interval_rd = None
+                    if sched_type == "periodic":
+                        interval_rd = parse_interval_relativedelta(interval_str or "", min_seconds=60)
+                        if interval_rd is None:
+                            interval_rd = relativedelta(days=1)
+                            interval_str = "1 day"
+                        interval_spec = serialize_interval(interval_rd)
+
+                    now = self.state.get_current_time()
+                    tz = self.state.get_tzinfo()
+                    target_dt = None
+                    if sched_type == "periodic" and not time_str:
+                        target_dt = now + (interval_rd or relativedelta(days=1))
+                    elif time_str:
+                        target_dt = parse_schedule_time(time_str, tz, now)
+
+                    if target_dt is None:
+                        logger.warning("Unparseable schedule time '%s', defaulting to 60s from now", time_str)
+                        target_dt = now + relativedelta(seconds=60)
+                    elif target_dt <= now:
+                        if sched_type == "periodic" and interval_rd:
+                            while target_dt <= now:
+                                target_dt += interval_rd
+                        else:
+                            target_dt = now + relativedelta(seconds=60)
+
+                    sched_entry = {
+                        "id": f"sched_{int(time.time())}_{trigger_msg_id or random.randint(1000, 9999)}",
+                        "type": sched_type,
+                        "chat_id": chat_id,
+                        "target_msg_id": trigger_msg_id,
+                        "target_time": target_dt.isoformat(),
+                        "interval_str": interval_str,
+                        "interval_spec": interval_spec,
+                        "description": schedule_spec.get("description", "").strip(),
+                        "created_at": now.isoformat(),
+                    }
+                    self.state.add_scheduled_reply(sched_entry)
+                    self.schedule_reply_job(context, sched_entry)
+                    logger.info("Registered and scheduled reply job: %s (type=%s, target=%s)", sched_entry["id"], sched_type, sched_entry["target_time"])
+
+                elif action == "cancel":
+                    sched_id = schedule_spec.get("schedule_id", "").strip()
+                    if sched_id:
+                        self.cancel_reply_job(context, sched_id)
+                        removed = self.state.remove_scheduled_reply(sched_id)
+                        logger.info("Cancelled scheduled reply '%s' (removed from state: %s)", sched_id, removed)
             # 1. Emoji Reaction Action
             if reaction:
                 raw_emoji, target_id = reaction
@@ -1072,6 +1479,26 @@ class BotHandlers:
         tl_primary = self.params.model_thinking_level or "off (default)"
         tl_large = self.params.effective_large_thinking_level or "off (default)"
         tl_image = self.params.effective_image_thinking_level or "minimal (default)"
+
+        # Scheduled replies stats
+        sched_replies = self.state.get_scheduled_replies()
+        sched_count = len(sched_replies)
+        next_sched_str = "None"
+        if sched_replies:
+            valid_targets = []
+            for r in sched_replies:
+                try:
+                    dt = datetime.fromisoformat(r["target_time"])
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=self.state.get_tzinfo())
+                    valid_targets.append(dt)
+                except Exception:
+                    pass
+            if valid_targets:
+                earliest = min(valid_targets)
+                next_sched_str = self.state.format_time(earliest)
+        sched_status = f"{sched_count} active (Next: {next_sched_str})"
+
         text = (
             f"📊 <b>Pletykas Status</b>\n"
             f"• Group Chat ID: <code>{self.params.group_chat_id}</code>\n"
@@ -1086,6 +1513,7 @@ class BotHandlers:
             f"• Debug Mode: <code>{debug_status}</code>\n"
             f"• Sleep Schedule: <code>{sleep_status}</code>\n"
             f"• Spontaneous Messages: <code>{spont_status}</code>\n"
+            f"• Scheduled Replies: <code>{sched_status}</code>\n"
             f"• Models:\n"
             f"  - Primary: <code>{self.params.model_name}</code> (thinking: {tl_primary})\n"
             f"  - Larger: <code>{self.params.model_large_name}</code> (thinking: {tl_large})\n"
@@ -1387,6 +1815,64 @@ class BotHandlers:
                 parse_mode=ParseMode.HTML,
             )
 
+
+    async def cmd_scheduled(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update.effective_user.id if update.effective_user else None):
+            return
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+
+        args = context.args or []
+        subcommand = args[0].strip().lower() if args else "list"
+
+        if subcommand in ("list", "show"):
+            replies = self.state.get_scheduled_replies()
+            if not replies:
+                await update.effective_message.reply_text("📋 No active scheduled replies.")
+                return
+
+            lines = ["📋 <b>Active Scheduled Replies</b>:"]
+            for r in replies:
+                s_id = html.escape(str(r.get("id", "")))
+                s_type = html.escape(str(r.get("type", "oneshot")))
+                t_time = html.escape(str(r.get("target_time", "")))
+                desc = html.escape(str(r.get("description", "")))
+                if s_type == "periodic":
+                    interval = html.escape(str(r.get("interval_str", "")))
+                    lines.append(
+                        f"\n• <b>ID:</b> <code>{s_id}</code>\n"
+                        f"  <b>Type:</b> periodic (every {interval})\n"
+                        f"  <b>Next:</b> <code>{t_time}</code>\n"
+                        f"  <b>Task:</b> {desc}"
+                    )
+                else:
+                    lines.append(
+                        f"\n• <b>ID:</b> <code>{s_id}</code>\n"
+                        f"  <b>Type:</b> oneshot\n"
+                        f"  <b>Due:</b> <code>{t_time}</code>\n"
+                        f"  <b>Task:</b> {desc}"
+                    )
+            lines.append("\n<i>To cancel a schedule:</i> <code>/scheduled cancel &lt;id&gt;</code>")
+            await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            return
+
+        if subcommand == "cancel":
+            if len(args) < 2:
+                await update.effective_message.reply_text("❌ Usage: <code>/scheduled cancel &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
+                return
+            target_id = args[1].strip()
+            self.cancel_reply_job(context, target_id)
+            removed = self.state.remove_scheduled_reply(target_id)
+            if removed:
+                await update.effective_message.reply_text(f"✅ Scheduled reply <code>{html.escape(target_id)}</code> has been cancelled.", parse_mode=ParseMode.HTML)
+            else:
+                await update.effective_message.reply_text(f"❌ Scheduled reply <code>{html.escape(target_id)}</code> not found.", parse_mode=ParseMode.HTML)
+            return
+
+        await update.effective_message.reply_text(
+            "❌ Usage: <code>/scheduled</code> (or <code>/scheduled list</code>) to view, or <code>/scheduled cancel &lt;id&gt;</code> to cancel.",
+            parse_mode=ParseMode.HTML,
+        )
     async def _process_prompt_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any) -> None:
         user_id = update.effective_user.id if update.effective_user else None
         if not document:
@@ -1761,5 +2247,6 @@ class BotHandlers:
         application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         application.add_handler(CommandHandler("curate", self.cmd_curate))
 
+        application.add_handler(CommandHandler(["scheduled", "schedules"], self.cmd_scheduled))
         # Main message handler (captures text, photos, media in groups and private)
         application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.on_message))

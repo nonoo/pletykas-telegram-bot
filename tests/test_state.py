@@ -296,3 +296,96 @@ def test_state_spontaneous_next_fire_time():
         sm3 = StateManager(sf)
         sm3.load()
         assert sm3.get_spontaneous_next_fire_time() is None
+
+
+def test_state_scheduled_replies_crud_and_persistence():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        # Initially empty
+        assert sm.get_scheduled_replies() == []
+        assert sm.format_scheduled_replies_context() == "None"
+
+        # Add a oneshot reply
+        entry1 = {
+            "id": "sched_1001",
+            "type": "oneshot",
+            "chat_id": -100123,
+            "target_msg_id": 42,
+            "target_time": "2026-09-27T09:00:00+00:00",
+            "interval_str": None,
+            "interval_spec": None,
+            "description": "Remind Alice about report",
+            "created_at": "2026-09-26T12:00:00+00:00",
+        }
+        s_id1 = sm.add_scheduled_reply(entry1)
+        assert s_id1 == "sched_1001"
+        assert len(sm.get_scheduled_replies()) == 1
+        assert sm.get_scheduled_reply("sched_1001")["description"] == "Remind Alice about report"
+
+        # Add a periodic reply without id (should auto-generate)
+        entry2 = {
+            "type": "periodic",
+            "chat_id": -100123,
+            "target_msg_id": None,
+            "target_time": "2026-10-01T10:00:00+00:00",
+            "interval_str": "1 month",
+            "interval_spec": {"years": 0, "months": 1, "days": 0, "hours": 0, "minutes": 0, "seconds": 0},
+            "description": "Monthly retro",
+            "created_at": "2026-09-26T12:00:00+00:00",
+        }
+        s_id2 = sm.add_scheduled_reply(entry2)
+        assert s_id2.startswith("sched_")
+        assert len(sm.get_scheduled_replies()) == 2
+
+        # Verify formatting
+        context = sm.format_scheduled_replies_context()
+        assert "sched_1001" in context
+        assert "Type: oneshot" in context
+        assert "Due: 2026-09-27T09:00:00+00:00" in context
+        assert "Remind Alice about report" in context
+        assert s_id2 in context
+        assert "Type: periodic" in context
+        assert "Interval: 1 month" in context
+        assert "Monthly retro" in context
+
+        # Update
+        updated = sm.update_scheduled_reply("sched_1001", {"target_time": "2026-09-27T10:00:00+00:00"})
+        assert updated is True
+        assert sm.get_scheduled_reply("sched_1001")["target_time"] == "2026-09-27T10:00:00+00:00"
+        assert sm.update_scheduled_reply("nonexistent", {"target_time": "2026-09-27T10:00:00+00:00"}) is False
+
+        # Reload from disk and verify persistence
+        sm2 = StateManager(sf)
+        sm2.load()
+        assert len(sm2.get_scheduled_replies()) == 2
+        assert sm2.get_scheduled_reply("sched_1001")["target_time"] == "2026-09-27T10:00:00+00:00"
+
+        # Remove
+        removed = sm2.remove_scheduled_reply("sched_1001")
+        assert removed is True
+        assert len(sm2.get_scheduled_replies()) == 1
+        assert sm2.get_scheduled_reply("sched_1001") is None
+        assert sm2.remove_scheduled_reply("sched_1001") is False
+
+        # Reload again
+        sm3 = StateManager(sf)
+        sm3.load()
+        assert len(sm3.get_scheduled_replies()) == 1
+        assert sm3.get_scheduled_reply(s_id2) is not None
+
+
+def test_state_scheduled_replies_migration():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        # Write state JSON without scheduled_replies key
+        with open(sf, "w", encoding="utf-8") as f:
+            import json
+            json.dump({"version": 1, "language": "English"}, f)
+
+        sm = StateManager(sf)
+        sm.load()
+        assert sm.get_scheduled_replies() == []
+        assert sm.format_scheduled_replies_context() == "None"
