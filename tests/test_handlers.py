@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime
 import html
@@ -156,6 +157,15 @@ def test_is_direct_trigger(test_setup):
     bot_user = MagicMock(is_bot=True, id=9999, username="pletykas_bot")
     msg_reply.reply_to_message = MagicMock(from_user=bot_user)
     assert handlers._is_direct_trigger(msg_reply, bot_username="pletykas_bot", bot_id=9999) is True
+
+    # 6b. Bot display name with extra words (e.g. "Pletykas Bot") matches single word "Pletykas"
+    msg_bot_first_name = MagicMock(reply_to_message=None, text="Pletykas, mit gondolsz?", caption=None, entities=[])
+    assert handlers._is_direct_trigger(msg_bot_first_name, bot_username="pletykas_bot", bot_name="Pletykas Bot") is True
+
+    # 6c. Photo with caption mention entity
+    mention_entity = MagicMock(type="mention", offset=0, length=13)
+    msg_photo_caption = MagicMock(reply_to_message=None, text=None, caption="@pletykas_bot nézd", entities=[], caption_entities=[mention_entity])
+    assert handlers._is_direct_trigger(msg_photo_caption, bot_username="pletykas_bot") is True
 
     # 7. Regular message between humans
     msg_human = MagicMock(reply_to_message=None, text="Hey Bob, want to grab lunch?", caption=None, entities=[])
@@ -414,8 +424,69 @@ async def test_debounce_job_handling(test_setup):
     # New job scheduled via run_once
     mock_context.job_queue.run_once.assert_called_once()
     call_kwargs = mock_context.job_queue.run_once.call_args[1]
+    assert call_kwargs["when"] == 5
     assert "job_kwargs" in call_kwargs
     assert call_kwargs["job_kwargs"]["id"].startswith(f"debounce_{chat_id}_")
+    assert len(s.get_chat_history()) == 1
+
+@pytest.mark.asyncio
+async def test_bot_mention_or_nickname_ignores_cooldown_and_evaluates_immediately(test_setup):
+    p, s, m, llm, handlers = test_setup
+    s.set_spontaneous_settings(enabled=False)
+    assert s.get_cooldown_sec() == 5
+
+    chat_id = -1001234567890
+    # Pending debounce job from an earlier message
+    mock_job1 = MagicMock()
+    mock_job1.schedule_removal = MagicMock()
+    handlers._debounce_jobs[chat_id] = mock_job1
+
+    mock_msg = MagicMock()
+    mock_msg.message_id = 2001
+    mock_msg.from_user.id = 555
+    mock_msg.from_user.full_name = "User"
+    mock_msg.text = "pletyi, mondj egy viccet!"
+    mock_msg.caption = None
+    mock_msg.photo = []
+    mock_msg.voice = None
+    mock_msg.audio = None
+    mock_msg.video = None
+    mock_msg.video_note = None
+    mock_msg.document = None
+    mock_msg.sticker = None
+    mock_msg.animation = None
+    mock_msg.reply_to_message = None
+    mock_msg.entities = []
+    mock_msg.migrate_to_chat_id = None
+    mock_msg.date = None
+
+    mock_chat = MagicMock(id=chat_id, type="supergroup")
+    mock_update = MagicMock(effective_chat=mock_chat, effective_message=mock_msg, effective_user=mock_msg.from_user)
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 999999
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.job_queue.run_once = MagicMock()
+
+    with patch.object(handlers, "_execute_evaluation", AsyncMock()) as mock_eval:
+        await handlers.on_message(mock_update, mock_context)
+
+        # Old debounce job must be cancelled immediately
+        mock_job1.schedule_removal.assert_called_once()
+        assert chat_id not in handlers._debounce_jobs
+
+        # Cooldown timer MUST NOT be scheduled (cooldown ignored)
+        mock_context.job_queue.run_once.assert_not_called()
+
+        # Evaluation must be started immediately with is_direct_trigger=True
+        await asyncio.sleep(0)
+        mock_eval.assert_awaited_once_with(
+            context=mock_context,
+            chat_id=chat_id,
+            is_direct_trigger=True,
+            trigger_msg_id=2001,
+        )
     assert len(s.get_chat_history()) == 1
 
 def test_debounce_job_logging_suppressed():

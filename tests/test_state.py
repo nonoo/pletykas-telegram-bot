@@ -16,7 +16,7 @@ def test_state_load_defaults():
         assert sm.get_language() == "English"
         assert sm.get_timezone() == "UTC"
         assert sm.get_talkativeness() == 5
-        assert sm.get_cooldown_sec() == 3
+        assert sm.get_cooldown_sec() == 5
         assert sm.is_search_grounding_active() is True
         assert sm.is_debug_mode() is False
         assert sm.get_nicknames() == ["pletyi", "pletyo"]
@@ -30,7 +30,7 @@ def test_state_atomic_save_reload():
         sm.load()
         sm.set_language("English")
         sm.set_talkativeness(9)
-        sm.set_cooldown_sec(5)
+        sm.set_cooldown_sec(8)
         sm.set_search_grounding_active(True)
         sm.set_debug_mode(True)
         sm.set_nicknames(["pletyka", "@pleti", "pletyka"])
@@ -39,7 +39,7 @@ def test_state_atomic_save_reload():
         sm2.load()
         assert sm2.get_language() == "English"
         assert sm2.get_talkativeness() == 9
-        assert sm2.get_cooldown_sec() == 5
+        assert sm2.get_cooldown_sec() == 8
         assert sm2.is_search_grounding_active() is True
         assert sm2.is_debug_mode() is True
         assert sm2.get_nicknames() == ["pletyka", "pleti"]

@@ -12,7 +12,7 @@ This document outlines the architecture, design principles, invariants, and impl
 1. **Single Group Lockdown**: The bot operates exclusively in the designated `GROUP_CHAT_ID`. If added to any other group or supergroup, it immediately calls `context.bot.leave_chat(chat.id)`. Supergroup migrations (`message.migrate_to_chat_id`) update the configured chat ID in memory and state.
 2. **Private-Only Administration**: All `/` commands are strictly restricted to private chats with user IDs specified in `ADMIN_USERIDS`. Private messages are never forwarded to the LLM or added to conversation transcripts.
 3. **Pure LLM Autonomy**: The model decides when to speak, when to react with an emoji, when to request image generation, and when to remain completely silent using `<NO_REPLY>`.
-4. **Debounced Cooldown Batching**: When messages arrive in the group, a debounce timer (`cooldown_sec`) is started or reset. Only when the conversation pauses for `cooldown_sec` seconds does background LLM evaluation execute. Direct triggers (`@mention` or replies to the bot) bypass debounce and evaluate immediately.
+4. **Debounced Cooldown Batching**: When messages arrive in the group, a debounce timer (`cooldown_sec`, default: 5s) is started or reset. Only when the conversation pauses for `cooldown_sec` seconds does background LLM evaluation execute. Direct triggers (`@mention`, bot name, username, nicknames, or replies to the bot) bypass debounce and evaluate immediately.
 5. **No Indicator Leaks**: `ChatAction.TYPING` is never sent. `ChatAction.UPLOAD_PHOTO` is sent strictly during image generation/editing when the model outputs `<GENERATE_IMAGE>`.
 6. **Capability Escalation & Retry**: When the primary (small) model lacks capabilities to fulfill a request (e.g. real-time Google Search), it outputs `<RETRY_WITH_LARGE_MODEL>`. The LLM client intercepts this signal and automatically retries using the large model with Google Search grounding active.
 7. **Telegram HTML Markdown**: The effective system prompt enforces Telegram HTML markdown restricted strictly to `b`, `i`, `u`, `s`, `a`, `code`, and `blockquote`, while prohibiting other tags and LaTeX. Message dispatches render with `ParseMode.HTML` with automatic fallback to plain text if malformed tags occur.
@@ -64,7 +64,7 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
   "language": "English",
   "timezone": "Europe/Budapest",
   "talkativeness": 5,
-  "cooldown_sec": 3,
+  "cooldown_sec": 5,
   "search_grounding": false,
   "search_small_model": false,
   "image_interpretation_large_model": true,

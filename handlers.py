@@ -501,9 +501,10 @@ class BotHandlers:
         # 2. Text / caption analysis
         text = message.text or message.caption or ""
 
-        # 3. Message entities (Telegram mentions)
-        if message.entities and text:
-            for entity in message.entities:
+        # 3. Message entities (Telegram mentions in text or photo caption)
+        all_entities = list(getattr(message, "entities", None) or []) + list(getattr(message, "caption_entities", None) or [])
+        if all_entities and text:
+            for entity in all_entities:
                 if entity.type == "mention" and bot_username:
                     mention_text = text[entity.offset: entity.offset + entity.length].lstrip("@").lower()
                     if mention_text == bot_username.lower():
@@ -519,9 +520,20 @@ class BotHandlers:
         candidates: List[str] = []
         if bot_username and isinstance(bot_username, str):
             candidates.append(bot_username)
+            uname_clean = bot_username.lstrip("@").strip()
+            if uname_clean.lower().endswith("_bot") and len(uname_clean) > 4:
+                candidates.append(uname_clean[:-4])
+            elif uname_clean.lower().endswith("bot") and len(uname_clean) > 3:
+                candidates.append(uname_clean[:-3])
+
         if bot_name and isinstance(bot_name, str):
             candidates.append(bot_name)
-        for default_name in ("Pletykás", "Pletykas"):
+            for w in bot_name.split():
+                clean_w = w.strip()
+                if len(clean_w) >= 3 and clean_w.lower() not in ("bot", "the"):
+                    candidates.append(clean_w)
+
+        for default_name in ("Pletykás", "Pletykas", "Pletyi", "Pletyo", "Pletyó"):
             if default_name not in candidates:
                 candidates.append(default_name)
         candidates.extend(self.state.get_nicknames())

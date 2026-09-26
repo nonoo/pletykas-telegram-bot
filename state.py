@@ -32,7 +32,7 @@ class StateManager:
             "language": "English",
             "timezone": "UTC",
             "talkativeness": 5,
-            "cooldown_sec": 3,
+            "cooldown_sec": 5,
             "search_grounding": True,
             "search_small_model": False,
             "image_interpretation_large_model": True,
@@ -219,7 +219,7 @@ class StateManager:
         self.save()
 
     def get_cooldown_sec(self) -> int:
-        return int(self.data.get("cooldown_sec", 3))
+        return int(self.data.get("cooldown_sec", 5))
 
     def set_cooldown_sec(self, sec: int) -> None:
         clamped = max(0, int(sec))
