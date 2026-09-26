@@ -222,6 +222,27 @@ def test_state_image_interpretation_large_model():
         assert sm2.is_image_interpretation_large_model() is True
 
 
+def test_state_search_small_model():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+        # Disabled by default
+        assert sm.is_search_small_model() is False
+
+        # Toggle on
+        sm.set_search_small_model(True)
+        assert sm.is_search_small_model() is True
+
+        # Reload from disk
+        sm2 = StateManager(sf)
+        sm2.load()
+        assert sm2.is_search_small_model() is True
+
+        # Toggle back off
+        sm2.set_search_small_model(False)
+        assert sm2.is_search_small_model() is False
+
 def test_state_spontaneous_settings():
     with tempfile.TemporaryDirectory() as td:
         sf = os.path.join(td, "state.json")

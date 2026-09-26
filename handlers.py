@@ -52,6 +52,7 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 /prompt load - Expect a system prompt text file upload to validate and load
 /prompt reset - Reset to default persona prompt
 /grounding [on|off] - Toggle Google Search grounding for real-time web info
+/search_small [on|off] - Toggle small model direct web search (ON: small searches directly if capable, OFF: delegates to large model)
 /image_large [on|off] - Toggle instant large model for image interpretation (ON: large instant, OFF: small model first)
 
 <b>Memory Management</b>
@@ -208,7 +209,7 @@ class BotHandlers:
 
     # --- Spontaneous Messages & Inactivity Timer ---
 
-    def schedule_spontaneous_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+    def schedule_spontaneous_job(self, context: ContextTypes.DEFAULT_TYPE, force_new: bool = False) -> None:
         if not self.state.is_spontaneous_enabled():
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name("spontaneous_revival"):
@@ -235,7 +236,7 @@ class BotHandlers:
             max_hours = min_hours
 
         now = datetime.now(self.state.get_tzinfo())
-        persisted_dt = self.state.get_spontaneous_next_fire_time()
+        persisted_dt = self.state.get_spontaneous_next_fire_time() if not force_new else None
 
         if persisted_dt and persisted_dt > now:
             delay_sec = (persisted_dt - now).total_seconds()
@@ -967,6 +968,10 @@ class BotHandlers:
             asyncio.create_task(self.trigger_curation())
 
 
+        # Generate new spontaneous message random timestamp upon group message arrival
+        if self.state.is_spontaneous_enabled():
+            self.schedule_spontaneous_job(context, force_new=True)
+
         # Check direct trigger
         bot_username = context.bot.username if isinstance(getattr(context.bot, "username", None), str) else ""
         bot_name = context.bot.first_name if isinstance(getattr(context.bot, "first_name", None), str) else ""
@@ -1064,13 +1069,14 @@ class BotHandlers:
             f"• Cooldown: <code>{self.state.get_cooldown_sec()}s</code>\n"
             f"• Nicknames: <code>{html.escape(nicks_str)}</code>\n"
             f"• Search Grounding: <code>{grounding_status}</code>\n"
+            f"• Small Model Search: <code>{'ON (Direct Search)' if self.state.is_search_small_model() else 'OFF (Delegates to Large Model)'}</code>\n"
             f"• Image Vision Model: <code>{'Large Model (Instant)' if self.state.is_image_interpretation_large_model() else 'Small Model First'}</code>\n"
             f"• Debug Mode: <code>{debug_status}</code>\n"
             f"• Sleep Schedule: <code>{sleep_status}</code>\n"
             f"• Spontaneous Messages: <code>{spont_status}</code>\n"
             f"• Models:\n"
             f"  - Primary: <code>{self.params.model_name}</code> (thinking: {tl_primary})\n"
-            f"  - Vision: <code>{self.params.model_large_name}</code> (thinking: {tl_large})\n"
+            f"  - Larger: <code>{self.params.model_large_name}</code> (thinking: {tl_large})\n"
             f"  - Image: <code>{self.params.model_image_name}</code> (size: {self.params.model_image_size}, thinking: {tl_image})\n"
             f"• Stats:\n"
             f"  - Uncurated Messages: {self.state.get_messages_since_last_curation()}/20"
@@ -1540,6 +1546,41 @@ class BotHandlers:
                 parse_mode=ParseMode.HTML,
             )
 
+    async def cmd_search_small(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update.effective_user.id if update.effective_user else None):
+            return
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+
+        args = context.args or []
+        if not args:
+            cur = "ON" if self.state.is_search_small_model() else "OFF"
+            desc = "Small model searches directly when search grounding is active." if cur == "ON" else "Small model delegates web searches to the large model (with automatic escalation)."
+            await update.effective_message.reply_text(
+                f"🔍 Small Model Web Search is currently: <b>{cur}</b>\n<i>({desc})</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        mode = args[0].lower()
+        if mode == "on":
+            self.state.set_search_small_model(True)
+            await update.effective_message.reply_text(
+                "✅ Small model web search turned <b>ON</b>. Small model will search directly if supported.",
+                parse_mode=ParseMode.HTML,
+            )
+        elif mode == "off":
+            self.state.set_search_small_model(False)
+            await update.effective_message.reply_text(
+                "✅ Small model web search turned <b>OFF</b>. Small model will delegate web searches to the large model.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/search_small [on|off]</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
 
     async def _process_memory_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any) -> None:
         user_id = update.effective_user.id if update.effective_user else None
@@ -1704,6 +1745,7 @@ class BotHandlers:
         application.add_handler(CommandHandler("debug", self.cmd_debug))
         application.add_handler(CommandHandler(["image_large", "image_large_model", "imagelarge"], self.cmd_image_large_model))
         application.add_handler(CommandHandler("memories", self.cmd_memories))
+        application.add_handler(CommandHandler(["search_small", "search_small_model", "searchsmall", "grounding_small"], self.cmd_search_small))
         application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         application.add_handler(CommandHandler("curate", self.cmd_curate))
 

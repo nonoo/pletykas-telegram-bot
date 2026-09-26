@@ -314,6 +314,19 @@ async def test_admin_commands_private_chat(test_setup):
     await handlers.cmd_image_large_model(mock_update, mock_context)
     assert s.is_image_interpretation_large_model() is True
 
+
+    # /search_small
+    mock_context.args = []
+    await handlers.cmd_search_small(mock_update, mock_context)
+    assert "Small Model Web Search is currently" in mock_msg.reply_text.call_args[0][0]
+
+    mock_context.args = ["on"]
+    await handlers.cmd_search_small(mock_update, mock_context)
+    assert s.is_search_small_model() is True
+
+    mock_context.args = ["off"]
+    await handlers.cmd_search_small(mock_update, mock_context)
+    assert s.is_search_small_model() is False
     # /prompt view (downloads prompt document)
     mock_msg.document = None
     mock_msg.reply_document = AsyncMock()
@@ -359,6 +372,7 @@ async def test_admin_commands_private_chat(test_setup):
 @pytest.mark.asyncio
 async def test_debounce_job_handling(test_setup):
     p, s, m, llm, handlers = test_setup
+    s.set_spontaneous_settings(enabled=False)
 
     chat_id = -1001234567890
     mock_job1 = MagicMock()
@@ -583,6 +597,8 @@ async def test_status_cmd_shows_next_spontaneous_firing_timestamp(test_setup):
     await handlers.cmd_status(mock_update, mock_context)
     status_reply = mock_msg.reply_text.call_args[0][0]
     assert "• Spontaneous Messages: <code>ON (every 2-4h, random) (Next: 20" in status_reply
+    assert "• Small Model Search: <code>" in status_reply
+    assert "  - Larger: <code>" in status_reply
 
     # 3. /spontaneous with no args shows Next Firing timestamp
     mock_context.args = []
@@ -647,6 +663,68 @@ async def test_spontaneous_job_persists_and_resumes_across_restarts(test_setup):
     assert new_fire_time is not None
     assert new_fire_time > datetime.now(s.get_tzinfo())
     assert new_fire_time != past_time
+
+@pytest.mark.asyncio
+async def test_group_message_reschedules_spontaneous_job(test_setup):
+    from datetime import timedelta
+    p, s, m, llm, handlers = test_setup
+    p.group_chat_id = -1001234567890
+
+    mock_chat = MagicMock()
+    mock_chat.id = -1001234567890
+    mock_chat.type = "supergroup"
+
+    mock_user = MagicMock()
+    mock_user.id = 111111
+    mock_user.full_name = "Alice"
+
+    mock_msg = MagicMock()
+    mock_msg.message_id = 5001
+    mock_msg.from_user = mock_user
+    mock_msg.text = "Hello everyone in the group!"
+    mock_msg.photo = None
+    mock_msg.voice = None
+    mock_msg.audio = None
+    mock_msg.video = None
+    mock_msg.video_note = None
+    mock_msg.document = None
+    mock_msg.sticker = None
+    mock_msg.animation = None
+    mock_msg.caption = None
+    mock_msg.reply_to_message = None
+
+    mock_update = MagicMock(effective_chat=mock_chat, effective_message=mock_msg, effective_user=mock_user)
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 999999
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.job_queue.get_jobs_by_name.return_value = []
+    mock_context.job_queue.run_once = MagicMock(return_value=MagicMock())
+
+    # 1. Enable spontaneous messages and set an initial scheduled future timestamp
+    s.set_spontaneous_settings(enabled=True, min_hours=2.0, max_hours=4.0)
+    old_future_time = datetime.now(s.get_tzinfo()) + timedelta(seconds=3600)
+    s.set_spontaneous_next_fire_time(old_future_time)
+    handlers._next_spontaneous_time = old_future_time
+
+    # 2. When a telegram message arrives in the group, spontaneous job should reschedule with a new timestamp
+    with patch.object(handlers, "schedule_spontaneous_job", wraps=handlers.schedule_spontaneous_job) as spy_resched:
+        await handlers.on_message(mock_update, mock_context)
+        spy_resched.assert_called_once_with(mock_context, force_new=True)
+
+    # The persisted timestamp must be updated and different from the old one
+    new_fire_time = s.get_spontaneous_next_fire_time()
+    assert new_fire_time is not None
+    assert new_fire_time != old_future_time
+    assert new_fire_time > datetime.now(s.get_tzinfo())
+
+    # 3. When spontaneous messages are disabled, on_message should not reschedule
+    s.set_spontaneous_settings(enabled=False)
+    with patch.object(handlers, "schedule_spontaneous_job", wraps=handlers.schedule_spontaneous_job) as spy_resched:
+        mock_msg.message_id = 5002
+        await handlers.on_message(mock_update, mock_context)
+        spy_resched.assert_not_called()
 @pytest.mark.asyncio
 async def test_photo_reply_and_reference_triggers_vision(test_setup):
     p, s, m, llm, handlers = test_setup

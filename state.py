@@ -34,6 +34,7 @@ class StateManager:
             "talkativeness": 5,
             "cooldown_sec": 3,
             "search_grounding": True,
+            "search_small_model": False,
             "image_interpretation_large_model": True,
             "debug": False,
             "nicknames": ["pletyi", "pletyo"],
@@ -231,6 +232,14 @@ class StateManager:
 
     def set_search_grounding_active(self, active: bool) -> None:
         self.data["search_grounding"] = bool(active)
+        self.save()
+
+    # Small Model Search Selection
+    def is_search_small_model(self) -> bool:
+        return bool(self.data.get("search_small_model", False))
+
+    def set_search_small_model(self, active: bool) -> None:
+        self.data["search_small_model"] = bool(active)
         self.save()
 
     # Image Interpretation Model Selection

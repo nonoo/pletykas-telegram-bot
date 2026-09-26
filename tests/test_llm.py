@@ -261,6 +261,106 @@ async def test_evaluate_and_reply_retries_with_large_model():
         )
         assert call_count == 2
         assert text == "Here is the live search result from the web!"
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_retries_with_genai_search_grounding():
+    p = Params()
+    p.model_name = "deepseek-flash"
+    p.model_api_base = "https://api.deepseek.com"
+    p.model_api_key = "deepseek-key"
+    p.model_large_name = "gemini-3.5-flash-lite"
+    p.model_large_api_base = ""
+    p.model_large_api_key = "google-key"
+    s = StateManager("test.json")
+    s.set_search_grounding_active(True)
+    client = LLMClient(p, s)
+
+    # 1. Primary model (deepseek-flash, openai-compatible) receives prompt with Capability Escalation
+    async def mock_call_openai(api_base, api_key, model_name, messages, **kwargs):
+        user_msg = messages[-1]["content"]
+        assert "[Capability Escalation & Delegation]" in user_msg
+        assert "<RETRY_WITH_LARGE_MODEL>" in user_msg
+        return "<RETRY_WITH_LARGE_MODEL: Élő időjárás-lekérdezés Budakeszire>", 10, 5
+
+    # 2. Large model (gemini-3.5-flash-lite, genai) receives prompt with Real-Time Web Search & Grounding
+    async def mock_call_genai(api_key, model_name, contents, system_instruction, use_search_grounding, **kwargs):
+        assert model_name == "gemini-3.5-flash-lite"
+        assert use_search_grounding is True
+        prompt = contents[0]
+        assert "[Real-Time Web Search & Grounding]" in prompt
+        assert "Do NOT output <RETRY_WITH_LARGE_MODEL>" in prompt
+        assert "[Capability Escalation & Delegation]" not in prompt
+        return "Budakeszin most 17 fok van!", 20, 10
+
+    with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)), \
+         patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
+        text, reaction, img_spec = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="pletyi, keress ra a neten, milyen most az idojaras budakeszin",
+            bot_username="pletykas_bot",
+            is_direct_trigger=True,
+        )
+        assert text == "Budakeszin most 17 fok van!"
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_small_model_search_toggle():
+    p = Params()
+    p.model_name = "gemini-3.5-flash-lite"
+    p.model_api_base = ""
+    p.model_api_key = "google-key"
+    p.model_large_name = "gemini-1.5-pro"
+    p.model_large_api_base = ""
+    p.model_large_api_key = "google-key"
+    s = StateManager("test.json")
+    s.set_search_grounding_active(True)
+    client = LLMClient(p, s)
+
+    # 1. search_small_model is False by default: primary model receives can_search=False
+    call_records = []
+    async def mock_call_genai(api_key, model_name, contents, system_instruction, use_search_grounding, **kwargs):
+        call_records.append((model_name, use_search_grounding, contents[0]))
+        if model_name == "gemini-3.5-flash-lite":
+            assert use_search_grounding is False
+            assert "[Capability Escalation & Delegation]" in contents[0]
+            return "<RETRY_WITH_LARGE_MODEL: Live search>", 10, 5
+        else:
+            assert model_name == "gemini-1.5-pro"
+            assert use_search_grounding is True
+            assert "[Real-Time Web Search & Grounding]" in contents[0]
+            return "Large model search result", 20, 10
+
+    with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
+        text, _, _ = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="search weather",
+            bot_username="pletykas_bot",
+            is_direct_trigger=True,
+        )
+        assert text == "Large model search result"
+        assert len(call_records) == 2
+
+    # 2. search_small_model turned ON: primary model searches directly in 1 step
+    s.set_search_small_model(True)
+    call_records.clear()
+    async def mock_call_genai_direct(api_key, model_name, contents, system_instruction, use_search_grounding, **kwargs):
+        call_records.append((model_name, use_search_grounding, contents[0]))
+        assert model_name == "gemini-3.5-flash-lite"
+        assert use_search_grounding is True
+        assert "[Real-Time Web Search & Grounding]" in contents[0]
+        return "Direct small model search result", 15, 8
+
+    with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai_direct)):
+        text, _, _ = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="search weather",
+            bot_username="pletykas_bot",
+            is_direct_trigger=True,
+        )
+        assert text == "Direct small model search result"
+        assert len(call_records) == 1
 @pytest.mark.asyncio
 async def test_evaluate_and_reply_retries_with_large_model_and_chat_history_image():
     import base64
@@ -613,3 +713,30 @@ async def test_generate_image_gemini_interactions_sdk():
         assert mock_debug_log.call_count >= 2
         req_call = mock_debug_log.call_args_list[0]
         assert "Google Interactions SDK: models/gemini-3.1-flash-lite-image" in req_call[0][0]
+
+@pytest.mark.asyncio
+async def test_debug_mode_genai_response_with_search_queries(capsys):
+    p = Params()
+    s = StateManager("test.json")
+    s.set_debug_mode(True)
+    client = LLMClient(p, s)
+
+    mock_candidate = MagicMock()
+    mock_candidate.grounding_metadata.web_search_queries = ["weather in Budakeszi"]
+    mock_resp = MagicMock()
+    mock_resp.text = "17 degrees in Budakeszi!"
+    mock_resp.candidates = [mock_candidate]
+    mock_resp.model_dump_json.return_value = '{"candidates": [{"content": "raw"}]}'
+    mock_resp.usage_metadata.prompt_token_count = 15
+    mock_resp.usage_metadata.candidates_token_count = 8
+
+    mock_genai_client = AsyncMock()
+    mock_genai_client.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+
+    with patch.object(client, "_get_genai_client", return_value=mock_genai_client):
+        content, p_tok, c_tok = await client._call_genai(
+            "api-key", "gemini-3.5-flash-lite", [{"role": "user", "parts": ["hi"]}], use_search_grounding=True
+        )
+        assert content == "17 degrees in Budakeszi!"
+        captured = capsys.readouterr()
+        assert "[Google Search Queries: ['weather in Budakeszi']]" in captured.out

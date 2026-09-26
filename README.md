@@ -93,6 +93,7 @@ podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-tel
 | `/spontaneous_now` | — | Instantly generates and dispatches a spontaneous message or poll to the group |
 | `/prompt` | `[load\|reset]` | Uploads system prompt file as-is, expects a text file upload to replace prompt, or resets to default |
 | `/grounding` | `[on\|off]` | Toggles Google Search grounding tool |
+| `/search_small` | `[on\|off]` | Toggles whether small model uses search grounding directly (default: `OFF` delegates to large model) |
 | `/image_large` | `[on\|off]` | Toggles large model for image interpretation (default: `ON` instant large model; `OFF` tries small model first) |
 | `/debug` | `[on\|off]` | Toggles debug streaming to stdout (raw LLM payloads and Telegram group messages) |
 | `/memories` | `[load]` | Uploads memories JSON file as-is, or enters waiting mode to validate and load an uploaded JSON file |

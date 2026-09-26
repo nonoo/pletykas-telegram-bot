@@ -226,6 +226,8 @@ class LLMClient:
                 "contents": str(contents),
                 "system_instruction": system_instruction,
                 "thinking_level": thinking_level,
+                "search_grounding": use_search_grounding and not model_name.lower().startswith("gemma"),
+                "tools": ["google_search"] if (use_search_grounding and not model_name.lower().startswith("gemma")) else None,
                 "max_output_tokens": max_output_tokens,
             }
             self._log_debug_payload(f"GENAI SDK REQUEST ({model_name})", json.dumps(sdk_dbg, indent=2, default=str))
@@ -266,7 +268,16 @@ class LLMClient:
             except Exception:
                 raw_resp = str(response)
             raw_clean = raw_resp.rstrip("\r\n")
-            dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
+            search_queries_str = ""
+            try:
+                if response.candidates:
+                    grounding = getattr(response.candidates[0], "grounding_metadata", None)
+                    queries = getattr(grounding, "web_search_queries", None)
+                    if isinstance(queries, list) and queries:
+                        search_queries_str = f"\n[Google Search Queries: {queries}]"
+            except Exception:
+                pass
+            dbg_text = f"{raw_clean}{search_queries_str}\n{content}" if content else f"{raw_clean}{search_queries_str}"
             self._log_debug_payload(f"GENAI SDK RESPONSE ({model_name})", dbg_text)
 
         p_tokens = 0
@@ -359,7 +370,7 @@ class LLMClient:
         return False, ""
 
 
-    def _build_evaluation_instructions(self, is_direct_trigger: bool, talkativeness: int) -> str:
+    def _build_evaluation_instructions(self, is_direct_trigger: bool, talkativeness: int, can_search: bool = False) -> str:
         if is_direct_trigger:
             trigger_instruction = "You are directly addressed or replied to in the chat. Provide your in-character response to the group now."
         else:
@@ -391,10 +402,7 @@ class LLMClient:
                 "2. Choose EXACTLY ONE action: Output <NO_REPLY>, OR output a single <REACTION:emoji>, OR write a text reply. DO NOT combine text and reaction unless explicitly needed."
             )
 
-        instructions = f"""[Instruction]
-{trigger_instruction}
-
-[Image Generation & Modification Capability]
+        image_capability = """[Image Generation & Modification Capability]
 If a user asks you to generate a new image or modify an existing image (either by referring to an image from the conversation or by replying to an image message):
 Output a special image block:
 <GENERATE_IMAGE>
@@ -402,22 +410,87 @@ Prompt: <detailed English visual prompt describing the desired image or modifica
 Caption: <your in-character message or response in the chat language to accompany the image>
 Source: <message ID if referring to an image in transcript, or 'reply' if replying to a photo message, or 'new'>
 Mode: <'modify' if changing an existing image, or 'generate' if creating a fresh image>
-</GENERATE_IMAGE>
+</GENERATE_IMAGE>"""
 
-[Capability Escalation & Delegation]
+        if can_search:
+            search_section = """[Real-Time Web Search & Grounding]
+You are equipped with Google Search grounding and have direct access to live, real-time web search.
+When a user asks about current weather, recent events, latest news, live information, or facts beyond your initial knowledge, use your Google Search grounding tool to find the accurate, up-to-date information and incorporate it into your witty, in-character response.
+Do NOT output <RETRY_WITH_LARGE_MODEL> or say you cannot search the internet, because you HAVE real-time search capability."""
+            escalation_rule = ""
+        else:
+            search_section = """[Capability Escalation & Delegation]
 If a user asks for something you are incapable of doing (such as real-time web search or Google Search for up-to-date facts, current news, live sports, weather, recent events, or information beyond your knowledge cutoff), you MUST output:
 <RETRY_WITH_LARGE_MODEL>
 or
 <RETRY_WITH_LARGE_MODEL:reason>
-Do not guess, hallucinate, or state that you cannot search the internet or lack tools. Output `<RETRY_WITH_LARGE_MODEL>` so the request is automatically delegated to a capable model with Google Search grounding.
+Do not guess, hallucinate, or state that you cannot search the internet or lack tools. Output `<RETRY_WITH_LARGE_MODEL>` so the request is automatically delegated to a capable model with Google Search grounding."""
+            escalation_rule = "\n- If you lack external capabilities or tools to answer (e.g. real-time web/Google search needed), output '<RETRY_WITH_LARGE_MODEL>'."
 
-[Output Rules]
+        output_rules = f"""[Output Rules]
 - You can speak, react with an emoji, do BOTH, request image generation, or remain silent.
-- To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.
-- If you lack external capabilities or tools to answer (e.g. real-time web/Google search needed), output '<RETRY_WITH_LARGE_MODEL>'.
+- To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.
 - Never explain your decision or output meta-commentary. Speak strictly in character."""
-        return instructions
+
+        return f"""[Instruction]
+{trigger_instruction}
+
+{image_capability}
+
+{search_section}
+
+{output_rules}"""
+
+    def _build_user_content_prompt(
+        self,
+        memory_context: str,
+        transcript: str,
+        instructions: str,
+    ) -> str:
+        current_time_str = self.state.get_current_time_str()
+        timezone_str = self.state.get_timezone()
+        return f"""[Context Information]
+Current Time: {current_time_str}
+Timezone: {timezone_str}
+
+[Current Memory]
+{memory_context}
+
+[Recent Conversation Transcript]
+{transcript}
+
+{instructions}"""
+
+    def _build_image_evaluation_prompt(
+        self,
+        memory_context: str,
+        transcript: str,
+        caption: str,
+        instructions: str,
+    ) -> str:
+        current_time_str = self.state.get_current_time_str()
+        timezone_str = self.state.get_timezone()
+        return f"""[Context Information]
+Current Time: {current_time_str}
+Timezone: {timezone_str}
+
+[Current Memory]
+{memory_context}
+
+[Recent Conversation Transcript]
+{transcript}
+
+[Photo Caption from User]
+{caption if caption else "(no caption provided)"}
+
+{instructions}
+
+[Special Image Requirement]
+In addition to your response and/or emoji reaction, you MUST include a detailed, objective visual description of this photo enclosed in:
+<IMAGE_DESCRIPTION>
+(detailed objective description of image subjects, setting, mood, colors, and key details)
+</IMAGE_DESCRIPTION>"""
 
     async def evaluate_and_reply(
         self,
@@ -430,21 +503,13 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
         image_bytes: Optional[bytes] = None,
     ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]]]:
         """Evaluates conversation and produces in-character text, emoji reaction, and/or image generation spec."""
-        current_time_str = self.state.get_current_time_str()
-        timezone_str = self.state.get_timezone()
-        instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
-
-        user_content_prompt = f"""[Context Information]
-Current Time: {current_time_str}
-Timezone: {timezone_str}
-
-[Current Memory]
-{memory_context}
-
-[Recent Conversation Transcript]
-{transcript}
-
-{instructions}"""
+        primary_can_search = (
+            self.state.is_search_small_model()
+            and self._is_genai_model(self.params.model_name, self.params.model_api_base)
+            and self.state.is_search_grounding_active()
+        )
+        primary_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=primary_can_search)
+        primary_prompt = self._build_user_content_prompt(memory_context, transcript, primary_instructions)
 
         model_name = self.params.model_name
         api_key = self.params.model_api_key
@@ -459,6 +524,8 @@ Timezone: {timezone_str}
             m_key: str,
             m_base: str,
             m_tl: str,
+            prompt_text: str,
+            can_search: bool,
             img_bytes: Optional[bytes] = None,
         ) -> Tuple[str, int, int]:
             if img_bytes:
@@ -470,8 +537,8 @@ Timezone: {timezone_str}
                         thinking_level=m_tl,
                         image_bytes=img_bytes,
                         system_prompt=system_prompt,
-                        user_content_prompt=user_content_prompt,
-                        use_search_grounding=self.state.is_search_grounding_active(),
+                        user_content_prompt=prompt_text,
+                        use_search_grounding=can_search,
                     )
                 except Exception as e:
                     logger.warning("Vision call failed on model %s, falling back to text: %s", m_name, e)
@@ -480,15 +547,15 @@ Timezone: {timezone_str}
                 return await self._call_genai(
                     api_key=m_key,
                     model_name=m_name,
-                    contents=[user_content_prompt],
+                    contents=[prompt_text],
                     system_instruction=f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(m_tl)}",
-                    use_search_grounding=self.state.is_search_grounding_active(),
+                    use_search_grounding=can_search,
                     thinking_level=m_tl,
                 )
             else:
                 messages = [
                     {"role": "system", "content": f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(m_tl)}"},
-                    {"role": "user", "content": user_content_prompt},
+                    {"role": "user", "content": prompt_text},
                 ]
                 return await self._call_openai_compatible(
                     api_base=m_base,
@@ -497,9 +564,10 @@ Timezone: {timezone_str}
                     messages=messages,
                     thinking_level=m_tl,
                 )
+
         # 1. Primary (small) model invocation
         raw_response, prompt_tokens, completion_tokens = await _invoke_model(
-            model_name, api_key, api_base, self.params.model_thinking_level, image_bytes
+            model_name, api_key, api_base, self.params.model_thinking_level, primary_prompt, primary_can_search, image_bytes
         )
 
         # 2. Check if primary model indicated incapability (e.g. needs web search / large model)
@@ -529,9 +597,14 @@ Timezone: {timezone_str}
                             except Exception as e:
                                 logger.warning("Failed to decode photo bytes from chat history: %s", e)
 
+            large_can_search = self._is_genai_model(large_name, large_base) and self.state.is_search_grounding_active()
+            large_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=large_can_search)
+            large_prompt = self._build_user_content_prompt(memory_context, transcript, large_instructions)
+
             raw_response, prompt_tokens, completion_tokens = await _invoke_model(
-                large_name, large_key, large_base, large_tl, retry_img_bytes
+                large_name, large_key, large_base, large_tl, large_prompt, large_can_search, retry_img_bytes
             )
+
 
         raw_trimmed = raw_response.strip()
         if raw_trimmed == "<NO_REPLY>":
@@ -613,31 +686,6 @@ Timezone: {timezone_str}
         caption: str,
     ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]], str]:
         """Dispatches photo to Large Multimodal Model to generate a reply, reaction, image spec, and visual description."""
-        current_time_str = self.state.get_current_time_str()
-        timezone_str = self.state.get_timezone()
-        instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
-
-        user_content_prompt = f"""[Context Information]
-Current Time: {current_time_str}
-Timezone: {timezone_str}
-
-[Current Memory]
-{memory_context}
-
-[Recent Conversation Transcript]
-{transcript}
-
-[Photo Caption from User]
-{caption if caption else "(no caption provided)"}
-
-{instructions}
-
-[Special Image Requirement]
-In addition to your response and/or emoji reaction, you MUST include a detailed, objective visual description of this photo enclosed in:
-<IMAGE_DESCRIPTION>
-(detailed objective description of image subjects, setting, mood, colors, and key details)
-</IMAGE_DESCRIPTION>"""
-
         use_large = self.state.is_image_interpretation_large_model()
         raw_response = ""
 
@@ -650,6 +698,14 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             # Resize image to a smaller dimension to optimize bandwidth/tokens for the small model
             small_image_bytes = compress_image(image_bytes, max_dim=800, quality=80)
 
+            small_can_search = (
+                self.state.is_search_small_model()
+                and self._is_genai_model(small_name, small_base)
+                and self.state.is_search_grounding_active()
+            )
+            small_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=small_can_search)
+            small_prompt = self._build_image_evaluation_prompt(memory_context, transcript, caption, small_instructions)
+
             try:
                 logger.info("Interpreting image using small model '%s'...", small_name)
                 resp_text, _, _ = await self._call_vision_model(
@@ -659,8 +715,8 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     thinking_level=small_thinking,
                     image_bytes=small_image_bytes,
                     system_prompt=system_prompt,
-                    user_content_prompt=user_content_prompt,
-                    use_search_grounding=False,
+                    user_content_prompt=small_prompt,
+                    use_search_grounding=small_can_search,
                 )
                 trimmed = resp_text.strip()
                 needs_retry, retry_reason = self._check_incapable_retry(trimmed)
@@ -678,6 +734,10 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             large_key = self.params.effective_large_api_key
             large_base = self.params.effective_large_api_base
             large_thinking = self.params.effective_large_thinking_level
+            large_can_search = self._is_genai_model(large_name, large_base) and self.state.is_search_grounding_active()
+            large_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=large_can_search)
+            large_prompt = self._build_image_evaluation_prompt(memory_context, transcript, caption, large_instructions)
+
             logger.info("Interpreting image using large model '%s'...", large_name)
             resp_text, _, _ = await self._call_vision_model(
                 model_name=large_name,
@@ -686,8 +746,8 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 thinking_level=large_thinking,
                 image_bytes=image_bytes,
                 system_prompt=system_prompt,
-                user_content_prompt=user_content_prompt,
-                use_search_grounding=self.state.is_search_grounding_active(),
+                user_content_prompt=large_prompt,
+                use_search_grounding=large_can_search,
             )
             raw_response = resp_text.strip()
 

@@ -18,6 +18,7 @@ This document outlines the architecture, design principles, invariants, and impl
 7. **Telegram HTML Markdown**: The effective system prompt enforces Telegram HTML markdown restricted strictly to `b`, `i`, `u`, `s`, `a`, `code`, and `blockquote`, while prohibiting other tags and LaTeX. Message dispatches render with `ParseMode.HTML` with automatic fallback to plain text if malformed tags occur.
 8. **Image Interpretation Model Selection**: Controlled by the `image_interpretation_large_model` state setting (default: `True`). When `True`, the large vision model is used directly and immediately without attempting the small model. When toggled to `False` (via `/image_large off`), the small model is tried first with resized/compressed images, with automatic fallback to the large model if it fails or signals `<RETRY_WITH_LARGE_MODEL>`.
 9. **Debug Mode Streaming**: Controlled by the `debug` state setting (toggled via `/debug [on|off]`). When active, raw LLM request/response payloads, all incoming Telegram group messages (with sender, IDs, media type, and content), and all outgoing Telegram group dispatches (replies, photos, polls, reactions) are printed directly to stdout with structured banners.
+10. **Small Model Direct Web Search Selection**: Controlled by the `search_small_model` state setting (default: `False`, toggled via `/search_small [on|off]`). When `False`, the small model delegates web searches via `<RETRY_WITH_LARGE_MODEL>` to the large model. When toggled to `True`, the small model is granted search grounding directly (if supported by its provider), searching and replying in one step.
 
 ---
 
@@ -65,6 +66,8 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
   "talkativeness": 5,
   "cooldown_sec": 3,
   "search_grounding": false,
+  "search_small_model": false,
+  "image_interpretation_large_model": true,
   "debug": false,
   "nicknames": [
     "pletyi",
@@ -89,6 +92,7 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
 ```
 - `chat_history`: Ring buffer of the last 20 messages injected into prompt transcripts.
 - `memory_history`: Ring buffer of the last 30 messages maintained for LLM memory curation.
+- `spontaneous_messages`: Periodic revival timer (`min_hours` to `max_hours`). Whenever a Telegram message arrives in the group, a new random timestamp is rolled and rescheduled to reset the revival window. The scheduled timestamp (`next_fire_time`) is persisted in state and resumes on restart.
 
 ### Memory (`pletykas-memory.json`)
 Managed by `MemoryManager` via atomic replacement:
