@@ -7,7 +7,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py /app/
 
 ENV BOT_TOKEN= GROUP_CHAT_ID= ADMIN_USERIDS= \
-	STATE_FILE=/app/pletykas-state.json MEMORY_FILE=/app/pletykas-memory.json \
+	STATE_FILE=/app/pletykas-state.json \
+	CHATHISTORY_FILE=/app/pletykas-chathistory.json \
+	MEMHISTORY_FILE=/app/pletykas-memhistory.json \
+	SYSPROMPT_FILE=/app/pletykas-sysprompt.txt \
+	SCHED_FILE=/app/pletykas-sched.json \
+	MEMORY_FILE=/app/pletykas-memory.json \
 	MODEL_NAME= MODEL_API_KEY= MODEL_API_BASE= MODEL_THINKING_LEVEL= \
 	MODEL_LARGE_NAME= MODEL_LARGE_API_KEY= MODEL_LARGE_API_BASE= MODEL_LARGE_THINKING_LEVEL= \
 	MODEL_IMAGE_NAME= MODEL_IMAGE_API_KEY= MODEL_IMAGE_API_BASE= \
