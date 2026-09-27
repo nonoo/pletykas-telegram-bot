@@ -424,7 +424,7 @@ async def test_debounce_job_handling(test_setup):
     # New job scheduled via run_once
     mock_context.job_queue.run_once.assert_called_once()
     call_kwargs = mock_context.job_queue.run_once.call_args[1]
-    assert call_kwargs["when"] == 5
+    assert call_kwargs["when"] == 3
     assert "job_kwargs" in call_kwargs
     assert call_kwargs["job_kwargs"]["id"].startswith(f"debounce_{chat_id}_")
     assert len(s.get_chat_history()) == 1
@@ -433,7 +433,7 @@ async def test_debounce_job_handling(test_setup):
 async def test_bot_mention_or_nickname_ignores_cooldown_and_evaluates_immediately(test_setup):
     p, s, m, llm, handlers = test_setup
     s.set_spontaneous_settings(enabled=False)
-    assert s.get_cooldown_sec() == 5
+    assert s.get_cooldown_sec() == 3
 
     chat_id = -1001234567890
     # Pending debounce job from an earlier message
@@ -1251,7 +1251,6 @@ async def test_scheduled_reply_callback_oneshot_and_periodic(test_setup):
     s_id = s.add_scheduled_reply({
         "id": "sched_oneshot_1",
         "type": "oneshot",
-        "chat_id": p.group_chat_id,
         "target_msg_id": 42,
         "target_time": "2026-09-26T14:00:00+00:00",
         "interval_str": None,
@@ -1278,7 +1277,6 @@ async def test_scheduled_reply_callback_oneshot_and_periodic(test_setup):
     p_id = s.add_scheduled_reply({
         "id": "sched_periodic_1",
         "type": "periodic",
-        "chat_id": p.group_chat_id,
         "target_msg_id": None,
         "target_time": "2026-09-26T14:00:00+00:00",
         "interval_str": "1 day",
@@ -1314,7 +1312,6 @@ async def test_scheduled_reply_callback_sleeping(test_setup):
     p_id = s.add_scheduled_reply({
         "id": "sched_periodic_quiet",
         "type": "periodic",
-        "chat_id": p.group_chat_id,
         "target_msg_id": None,
         "target_time": "2026-09-26T14:00:00+00:00",
         "interval_str": "1 day",
@@ -1334,7 +1331,6 @@ async def test_scheduled_reply_callback_sleeping(test_setup):
     o_id = s.add_scheduled_reply({
         "id": "sched_oneshot_quiet",
         "type": "oneshot",
-        "chat_id": p.group_chat_id,
         "target_msg_id": 99,
         "target_time": "2026-09-26T14:00:00+00:00",
         "interval_str": None,
@@ -1362,7 +1358,6 @@ def test_load_and_schedule_pending_replies(test_setup):
     s.add_scheduled_reply({
         "id": "sched_future",
         "type": "oneshot",
-        "chat_id": p.group_chat_id,
         "target_time": future_dt.isoformat(),
         "description": "Future job",
     })
@@ -1372,7 +1367,6 @@ def test_load_and_schedule_pending_replies(test_setup):
     s.add_scheduled_reply({
         "id": "sched_recent_past",
         "type": "oneshot",
-        "chat_id": p.group_chat_id,
         "target_time": recent_past.isoformat(),
         "description": "Recent past job",
     })
@@ -1382,7 +1376,6 @@ def test_load_and_schedule_pending_replies(test_setup):
     s.add_scheduled_reply({
         "id": "sched_expired",
         "type": "oneshot",
-        "chat_id": p.group_chat_id,
         "target_time": old_past.isoformat(),
         "description": "Expired job",
     })
@@ -1391,7 +1384,6 @@ def test_load_and_schedule_pending_replies(test_setup):
     s.add_scheduled_reply({
         "id": "sched_periodic_past",
         "type": "periodic",
-        "chat_id": p.group_chat_id,
         "target_time": old_past.isoformat(),
         "interval_str": "1 day",
         "interval_spec": {"years": 0, "months": 0, "days": 1, "hours": 0, "minutes": 0, "seconds": 0},
@@ -1434,7 +1426,6 @@ async def test_cmd_scheduled_and_status(test_setup):
     s_id = s.add_scheduled_reply({
         "id": "sched_test_101",
         "type": "oneshot",
-        "chat_id": p.group_chat_id,
         "target_time": "2026-10-01T10:00:00+00:00",
         "description": "Send monthly report",
     })
@@ -1465,3 +1456,116 @@ async def test_cmd_scheduled_and_status(test_setup):
     await handlers.cmd_scheduled(mock_update, mock_context)
     assert "not found" in mock_msg.reply_text.call_args[0][0]
 
+@pytest.mark.asyncio
+async def test_history_curation_thread_execution(test_setup):
+    p, s, m, llm, handlers = test_setup
+    s.append_memory_message({"id": 1, "text": "Alice: I love Rust"})
+    s.append_memory_message({"id": 2, "text": "Bob: Me too!"})
+
+    mock_curation_result = {
+        "facts_to_add": [{"topic": "Alice", "content": "Enjoys Rust programming"}],
+        "facts_to_update": [],
+        "facts_to_discard": [],
+        "dynamics_to_add": [{"members": ["Alice", "Bob"], "relation": "Rust enthusiasts"}],
+        "dynamics_to_discard": [],
+        "jokes_to_add": [{"title": "Rustacean", "context": "Alice and Bob's joke"}],
+        "jokes_to_discard": [],
+    }
+
+    with patch.object(llm, "curate_memory", AsyncMock(return_value=mock_curation_result)):
+        summary = await handlers.trigger_curation(blocking=True)
+
+    assert summary["added_facts"] == 1
+    assert summary["added_dynamics"] == 1
+    assert summary["added_jokes"] == 1
+
+    all_mem = m.get_all_memories()
+    assert len(all_mem["memories"]) == 1
+    assert all_mem["memories"][0]["topic"] == "Alice"
+    assert len(all_mem["dynamics"]) == 1
+    assert len(all_mem["inside_jokes"]) == 1
+    assert m.get_last_curated_at() != ""
+
+
+@pytest.mark.asyncio
+async def test_history_curation_concurrent_lock(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    # Simulate an ongoing curation holding the lock
+    handlers._curation_lock.acquire()
+    try:
+        # A non-blocking curation call should return empty dict and not block/raise
+        summary = handlers._curate_worker(blocking=False)
+        assert summary == {}
+    finally:
+        handlers._curation_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_cmd_curate_admin_flow(test_setup):
+    p, s, m, llm, handlers = test_setup
+    p.admin_user_ids = [123]
+
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_status_msg = MagicMock()
+    mock_status_msg.edit_text = AsyncMock()
+    mock_msg.reply_text.return_value = mock_status_msg
+
+    mock_update = MagicMock()
+    mock_update.effective_user.id = 123
+    mock_update.effective_chat.type = "private"
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+
+    with patch.object(handlers, "trigger_curation", AsyncMock(return_value={
+        "added_facts": 2, "updated_facts": 0, "discarded_facts": 0,
+        "added_dynamics": 1, "discarded_dynamics": 0,
+        "added_jokes": 0, "discarded_jokes": 0,
+    })):
+        await handlers.cmd_curate(mock_update, mock_context)
+
+    mock_msg.reply_text.assert_awaited_once()
+    assert "Consolidating memories" in mock_msg.reply_text.call_args[0][0]
+    mock_status_msg.edit_text.assert_awaited_once()
+    final_text = mock_status_msg.edit_text.call_args[0][0]
+    assert "Memory Consolidation Complete" in final_text
+    assert "Facts Added: 2" in final_text
+    assert "Dynamics Added: 1" in final_text
+
+
+@pytest.mark.asyncio
+async def test_on_message_triggers_curation_in_background(test_setup):
+    p, s, m, llm, handlers = test_setup
+    s.set_spontaneous_settings(enabled=False)
+    # Set messages since curation right below threshold (CHAT_HISTORY_SIZE - 1 = 19)
+    from state import CHAT_HISTORY_SIZE
+    s.set_messages_since_last_curation(CHAT_HISTORY_SIZE - 1)
+
+    mock_msg = MagicMock()
+    mock_msg.message_id = 5555
+    mock_msg.from_user.id = 777
+    mock_msg.from_user.full_name = "User"
+    mock_msg.text = "Hello everyone!"
+    mock_msg.reply_to_message = None
+    mock_msg.photo = []
+    mock_msg.migrate_to_chat_id = None
+
+    mock_chat = MagicMock()
+    mock_chat.id = p.group_chat_id
+    mock_chat.type = "supergroup"
+
+    mock_update = MagicMock()
+    mock_update.effective_chat = mock_chat
+    mock_update.effective_message = mock_msg
+    mock_update.message = mock_msg
+    mock_context = MagicMock()
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.id = 9999
+
+    with patch.object(handlers, "trigger_curation_background") as mock_curate_bg, \
+         patch.object(handlers, "_execute_evaluation", AsyncMock()):
+        await handlers.on_message(mock_update, mock_context)
+        mock_curate_bg.assert_called_once()
+        assert s.get_messages_since_last_curation() == 0

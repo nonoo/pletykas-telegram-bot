@@ -8,6 +8,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -246,6 +247,7 @@ class BotHandlers:
         self._active_evaluations: set[int] = set()
         self._waiting_for_memory_upload: set[int] = set()
         self._waiting_for_prompt_upload: set[int] = set()
+        self._curation_lock = threading.Lock()
         self._next_spontaneous_time: Optional[datetime] = None
     def _log_debug_group_msg(self, direction: str, text: str) -> None:
         if self.state.is_debug_mode():
@@ -566,7 +568,7 @@ class BotHandlers:
 
         sched_type = entry.get("type", "oneshot")
         sched_desc = entry.get("description", "")
-        chat_id = entry.get("chat_id") or self.params.group_chat_id
+        chat_id = self.state.get_group_chat_id() or self.params.group_chat_id or entry.get("chat_id")
         target_msg_id = entry.get("target_msg_id")
 
         # Sleep schedule handling: periodic replies defer during quiet hours; oneshot execute regardless
@@ -750,77 +752,115 @@ class BotHandlers:
 
     # --- Memory Curation ---
 
-    async def trigger_curation(self) -> Dict[str, Any]:
-        """Runs reflection and curation of recent chat messages into permanent memory."""
-        mem_history = self.state.get_memory_history()
-        transcript = self._format_transcript(mem_history)
-        current_memories = self.memory.get_all_memories()
+    def _curate_worker(self, blocking: bool = False) -> Dict[str, Any]:
+        """Synchronous worker that runs reflection and curation of recent chat messages into permanent memory.
+        Runs in a separate thread. Guarded by _curation_lock so only one curation job runs at a time.
+        """
+        acquired = self._curation_lock.acquire(blocking=blocking)
+        if not acquired:
+            logger.info("Memory curation already in progress in another thread; skipping concurrent trigger.")
+            return {}
 
-        curation = await self.llm.curate_memory(current_memories, transcript)
+        try:
+            mem_history = self.state.get_memory_history()
+            transcript = self._format_transcript(mem_history)
+            current_memories = self.memory.get_all_memories()
 
-        # Create timestamped backup before committing updates
-        self.memory.create_backup()
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                curation = loop.run_until_complete(
+                    self.llm.curate_memory(current_memories, transcript)
+                )
+            finally:
+                try:
+                    loop.run_until_complete(self.llm.close_thread_session())
+                except Exception:
+                    pass
+                loop.close()
 
-        added_facts = 0
-        updated_facts = 0
-        discarded_facts = 0
-        added_dyn = 0
-        discarded_dyn = 0
-        added_jokes = 0
-        discarded_jokes = 0
+            # Create timestamped backup before committing updates (MemoryManager is thread-locked)
+            self.memory.create_backup()
 
-        # Facts
-        for f in curation.get("facts_to_add", []):
-            if f.get("topic") and f.get("content"):
-                self.memory.add_memory(f["topic"], f["content"])
-                added_facts += 1
+            added_facts = 0
+            updated_facts = 0
+            discarded_facts = 0
+            added_dyn = 0
+            discarded_dyn = 0
+            added_jokes = 0
+            discarded_jokes = 0
 
-        for f in curation.get("facts_to_update", []):
-            if f.get("topic") and f.get("content"):
-                if self.memory.update_memory(f["topic"], f["content"]):
-                    updated_facts += 1
-                else:
+            # Facts
+            for f in curation.get("facts_to_add", []):
+                if f.get("topic") and f.get("content"):
                     self.memory.add_memory(f["topic"], f["content"])
                     added_facts += 1
 
-        for target in curation.get("facts_to_discard", []):
-            if self.memory.discard_memory(str(target)):
-                discarded_facts += 1
+            for f in curation.get("facts_to_update", []):
+                if f.get("topic") and f.get("content"):
+                    if self.memory.update_memory(f["topic"], f["content"]):
+                        updated_facts += 1
+                    else:
+                        self.memory.add_memory(f["topic"], f["content"])
+                        added_facts += 1
 
-        # Dynamics
-        for d in curation.get("dynamics_to_add", []):
-            if d.get("members") and d.get("relation"):
-                self.memory.add_dynamic(d["members"], d["relation"])
-                added_dyn += 1
+            for target in curation.get("facts_to_discard", []):
+                if self.memory.discard_memory(str(target)):
+                    discarded_facts += 1
 
-        for target in curation.get("dynamics_to_discard", []):
-            if self.memory.discard_dynamic(str(target)):
-                discarded_dyn += 1
+            # Dynamics
+            for d in curation.get("dynamics_to_add", []):
+                if d.get("members") and d.get("relation"):
+                    self.memory.add_dynamic(d["members"], d["relation"])
+                    added_dyn += 1
 
-        # Jokes
-        for j in curation.get("jokes_to_add", []):
-            if j.get("title") and j.get("context"):
-                self.memory.add_inside_joke(j["title"], j["context"])
-                added_jokes += 1
+            for target in curation.get("dynamics_to_discard", []):
+                if self.memory.discard_dynamic(str(target)):
+                    discarded_dyn += 1
 
-        for target in curation.get("jokes_to_discard", []):
-            if self.memory.discard_inside_joke(str(target)):
-                discarded_jokes += 1
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.memory.set_last_curated_at(now_iso)
+            # Jokes
+            for j in curation.get("jokes_to_add", []):
+                if j.get("title") and j.get("context"):
+                    self.memory.add_inside_joke(j["title"], j["context"])
+                    added_jokes += 1
 
-        summary = {
-            "added_facts": added_facts,
-            "updated_facts": updated_facts,
-            "discarded_facts": discarded_facts,
-            "added_dynamics": added_dyn,
-            "discarded_dynamics": discarded_dyn,
-            "added_jokes": added_jokes,
-            "discarded_jokes": discarded_jokes,
-        }
-        logger.info("Memory consolidation completed: %s", summary)
-        return summary
+            for target in curation.get("jokes_to_discard", []):
+                if self.memory.discard_inside_joke(str(target)):
+                    discarded_jokes += 1
 
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.memory.set_last_curated_at(now_iso)
+
+            summary = {
+                "added_facts": added_facts,
+                "updated_facts": updated_facts,
+                "discarded_facts": discarded_facts,
+                "added_dynamics": added_dyn,
+                "discarded_dynamics": discarded_dyn,
+                "added_jokes": added_jokes,
+                "discarded_jokes": discarded_jokes,
+            }
+            logger.info("Memory consolidation completed in worker thread: %s", summary)
+            return summary
+        except Exception as e:
+            logger.error("Error executing history curation worker: %s", e, exc_info=True)
+            return {}
+        finally:
+            self._curation_lock.release()
+
+    def trigger_curation_background(self) -> None:
+        """Spawns history curation in a separate background thread without blocking the event loop."""
+        t = threading.Thread(
+            target=self._curate_worker,
+            args=(False,),
+            daemon=True,
+            name="history-curation",
+        )
+        t.start()
+
+    async def trigger_curation(self, blocking: bool = True) -> Dict[str, Any]:
+        """Runs reflection and curation of recent chat messages into permanent memory in a worker thread."""
+        return await asyncio.to_thread(self._curate_worker, blocking)
     # --- Message Helpers & Formatting ---
 
     def _format_transcript(self, history: List[Dict[str, Any]]) -> str:
@@ -1045,7 +1085,6 @@ class BotHandlers:
                     sched_entry = {
                         "id": f"sched_{int(time.time())}_{trigger_msg_id or random.randint(1000, 9999)}",
                         "type": sched_type,
-                        "chat_id": chat_id,
                         "target_msg_id": trigger_msg_id,
                         "target_time": target_dt.isoformat(),
                         "interval_str": interval_str,
@@ -1384,7 +1423,7 @@ class BotHandlers:
         curation_count = self.state.increment_messages_since_last_curation()
         if curation_count >= CHAT_HISTORY_SIZE:
             self.state.set_messages_since_last_curation(0)
-            asyncio.create_task(self.trigger_curation())
+            self.trigger_curation_background()
 
 
         # Generate new spontaneous message random timestamp upon group message arrival
@@ -2212,15 +2251,18 @@ class BotHandlers:
 
         msg = await update.effective_message.reply_text("⏳ Consolidating memories from recent conversation...")
         summary = await self.trigger_curation()
+        if not summary:
+            await msg.edit_text("⚠️ Memory consolidation finished with no changes or was already in progress.")
+            return
         text = (
             f"✅ <b>Memory Consolidation Complete:</b>\n"
-            f"• Facts Added: {summary['added_facts']}\n"
-            f"• Facts Updated: {summary['updated_facts']}\n"
-            f"• Facts Discarded: {summary['discarded_facts']}\n"
-            f"• Dynamics Added: {summary['added_dynamics']}\n"
-            f"• Dynamics Discarded: {summary['discarded_dynamics']}\n"
-            f"• Jokes Added: {summary['added_jokes']}\n"
-            f"• Jokes Discarded: {summary['discarded_jokes']}"
+            f"• Facts Added: {summary.get('added_facts', 0)}\n"
+            f"• Facts Updated: {summary.get('updated_facts', 0)}\n"
+            f"• Facts Discarded: {summary.get('discarded_facts', 0)}\n"
+            f"• Dynamics Added: {summary.get('added_dynamics', 0)}\n"
+            f"• Dynamics Discarded: {summary.get('discarded_dynamics', 0)}\n"
+            f"• Jokes Added: {summary.get('added_jokes', 0)}\n"
+            f"• Jokes Discarded: {summary.get('discarded_jokes', 0)}"
         )
         await msg.edit_text(text, parse_mode=ParseMode.HTML)
 

@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import sys
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -43,28 +44,74 @@ class LLMClient:
     def __init__(self, params: Params, state: StateManager):
         self.params = params
         self.state = state
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._genai_clients: Dict[str, genai.Client] = {}
+        self._local = threading.local()
+        self._sessions: List[aiohttp.ClientSession] = []
+        self._sessions_lock = threading.Lock()
+
+    @property
+    def _genai_clients(self) -> Dict[str, genai.Client]:
+        clients = getattr(self._local, "genai_clients", None)
+        if clients is None:
+            clients = {}
+            self._local.genai_clients = clients
+        return clients
+
+    @_genai_clients.setter
+    def _genai_clients(self, val: Dict[str, genai.Client]) -> None:
+        self._local.genai_clients = val
+
+    @property
+    def _session(self) -> Optional[aiohttp.ClientSession]:
+        return getattr(self._local, "session", None)
+
+    @_session.setter
+    def _session(self, val: Optional[aiohttp.ClientSession]) -> None:
+        self._local.session = val
 
     def _log_debug_payload(self, title: str, text: str) -> None:
         if self.state.is_debug_mode():
             sys.stdout.write(f"\n--- [DEBUG {title}] ---\n{text}\n--- [END DEBUG {title}] ---\n")
             sys.stdout.flush()
+
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
-        return self._session
+        current_loop = asyncio.get_running_loop()
+        local_session = getattr(self._local, "session", None)
+        local_loop = getattr(self._local, "loop", None)
+        if local_session is None or local_session.closed or local_loop is not current_loop:
+            local_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+            self._local.session = local_session
+            self._local.loop = current_loop
+            with self._sessions_lock:
+                self._sessions.append(local_session)
+        return local_session
+
+    async def close_thread_session(self) -> None:
+        """Closes the HTTP session associated with the current worker thread."""
+        local_session = getattr(self._local, "session", None)
+        if local_session and not local_session.closed:
+            try:
+                await local_session.close()
+            except Exception:
+                pass
+        self._local.session = None
+        self._local.loop = None
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        with self._sessions_lock:
+            for s in self._sessions:
+                if not s.closed:
+                    try:
+                        await s.close()
+                    except Exception:
+                        pass
+            self._sessions.clear()
 
     def _get_genai_client(self, api_key: str) -> genai.Client:
         key = api_key.strip()
-        if key not in self._genai_clients:
-            self._genai_clients[key] = genai.Client(api_key=key)
-        return self._genai_clients[key]
-
+        clients = self._genai_clients
+        if key not in clients:
+            clients[key] = genai.Client(api_key=key)
+        return clients[key]
     def _is_genai_model(self, model_name: str, api_base: str) -> bool:
         """Determines whether a model should be called via Google GenAI SDK."""
         if api_base and "googleapis.com" not in api_base.lower() and "generativelanguage" not in api_base.lower():

@@ -16,7 +16,7 @@ def test_state_load_defaults():
         assert sm.get_language() == "English"
         assert sm.get_timezone() == "UTC"
         assert sm.get_talkativeness() == 5
-        assert sm.get_cooldown_sec() == 5
+        assert sm.get_cooldown_sec() == 3
         assert sm.is_search_grounding_active() is True
         assert sm.is_debug_mode() is False
         assert sm.get_nicknames() == ["pletyi", "pletyo"]
@@ -324,11 +324,12 @@ def test_state_scheduled_replies_crud_and_persistence():
         assert s_id1 == "sched_1001"
         assert len(sm.get_scheduled_replies()) == 1
         assert sm.get_scheduled_reply("sched_1001")["description"] == "Remind Alice about report"
+        # Verify chat_id was stripped and not stored
+        assert "chat_id" not in sm.get_scheduled_reply("sched_1001")
 
         # Add a periodic reply without id (should auto-generate)
         entry2 = {
             "type": "periodic",
-            "chat_id": -100123,
             "target_msg_id": None,
             "target_time": "2026-10-01T10:00:00+00:00",
             "interval_str": "1 month",
@@ -432,7 +433,7 @@ def test_state_separated_files_persistence():
             sc_data = json.load(f)
         assert len(sc_data) == 1
         assert sc_data[0]["id"] == s_id
-
+        assert "chat_id" not in sc_data[0]
         # Verify state.json does NOT contain chat_history, memory_history, system_prompt, scheduled_replies
         with open(sf, "r", encoding="utf-8") as f:
             state_data = json.load(f)
@@ -470,7 +471,7 @@ def test_state_migration_from_monolithic_state():
             "chat_history": [{"id": 1, "text": "legacy msg"}],
             "memory_history": [{"id": 10, "text": "legacy mem"}],
             "system_prompt": "Legacy prompt persona",
-            "scheduled_replies": [{"id": "sched_legacy", "type": "oneshot", "description": "legacy task"}],
+            "scheduled_replies": [{"id": "sched_legacy", "type": "oneshot", "chat_id": -100123, "description": "legacy task"}],
         }
         with open(sf, "w", encoding="utf-8") as f:
             json.dump(legacy_data, f)
@@ -505,8 +506,9 @@ def test_state_migration_from_monolithic_state():
         with open(pf, "r", encoding="utf-8") as f:
             assert f.read() == "Legacy prompt persona"
         with open(scf, "r", encoding="utf-8") as f:
-            assert json.load(f)[0]["id"] == "sched_legacy"
-
+            sc_loaded = json.load(f)
+            assert sc_loaded[0]["id"] == "sched_legacy"
+            assert "chat_id" not in sc_loaded[0]
         # Check state.json was cleaned
         with open(sf, "r", encoding="utf-8") as f:
             cleaned_state = json.load(f)
@@ -592,3 +594,31 @@ def test_state_custom_file_paths():
         assert os.path.exists(memf)
         assert os.path.exists(pf)
         assert os.path.exists(scf)
+def test_state_history_thread_safety():
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        errors = []
+
+        def worker(thread_idx: int):
+            try:
+                for i in range(25):
+                    sm.append_chat_message({"id": f"{thread_idx}_{i}", "text": f"chat {thread_idx}_{i}"})
+                    sm.append_memory_message({"id": f"{thread_idx}_{i}", "text": f"mem {thread_idx}_{i}"})
+                    _ = sm.get_chat_history()
+                    _ = sm.get_memory_history()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Thread errors encountered: {errors}"
+        assert len(sm.get_chat_history()) == CHAT_HISTORY_SIZE
+        assert len(sm.get_memory_history()) == MEMORY_HISTORY_SIZE

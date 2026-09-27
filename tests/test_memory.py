@@ -205,3 +205,35 @@ def test_memory_clear():
         assert all_m["memories"] == []
         assert all_m["dynamics"] == []
         assert all_m["inside_jokes"] == []
+def test_memory_thread_safety():
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        mm = MemoryManager(mf)
+        mm.load()
+
+        errors = []
+
+        def worker(thread_idx: int):
+            try:
+                for i in range(20):
+                    mm.add_memory(f"Topic_{thread_idx}_{i}", f"Fact content {i}")
+                    mm.add_dynamic([f"User_{thread_idx}", f"User_{i}"], "Colleagues")
+                    mm.add_inside_joke(f"Joke_{thread_idx}_{i}", "Funny lore")
+                    _ = mm.get_all_memories()
+                    _ = mm.format_for_context()
+                    mm.create_backup()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Thread errors encountered: {errors}"
+        all_m = mm.get_all_memories()
+        assert len(all_m["memories"]) == 6 * 20
+        assert len(all_m["dynamics"]) == 6 * 20
+        assert len(all_m["inside_jokes"]) == 6 * 20

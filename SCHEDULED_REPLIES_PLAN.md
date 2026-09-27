@@ -119,7 +119,6 @@ Intervals of arbitrary scaleâ€”including multiple days, weeks, months, or yearsâ
     {
       "id": "sched_1727339000_1042",
       "type": "oneshot",
-      "chat_id": -1001234567890,
       "target_msg_id": 1042,
       "target_time": "2026-10-01T10:00:00+02:00",
       "interval_str": "1 month",
