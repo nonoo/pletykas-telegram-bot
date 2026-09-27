@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time as time_mod
@@ -169,7 +170,8 @@ class StateManager:
                         if isinstance(loaded, list):
                             self.chat_history = loaded[-CHAT_HISTORY_SIZE:]
                         else:
-                            self.chat_history = []
+                            logger.critical("Fatal: Legacy chat history in %s is not a list (expected JSON array). Quitting.", self._legacy_history_file_path)
+                            sys.exit(1)
                         self.save_chat_history()
                         try:
                             os.remove(self._legacy_history_file_path)
@@ -177,7 +179,8 @@ class StateManager:
                             pass
                         return
                     except Exception as e:
-                        logger.error("Failed to migrate legacy history from %s: %s", self._legacy_history_file_path, e)
+                        logger.critical("Fatal: Failed to load or parse legacy chat history from %s: %s. Quitting.", self._legacy_history_file_path, e)
+                        sys.exit(1)
 
                 self.chat_history = []
                 try:
@@ -192,12 +195,11 @@ class StateManager:
                 if isinstance(loaded, list):
                     self.chat_history = loaded[-CHAT_HISTORY_SIZE:]
                 else:
-                    logger.warning("Chat history in %s is not a list; resetting to empty", target_path)
-                    self.chat_history = []
+                    logger.critical("Fatal: Chat history in %s is not a list (expected JSON array). Quitting.", target_path)
+                    sys.exit(1)
             except Exception as e:
-                logger.error("Failed to load chat history from %s: %s", target_path, e)
-                self.chat_history = []
-
+                logger.critical("Fatal: Failed to load or parse chat history from %s: %s. Quitting.", target_path, e)
+                sys.exit(1)
     def load_memory_history(self) -> None:
         with self._memhistory_lock:
             if not os.path.exists(self.memhistory_file_path):
@@ -214,12 +216,11 @@ class StateManager:
                 if isinstance(loaded, list):
                     self.memory_history = loaded[-MEMORY_HISTORY_SIZE:]
                 else:
-                    logger.warning("Memory history in %s is not a list; resetting to empty", self.memhistory_file_path)
-                    self.memory_history = []
+                    logger.critical("Fatal: Memory history in %s is not a list (expected JSON array). Quitting.", self.memhistory_file_path)
+                    sys.exit(1)
             except Exception as e:
-                logger.error("Failed to load memory history from %s: %s", self.memhistory_file_path, e)
-                self.memory_history = []
-
+                logger.critical("Fatal: Failed to load or parse memory history from %s: %s. Quitting.", self.memhistory_file_path, e)
+                sys.exit(1)
     def load_system_prompt(self) -> None:
         if not os.path.exists(self.sysprompt_file_path):
             self.system_prompt = DEFAULT_SYSTEM_PROMPT
@@ -253,22 +254,21 @@ class StateManager:
         try:
             with open(self.sched_file_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-                if isinstance(loaded, list):
-                    needs_save = False
-                    for item in loaded:
-                        if isinstance(item, dict) and "chat_id" in item:
-                            item.pop("chat_id", None)
-                            needs_save = True
-                    self.scheduled_replies = loaded
-                    if needs_save:
-                        self.save_scheduled_replies()
-                else:
-                    logger.warning("Scheduled replies in %s is not a list; resetting to empty", self.sched_file_path)
-                    self.scheduled_replies = []
+            if isinstance(loaded, list):
+                needs_save = False
+                for item in loaded:
+                    if isinstance(item, dict) and "chat_id" in item:
+                        item.pop("chat_id", None)
+                        needs_save = True
+                self.scheduled_replies = loaded
+                if needs_save:
+                    self.save_scheduled_replies()
+            else:
+                logger.critical("Fatal: Scheduled replies in %s is not a list (expected JSON array). Quitting.", self.sched_file_path)
+                sys.exit(1)
         except Exception as e:
-            logger.error("Failed to load scheduled replies from %s: %s", self.sched_file_path, e)
-            self.scheduled_replies = []
-
+            logger.critical("Fatal: Failed to load or parse scheduled replies from %s: %s. Quitting.", self.sched_file_path, e)
+            sys.exit(1)
     def load(self) -> None:
         if not os.path.exists(self.file_path):
             self.data = self._create_default_state()
@@ -384,18 +384,11 @@ class StateManager:
                     except Exception as e:
                         logger.error("Failed to clean migrated keys from state file: %s", e)
             else:
-                self.data = self._create_default_state()
-                self.load_chat_history()
-                self.load_memory_history()
-                self.load_system_prompt()
-                self.load_scheduled_replies()
+                logger.critical("Fatal: State file %s does not contain a JSON object. Quitting.", self.file_path)
+                sys.exit(1)
         except Exception as e:
-            logger.error("Failed to load state file %s: %s", self.file_path, e)
-            self.data = self._create_default_state()
-            self.load_chat_history()
-            self.load_memory_history()
-            self.load_system_prompt()
-            self.load_scheduled_replies()
+            logger.critical("Fatal: Failed to load or parse state file %s: %s. Quitting.", self.file_path, e)
+            sys.exit(1)
 
     def reload(self) -> None:
         self.load()

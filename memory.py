@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -136,15 +137,16 @@ class MemoryManager:
                                 j.pop("id", None)
                         self.data = loaded
                     else:
-                        self.data = self._create_default_memory()
+                        logger.critical("Fatal: Memory file %s does not contain a JSON object. Quitting.", self.file_path)
+                        sys.exit(1)
                 logger.info("Loaded memory from %s (facts: %d, dynamics: %d, jokes: %d)",
                             self.file_path,
                             len(self.data["memories"]),
                             len(self.data["dynamics"]),
                             len(self.data["inside_jokes"]))
             except Exception as e:
-                logger.error("Failed to load memory file %s: %s", self.file_path, e)
-                self.data = self._create_default_memory()
+                logger.critical("Fatal: Failed to load or parse memory file %s: %s. Quitting.", self.file_path, e)
+                sys.exit(1)
     def reload(self) -> None:
         with self._lock:
             self.load()

@@ -237,3 +237,12 @@ def test_memory_thread_safety():
         assert len(all_m["memories"]) == 6 * 20
         assert len(all_m["dynamics"]) == 6 * 20
         assert len(all_m["inside_jokes"]) == 6 * 20
+def test_memory_file_parse_error_quits():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        with open(mf, "w", encoding="utf-8") as f:
+            f.write("{invalid json memory file [[")
+        mm = MemoryManager(mf)
+        with pytest.raises(SystemExit) as exc_info:
+            mm.load()
+        assert exc_info.value.code == 1

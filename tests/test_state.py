@@ -537,36 +537,48 @@ def test_state_legacy_history_file_migration():
         assert os.path.exists(new_chf)
         assert not os.path.exists(old_hf)
 
+def test_state_file_parse_error_quits():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        with open(sf, "w", encoding="utf-8") as f:
+            f.write("{corrupted json[")
+        sm = StateManager(sf)
+        with pytest.raises(SystemExit) as exc_info:
+            sm.load()
+        assert exc_info.value.code == 1
 
-def test_state_separated_files_error_handling():
+def test_chathistory_file_parse_error_quits():
     with tempfile.TemporaryDirectory() as td:
         sf = os.path.join(td, "state.json")
         chf = os.path.join(td, "pletykas-chathistory.json")
-        memf = os.path.join(td, "pletykas-memhistory.json")
-        pf = os.path.join(td, "pletykas-sysprompt.txt")
-        scf = os.path.join(td, "pletykas-sched.json")
-
-        # Write corrupted files
-        with open(sf, "w", encoding="utf-8") as f:
-            f.write('{"version": 1}')
-        with open(chf, "r" if False else "w", encoding="utf-8") as f:
-            f.write("corrupted json {[[")
-        with open(memf, "w", encoding="utf-8") as f:
-            f.write("not a json")
-        with open(pf, "w", encoding="utf-8") as f:
-            f.write("   \n  ")  # empty
-        with open(scf, "w", encoding="utf-8") as f:
-            f.write('{"not": "a list"}')
-
+        with open(chf, "w", encoding="utf-8") as f:
+            f.write("invalid json...")
         sm = StateManager(sf)
-        sm.load()
+        with pytest.raises(SystemExit) as exc_info:
+            sm.load()
+        assert exc_info.value.code == 1
 
-        assert sm.get_chat_history() == []
-        assert sm.get_memory_history() == []
-        from state import DEFAULT_SYSTEM_PROMPT
-        assert sm.get_system_prompt() == DEFAULT_SYSTEM_PROMPT
-        assert sm.get_scheduled_replies() == []
+def test_memhistory_file_parse_error_quits():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        memf = os.path.join(td, "pletykas-memhistory.json")
+        with open(memf, "w", encoding="utf-8") as f:
+            f.write("invalid json...")
+        sm = StateManager(sf)
+        with pytest.raises(SystemExit) as exc_info:
+            sm.load()
+        assert exc_info.value.code == 1
 
+def test_sched_file_parse_error_quits():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        scf = os.path.join(td, "pletykas-sched.json")
+        with open(scf, "w", encoding="utf-8") as f:
+            f.write("not valid json [")
+        sm = StateManager(sf)
+        with pytest.raises(SystemExit) as exc_info:
+            sm.load()
+        assert exc_info.value.code == 1
 
 def test_state_custom_file_paths():
     with tempfile.TemporaryDirectory() as td:
