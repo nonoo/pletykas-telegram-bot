@@ -386,6 +386,76 @@ class BotHandlers:
         self.state.set_spontaneous_next_fire_time(None)
         self.schedule_spontaneous_job(context)
 
+    async def _send_group_poll(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        question: str,
+        options: List[str],
+        reply_to_msg_id: Optional[int] = None,
+        poll_type_label: str = "Poll",
+    ) -> Optional[Any]:
+        """Sends a Telegram poll to the group, logs debug output, and records it in history."""
+        sent = None
+        try:
+            if reply_to_msg_id:
+                try:
+                    sent = await context.bot.send_poll(
+                        chat_id=chat_id,
+                        question=question,
+                        options=options,
+                        is_anonymous=False,
+                        reply_to_message_id=reply_to_msg_id,
+                    )
+                except Exception as re:
+                    logger.debug("Failed sending poll with reply_to_message_id (%s), sending without reply", re)
+                    sent = await context.bot.send_poll(
+                        chat_id=chat_id,
+                        question=question,
+                        options=options,
+                        is_anonymous=False,
+                    )
+            else:
+                sent = await context.bot.send_poll(
+                    chat_id=chat_id,
+                    question=question,
+                    options=options,
+                    is_anonymous=False,
+                )
+        except Exception as e:
+            logger.error("Failed to send %s to chat %s: %s", poll_type_label, chat_id, e)
+            return None
+
+        now_str = self.state.get_current_time_str()
+        bot_name = getattr(context.bot, "first_name", None) or "Pletykas"
+        bot_name = str(bot_name) if isinstance(bot_name, str) else "Pletykas"
+        raw_bot_id = getattr(context.bot, "id", 0)
+        bot_id = int(raw_bot_id) if isinstance(raw_bot_id, (int, float)) else 0
+
+        if self.state.is_debug_mode():
+            reply_info = f" | Reply to msg ID: {reply_to_msg_id}" if reply_to_msg_id else ""
+            self._log_debug_group_msg(
+                "OUTGOING",
+                f"Chat ID: {chat_id} | Message ID: {sent.message_id}{reply_info}\nType: {poll_type_label}\nQuestion: {question}\nOptions: {', '.join(options)}",
+            )
+
+        poll_text = f"[Poll: {question}] Options: {', '.join(options)}"
+        entry = {
+            "id": sent.message_id,
+            "from_user_id": bot_id,
+            "from_user_name": bot_name,
+            "timestamp_epoch": time.time(),
+            "timestamp_str": now_str,
+            "reply_to_msg_id": reply_to_msg_id,
+            "reply_to_user_name": None,
+            "text": poll_text,
+            "media_type": "poll",
+            "media_b64": None,
+        }
+        self.state.append_chat_message(entry)
+        self.state.append_memory_message(entry)
+        return sent
+
     async def trigger_spontaneous_message(self, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, str]:
         """Generates and dispatches a spontaneous conversation starter (text or poll) to the group."""
         group_id = self.params.group_chat_id
@@ -414,91 +484,67 @@ class BotHandlers:
             logger.warning("LLM returned empty spontaneous message")
             return False, "LLM returned empty spontaneous message."
 
-        # Check for poll format
-        poll_match = re.search(r"<POLL>([\s\S]*?)</POLL>", response)
-        if poll_match:
-            block = poll_match.group(1).strip()
-            q = ""
-            opts = []
-            for line in block.splitlines():
-                line = line.strip()
-                if line.lower().startswith("question:"):
-                    q = line[9:].strip()
-                elif line.startswith("-") or line.startswith("•") or line.startswith("*"):
-                    opt = line.lstrip("-•* ").strip()
-                    if opt:
-                        opts.append(opt)
+        cleaned_text, poll_spec = self.llm.extract_poll(response)
 
-            if q and len(opts) >= 2:
-                try:
-                    sent = await context.bot.send_poll(
-                        chat_id=group_id,
-                        question=q,
-                        options=opts[:10],
-                        is_anonymous=False,
-                    )
-                    now_str = self.state.get_current_time_str()
-                    if self.state.is_debug_mode():
-                        self._log_debug_group_msg(
-                            "OUTGOING",
-                            f"Chat ID: {group_id} | Message ID: {sent.message_id}\nType: Spontaneous Poll\nQuestion: {q}\nOptions: {', '.join(opts[:10])}",
-                        )
-                    poll_text = f"[Poll: {q}] Options: {', '.join(opts[:10])}"
-                    bot_name = context.bot.first_name if isinstance(getattr(context.bot, "first_name", None), str) else "Pletykas"
-                    bot_id = context.bot.id if isinstance(getattr(context.bot, "id", None), int) else 0
-                    entry = {
-                        "id": sent.message_id,
-                        "from_user_id": bot_id,
-                        "from_user_name": bot_name,
-                        "timestamp_epoch": time.time(),
-                        "timestamp_str": now_str,
-                        "reply_to_msg_id": None,
-                        "reply_to_user_name": None,
-                        "text": poll_text,
-                        "media_type": "poll",
-                        "media_b64": None,
-                    }
-                    self.state.append_chat_message(entry)
-                    self.state.append_memory_message(entry)
-                    return True, poll_text
-                except Exception as e:
-                    logger.error("Failed to send spontaneous poll: %s", e)
-                    return False, f"Failed to send poll: {e}"
+        sent_any = False
+        sent_texts: List[str] = []
 
-        # Standard text message
-        try:
+        if cleaned_text:
             try:
-                sent = await context.bot.send_message(chat_id=group_id, text=response, parse_mode=ParseMode.HTML)
-            except Exception as pe:
-                logger.debug("Failed sending spontaneous message with HTML parse mode (%s), falling back to plain text", pe)
-                sent = await context.bot.send_message(chat_id=group_id, text=response)
-            now_str = self.state.get_current_time_str()
-            bot_name = context.bot.first_name if isinstance(getattr(context.bot, "first_name", None), str) else "Pletykas"
-            if self.state.is_debug_mode():
-                self._log_debug_group_msg(
-                    "OUTGOING",
-                    f"Chat ID: {group_id} | Message ID: {sent.message_id}\nType: Spontaneous Text Message\nText: {response}",
-                )
-            bot_id = context.bot.id if isinstance(getattr(context.bot, "id", None), int) else 0
-            entry = {
-                "id": sent.message_id,
-                "from_user_id": bot_id,
-                "from_user_name": bot_name,
-                "timestamp_epoch": time.time(),
-                "timestamp_str": now_str,
-                "reply_to_msg_id": None,
-                "reply_to_user_name": None,
-                "text": response,
-                "media_type": "none",
-                "media_b64": None,
-            }
-            self.state.append_chat_message(entry)
-            self.state.append_memory_message(entry)
-            return True, response
-        except Exception as e:
-            logger.error("Failed to send spontaneous message: %s", e)
-            return False, f"Failed to send message: {e}"
+                try:
+                    sent = await context.bot.send_message(chat_id=group_id, text=cleaned_text, parse_mode=ParseMode.HTML)
+                except Exception as pe:
+                    logger.debug("Failed sending spontaneous message with HTML parse mode (%s), falling back to plain text", pe)
+                    sent = await context.bot.send_message(chat_id=group_id, text=cleaned_text)
+                now_str = self.state.get_current_time_str()
+                bot_name = getattr(context.bot, "first_name", None) or "Pletykas"
+                bot_name = str(bot_name) if isinstance(bot_name, str) else "Pletykas"
+                raw_bot_id = getattr(context.bot, "id", 0)
+                bot_id = int(raw_bot_id) if isinstance(raw_bot_id, (int, float)) else 0
+                if self.state.is_debug_mode():
+                    self._log_debug_group_msg(
+                        "OUTGOING",
+                        f"Chat ID: {group_id} | Message ID: {sent.message_id}\nType: Spontaneous Text Message\nText: {cleaned_text}",
+                    )
+                entry = {
+                    "id": sent.message_id,
+                    "from_user_id": bot_id,
+                    "from_user_name": bot_name,
+                    "timestamp_epoch": time.time(),
+                    "timestamp_str": now_str,
+                    "reply_to_msg_id": None,
+                    "reply_to_user_name": None,
+                    "text": cleaned_text,
+                    "media_type": "none",
+                    "media_b64": None,
+                }
+                self.state.append_chat_message(entry)
+                self.state.append_memory_message(entry)
+                sent_any = True
+                sent_texts.append(cleaned_text)
+            except Exception as e:
+                logger.error("Failed to send spontaneous message: %s", e)
+                if not poll_spec:
+                    return False, f"Failed to send message: {e}"
 
+        if poll_spec:
+            sent_poll = await self._send_group_poll(
+                context=context,
+                chat_id=group_id,
+                question=poll_spec["question"],
+                options=poll_spec["options"],
+                reply_to_msg_id=None,
+                poll_type_label="Spontaneous Poll",
+            )
+            if sent_poll:
+                sent_any = True
+                sent_texts.append(f"[Poll: {poll_spec['question']}] Options: {', '.join(poll_spec['options'])}")
+            elif not sent_any:
+                return False, "Failed to send spontaneous poll."
+
+        if sent_any:
+            return True, "\n\n".join(sent_texts)
+        return False, "LLM returned empty spontaneous message."
     # --- Scheduled Replies ---
 
     def schedule_reply_job(self, context: ContextTypes.DEFAULT_TYPE, entry: Dict[str, Any]) -> None:
@@ -608,58 +654,70 @@ class BotHandlers:
             )
 
             if reply_text:
+                reply_text, poll_spec = self.llm.extract_poll(reply_text)
                 sent_msg = None
-                try:
-                    sent_msg = await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=reply_text,
-                        reply_to_message_id=target_msg_id,
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception as pe:
-                    logger.debug("Failed sending scheduled reply with HTML parse mode (%s), attempting without HTML", pe)
+                if reply_text:
                     try:
                         sent_msg = await context.bot.send_message(
                             chat_id=chat_id,
                             text=reply_text,
                             reply_to_message_id=target_msg_id,
+                            parse_mode=ParseMode.HTML,
                         )
-                    except Exception as re:
-                        logger.debug("Failed sending scheduled reply with reply_to_message_id (%s), sending to root", re)
+                    except Exception as pe:
+                        logger.debug("Failed sending scheduled reply with HTML parse mode (%s), attempting without HTML", pe)
                         try:
                             sent_msg = await context.bot.send_message(
                                 chat_id=chat_id,
                                 text=reply_text,
+                                reply_to_message_id=target_msg_id,
                             )
-                        except Exception as e_send:
-                            logger.error("Failed to send scheduled reply message: %s", e_send)
+                        except Exception as re:
+                            logger.debug("Failed sending scheduled reply with reply_to_message_id (%s), sending to root", re)
+                            try:
+                                sent_msg = await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=reply_text,
+                                )
+                            except Exception as e_send:
+                                logger.error("Failed to send scheduled reply message: %s", e_send)
 
-                if sent_msg:
-                    now_str = self.state.get_current_time_str()
-                    if self.state.is_debug_mode():
-                        reply_info = f" | Reply to msg ID: {target_msg_id}" if target_msg_id else ""
-                        self._log_debug_group_msg(
-                            "OUTGOING",
-                            f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Scheduled Reply ({sched_type})\nText: {reply_text}",
-                        )
+                    if sent_msg:
+                        now_str = self.state.get_current_time_str()
+                        if self.state.is_debug_mode():
+                            reply_info = f" | Reply to msg ID: {target_msg_id}" if target_msg_id else ""
+                            self._log_debug_group_msg(
+                                "OUTGOING",
+                                f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Scheduled Reply ({sched_type})\nText: {reply_text}",
+                            )
 
-                    bot_uid = getattr(context.bot, "id", 0)
-                    bot_uname = getattr(context.bot, "first_name", "Pletykas")
-                    msg_entry = {
-                        "id": sent_msg.message_id,
-                        "from_user_id": int(bot_uid) if isinstance(bot_uid, (int, float)) else 0,
-                        "from_user_name": str(bot_uname) if isinstance(bot_uname, str) else "Pletykas",
-                        "timestamp_epoch": time.time(),
-                        "timestamp_str": now_str,
-                        "reply_to_msg_id": target_msg_id,
-                        "reply_to_user_name": None,
-                        "text": reply_text,
-                        "media_type": "none",
-                        "media_b64": None,
-                    }
-                    self.state.append_chat_message(msg_entry)
-                    self.state.append_memory_message(msg_entry)
+                        bot_uid = getattr(context.bot, "id", 0)
+                        bot_uname = getattr(context.bot, "first_name", "Pletykas")
+                        msg_entry = {
+                            "id": sent_msg.message_id,
+                            "from_user_id": int(bot_uid) if isinstance(bot_uid, (int, float)) else 0,
+                            "from_user_name": str(bot_uname) if isinstance(bot_uname, str) else "Pletykas",
+                            "timestamp_epoch": time.time(),
+                            "timestamp_str": now_str,
+                            "reply_to_msg_id": target_msg_id,
+                            "reply_to_user_name": None,
+                            "text": reply_text,
+                            "media_type": "none",
+                            "media_b64": None,
+                        }
+                        self.state.append_chat_message(msg_entry)
+                        self.state.append_memory_message(msg_entry)
 
+                if poll_spec:
+                    poll_reply_to = target_msg_id if not reply_text else None
+                    await self._send_group_poll(
+                        context=context,
+                        chat_id=chat_id,
+                        question=poll_spec["question"],
+                        options=poll_spec["options"],
+                        reply_to_msg_id=poll_reply_to,
+                        poll_type_label=f"Scheduled Poll ({sched_type})",
+                    )
         except Exception as e:
             logger.error("Error executing scheduled reply callback for '%s': %s", schedule_id, e, exc_info=True)
 
@@ -1211,7 +1269,11 @@ class BotHandlers:
                     if is_direct_trigger:
                         reply_text = "sorry, I couldn't generate the image... 🎨❌"
 
-            # 3. Text Message Action
+            # 3. Text Message and/or Poll Action
+            poll_spec = None
+            if reply_text:
+                reply_text, poll_spec = self.llm.extract_poll(reply_text)
+
             if reply_text:
                 reply_to_id = trigger_msg_id if is_direct_trigger else None
                 try:
@@ -1251,6 +1313,17 @@ class BotHandlers:
                 self.state.append_chat_message(entry)
                 self.state.append_memory_message(entry)
 
+            # 4. Poll Action
+            if poll_spec:
+                poll_reply_to = trigger_msg_id if (is_direct_trigger and not reply_text) else None
+                await self._send_group_poll(
+                    context=context,
+                    chat_id=chat_id,
+                    question=poll_spec["question"],
+                    options=poll_spec["options"],
+                    reply_to_msg_id=poll_reply_to,
+                    poll_type_label="Poll",
+                )
         except Exception as e:
             logger.error("Error during evaluation execution: %s", e, exc_info=True)
             if is_direct_trigger:

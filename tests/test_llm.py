@@ -863,3 +863,97 @@ async def test_generate_scheduled_reply():
         assert "[Scheduled Task Execution]" in captured_prompt
         assert "Type: oneshot" in captured_prompt
         assert "Szólj Bélának hogy indul a busz" in captured_prompt
+
+
+def test_extract_poll_hungarian_with_intro_text():
+    from llm import extract_poll
+    text = """Srácok, Norbi este repülőtér + hotel Akossal, holnap meg Birmingham — szerintetek ki fogja előbb feladni a sorozást: ő vagy Misa? 😏
+
+<POLL>
+Kérdés: Ki bírja tovább a birminghami sorozást?
+Opciók:
+- Norbi
+- Misa
+- GGabor
+- Santha Gergő
+</POLL>"""
+    cleaned, spec = extract_poll(text)
+    assert cleaned == "Srácok, Norbi este repülőtér + hotel Akossal, holnap meg Birmingham — szerintetek ki fogja előbb feladni a sorozást: ő vagy Misa? 😏"
+    assert spec is not None
+    assert spec["question"] == "Ki bírja tovább a birminghami sorozást?"
+    assert spec["options"] == ["Norbi", "Misa", "GGabor", "Santha Gergő"]
+
+
+def test_extract_poll_english_standard():
+    from llm import extract_poll
+    text = """<POLL>
+Question: What is your favorite programming language?
+Options:
+- Python
+- Rust
+- Go
+</POLL>"""
+    cleaned, spec = extract_poll(text)
+    assert cleaned == ""
+    assert spec is not None
+    assert spec["question"] == "What is your favorite programming language?"
+    assert spec["options"] == ["Python", "Rust", "Go"]
+
+
+def test_extract_poll_without_prefix_and_numbered_options():
+    from llm import extract_poll
+    text = """Hova menjünk ebédelni?
+
+<POLL>
+Melyik étterem legyen mára?
+1. Burger King
+2. Wasabi
+3. Pizza Forte
+</POLL>
+
+Szavazzatok délután 1-ig!"""
+    cleaned, spec = extract_poll(text)
+    assert "Hova menjünk ebédelni?" in cleaned
+    assert "Szavazzatok délután 1-ig!" in cleaned
+    assert "<POLL>" not in cleaned
+    assert "</POLL>" not in cleaned
+    assert spec is not None
+    assert spec["question"] == "Melyik étterem legyen mára?"
+    assert spec["options"] == ["Burger King", "Wasabi", "Pizza Forte"]
+
+
+def test_extract_poll_malformed_and_unclosed():
+    from llm import extract_poll
+    # Single option -> invalid poll
+    text = "Hello! <POLL>\nQuestion: Single option?\n- Only me\n</POLL>"
+    cleaned, spec = extract_poll(text)
+    assert cleaned == "Hello!"
+    assert spec is None
+
+    # Unclosed poll tag
+    text2 = "Hello! <POLL>\nQuestion: Valid question?\n- Opt 1\n- Opt 2"
+    cleaned2, spec2 = extract_poll(text2)
+    assert cleaned2 == "Hello!"
+    assert spec2 is not None
+    assert spec2["question"] == "Valid question?"
+    assert spec2["options"] == ["Opt 1", "Opt 2"]
+
+
+def test_extract_poll_deduplication_and_limits():
+    from llm import extract_poll
+    text = """<POLL>
+Question: """ + ("Q" * 400) + """
+Options:
+- 'Apple'
+- "Banana"
+- Apple
+""" + "\n".join([f"- Option {i}" for i in range(15)]) + """
+</POLL>"""
+    cleaned, spec = extract_poll(text)
+    assert spec is not None
+    assert len(spec["question"]) == 300
+    # Deduplicated 'Apple', max 10 options
+    assert len(spec["options"]) == 10
+    assert spec["options"][0] == "Apple"
+    assert spec["options"][1] == "Banana"
+    assert spec["options"][2] == "Option 0"

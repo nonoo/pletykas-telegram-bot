@@ -1569,3 +1569,110 @@ async def test_on_message_triggers_curation_in_background(test_setup):
         await handlers.on_message(mock_update, mock_context)
         mock_curate_bg.assert_called_once()
         assert s.get_messages_since_last_curation() == 0
+
+
+@pytest.mark.asyncio
+async def test_spontaneous_hungarian_poll_with_intro_text(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=6001))
+    mock_context.bot.send_poll = AsyncMock(return_value=MagicMock(message_id=6002))
+
+    llm_out = """Srácok, Norbi este repülőtér + hotel Akossal, holnap meg Birmingham — szerintetek ki fogja előbb feladni a sorozást: ő vagy Misa? 😏
+
+<POLL>
+Kérdés: Ki bírja tovább a birminghami sorozást?
+Opciók:
+- Norbi
+- Misa
+- GGabor
+- Santha Gergő
+</POLL>"""
+
+    with patch.object(llm, "generate_spontaneous_message", AsyncMock(return_value=llm_out)):
+        success, detail = await handlers.trigger_spontaneous_message(mock_context)
+        assert success is True
+        # Intro text was sent first via send_message
+        mock_context.bot.send_message.assert_awaited_once()
+        msg_args = mock_context.bot.send_message.call_args[1]
+        assert msg_args["chat_id"] == p.group_chat_id
+        assert "Srácok, Norbi este repülőtér" in msg_args["text"]
+        assert "<POLL>" not in msg_args["text"]
+        assert "</POLL>" not in msg_args["text"]
+
+        # Poll was sent via send_poll
+        mock_context.bot.send_poll.assert_awaited_once()
+        poll_args = mock_context.bot.send_poll.call_args[1]
+        assert poll_args["chat_id"] == p.group_chat_id
+        assert poll_args["question"] == "Ki bírja tovább a birminghami sorozást?"
+        assert poll_args["options"] == ["Norbi", "Misa", "GGabor", "Santha Gergő"]
+        assert poll_args["is_anonymous"] is False
+
+        # Both entries recorded in chat history
+        history = s.get_chat_history()
+        assert len(history) >= 2
+        assert history[-2]["id"] == 6001
+        assert history[-2]["media_type"] == "none"
+        assert history[-1]["id"] == 6002
+        assert history[-1]["media_type"] == "poll"
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_with_poll(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7001))
+    mock_context.bot.send_poll = AsyncMock(return_value=MagicMock(message_id=7002))
+
+    llm_eval_out = ("Szerintem szavazzuk meg!\n<POLL>\nQuestion: Ki nyeri a meccset?\n- Csapat A\n- Csapat B\n</POLL>", None, None, None)
+
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=llm_eval_out)):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+
+        mock_context.bot.send_message.assert_awaited_once()
+        msg_kwargs = mock_context.bot.send_message.call_args[1]
+        assert msg_kwargs["text"] == "Szerintem szavazzuk meg!"
+        assert msg_kwargs["reply_to_message_id"] == 1234
+
+        mock_context.bot.send_poll.assert_awaited_once()
+        poll_kwargs = mock_context.bot.send_poll.call_args[1]
+        assert poll_kwargs["question"] == "Ki nyeri a meccset?"
+        assert poll_kwargs["options"] == ["Csapat A", "Csapat B"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_reply_with_poll(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=8001))
+    mock_context.bot.send_poll = AsyncMock(return_value=MagicMock(message_id=8002))
+    mock_job = MagicMock()
+    mock_job.data = {"schedule_id": "sched_test_poll"}
+    mock_context.job = mock_job
+
+    s.add_scheduled_reply({
+        "id": "sched_test_poll",
+        "type": "oneshot",
+        "target_msg_id": 4321,
+        "target_time": "2026-10-01T12:00:00",
+        "description": "Indíts egy szavazást",
+        "created_at": "2026-10-01T11:00:00",
+    })
+
+    scheduled_llm_out = "Időzített felmérés:\n<POLL>\nKérdés: Kész a feladat?\n- Igen\n- Nem\n</POLL>"
+    with patch.object(llm, "generate_scheduled_reply", AsyncMock(return_value=scheduled_llm_out)):
+        await handlers._scheduled_reply_callback(mock_context)
+
+        mock_context.bot.send_message.assert_awaited_once()
+        assert mock_context.bot.send_message.call_args[1]["text"] == "Időzített felmérés:"
+
+        mock_context.bot.send_poll.assert_awaited_once()
+        poll_kwargs = mock_context.bot.send_poll.call_args[1]
+        assert poll_kwargs["question"] == "Kész a feladat?"
+        assert poll_kwargs["options"] == ["Igen", "Nem"]

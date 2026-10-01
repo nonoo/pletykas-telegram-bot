@@ -38,6 +38,95 @@ def compress_image(image_bytes: bytes, max_dim: int = 1280, quality: int = 85) -
         logger.warning("Image compression failed, using original bytes: %s", e)
         return image_bytes
 
+_QUESTION_PREFIX_RE = re.compile(
+    r"^(?:question|kérdés|kerdes|szavazás|szavazas|frage|pregunta|q|poll|title|cím|cim|topic|téma|tema)\s*[:：\-]\s*(.*)$",
+    re.IGNORECASE,
+)
+_OPTIONS_HEADER_RE = re.compile(
+    r"^(?:options?|opciók?|opciok?|choices?|answers?|válaszok?|valaszok?|lehetőségek?|lehetosegek?|optionen|antworten|opciones|respuestas)\s*[:：\-]?\s*$",
+    re.IGNORECASE,
+)
+_OPTION_BULLET_RE = re.compile(
+    r"^(?:[-*•–—+>]|(?:\d+|[a-zA-Z])[\.\)]|\[\d+\]|\(\d+\))\s*(.*)$"
+)
+_OPTION_PREFIX_RE = re.compile(
+    r"^(?:option|opció|opcio)\s*\d*\s*[:：\-]\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def extract_poll(text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Extracts <POLL>...</POLL> block, stripping it from text and returning (cleaned_text, poll_spec)."""
+    if not text:
+        return text, None
+
+    pattern = r"<POLL\b[^>]*>([\s\S]*?)(?:</POLL>|$)"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return text.strip(), None
+
+    block = match.group(1).strip()
+    cleaned_text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+    question = ""
+    opts: List[str] = []
+    in_options = False
+
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if _OPTIONS_HEADER_RE.match(line):
+            in_options = True
+            continue
+
+        opt_match = _OPTION_BULLET_RE.match(line)
+        opt_pref_match = _OPTION_PREFIX_RE.match(line)
+
+        if opt_match:
+            opt_val = opt_match.group(1).strip()
+            if opt_val:
+                opts.append(opt_val)
+            in_options = True
+            continue
+        elif opt_pref_match:
+            opt_val = opt_pref_match.group(1).strip()
+            if opt_val:
+                opts.append(opt_val)
+            in_options = True
+            continue
+
+        q_match = _QUESTION_PREFIX_RE.match(line)
+        if q_match:
+            q_val = q_match.group(1).strip()
+            if q_val:
+                question = f"{question} {q_val}".strip() if question else q_val
+            continue
+
+        if in_options or len(opts) > 0:
+            opts.append(line)
+        else:
+            question = f"{question} {line}".strip() if question else line
+
+    question = question.strip()
+    cleaned_opts: List[str] = []
+    for opt in opts:
+        opt_s = opt.strip().strip("\"'").strip()
+        if opt_s and opt_s not in cleaned_opts:
+            cleaned_opts.append(opt_s)
+
+    # Telegram constraints: question 1-300 chars, 2-10 options, each <= 100 chars
+    if not question or len(cleaned_opts) < 2:
+        return cleaned_text, None
+
+    question = question[:300]
+    cleaned_opts = [o[:100] for o in cleaned_opts[:10]]
+
+    return cleaned_text, {
+        "question": question,
+        "options": cleaned_opts,
+    }
 
 
 class LLMClient:
@@ -452,6 +541,14 @@ class LLMClient:
             return text_cleaned, spec
 
         return text.strip(), None
+
+    def _extract_poll(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Extracts <POLL>...</POLL> block and strips it from text."""
+        return extract_poll(text)
+
+    def extract_poll(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Public helper to extract <POLL>...</POLL> block and strip it from text."""
+        return extract_poll(text)
     def _check_incapable_retry(self, response_text: str) -> Tuple[bool, str]:
         """Detects if model indicated it cannot fulfill the request (e.g. needs web search / large model)."""
         if not response_text:
@@ -545,6 +642,18 @@ Output:
 
 IMPORTANT: In the SAME turn, write your normal in-character reply to the user confirming that you scheduled or canceled the reminder! Never leave the reply empty when scheduling or canceling."""
 
+        poll_section = """[Group Poll Capability]
+If a user asks you to create, start, or post a poll, or if an interesting debate or group voting topic fits the conversation:
+Output an optional short conversational message introducing the poll, followed by a poll block:
+<POLL>
+Question: Your poll question?
+Options:
+- Option 1
+- Option 2
+- Option 3
+</POLL>
+You may include both your in-character text message and the <POLL> block in the same response."""
+
         if can_search:
             search_section = """[Real-Time Web Search & Grounding]
 You are equipped with Google Search grounding and have direct access to live, real-time web search.
@@ -563,6 +672,7 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
         output_rules = f"""[Output Rules]
 - You MUST select EXACTLY ONE primary action per turn: Output '<NO_REPLY>', OR output a single '<REACTION:emoji>', OR write a short text reply. DO NOT combine a text reply and an emoji reaction in the same response.
 - When scheduling or canceling a reminder via `<SCHEDULE:...>`, you MUST provide an in-character text confirmation in addition to the `<SCHEDULE:...>` block.
+- When creating a poll via `<POLL>`, you may include an introductory in-character text message in addition to the `<POLL>` block.
 - STRICT REACTION RULE: Do NOT use <REACTION:emoji> as a passive default. When talkativeness is low, '<NO_REPLY>' MUST be heavily preferred over reacting in 95% of cases. Only react if a message genuinely warrants a strong reaction.
 - To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.
@@ -575,6 +685,8 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
 
 {schedule_section}
 
+
+{poll_section}
 {search_section}
 
 {output_rules}"""
@@ -1191,9 +1303,9 @@ Timezone: {timezone_str}
 
 [Instruction]
 You are initiating a spontaneous conversation or dropping gossip into the Telegram group chat unprompted.
-You may choose between sending an engaging message or creating a group poll:
+You may choose between sending an engaging message or creating a group poll (you can also provide an introductory conversational message before the poll):
 1. Regular message: Draw upon your persona, memories, group dynamics, or inside jokes. Be witty or gossipy. Output ONLY your message text.
-2. Poll: If an interesting debate or group voting topic fits the context, output:
+2. Poll: If an interesting debate or group voting topic fits the context, you can output an optional in-character text message introducing the topic, followed by:
 <POLL>
 Question: Your poll question?
 Options:
