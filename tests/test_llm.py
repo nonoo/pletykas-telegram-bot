@@ -870,8 +870,8 @@ def test_extract_poll_hungarian_with_intro_text():
     text = """Srácok, Norbi este repülőtér + hotel Akossal, holnap meg Birmingham — szerintetek ki fogja előbb feladni a sorozást: ő vagy Misa? 😏
 
 <POLL>
-Kérdés: Ki bírja tovább a birminghami sorozást?
-Opciók:
+Question: Ki bírja tovább a birminghami sorozást?
+Options:
 - Norbi
 - Misa
 - GGabor

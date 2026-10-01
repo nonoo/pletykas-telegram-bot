@@ -1583,8 +1583,8 @@ async def test_spontaneous_hungarian_poll_with_intro_text(test_setup):
     llm_out = """Srácok, Norbi este repülőtér + hotel Akossal, holnap meg Birmingham — szerintetek ki fogja előbb feladni a sorozást: ő vagy Misa? 😏
 
 <POLL>
-Kérdés: Ki bírja tovább a birminghami sorozást?
-Opciók:
+Question: Ki bírja tovább a birminghami sorozást?
+Options:
 - Norbi
 - Misa
 - GGabor
@@ -1665,7 +1665,7 @@ async def test_scheduled_reply_with_poll(test_setup):
         "created_at": "2026-10-01T11:00:00",
     })
 
-    scheduled_llm_out = "Időzített felmérés:\n<POLL>\nKérdés: Kész a feladat?\n- Igen\n- Nem\n</POLL>"
+    scheduled_llm_out = "Időzített felmérés:\n<POLL>\nQuestion: Kész a feladat?\n- Igen\n- Nem\n</POLL>"
     with patch.object(llm, "generate_scheduled_reply", AsyncMock(return_value=scheduled_llm_out)):
         await handlers._scheduled_reply_callback(mock_context)
 

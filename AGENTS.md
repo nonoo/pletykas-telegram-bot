@@ -186,6 +186,9 @@ Managed by `MemoryManager` via atomic replacement:
   ```
 - `<SCHEDULE:cancel:id>` or `<SCHEDULE:cancel>id</SCHEDULE:cancel>`: Cancels an active scheduled timer by ID.
 
+
+### Protocol Keyword Invariant
+All protocol tags (`<GENERATE_IMAGE>`, `<SCHEDULE:...>`, `<POLL>`, etc.) and their inner field keywords (`Prompt:`, `Caption:`, `Source:`, `Mode:`, `Time:`, `Interval:`, `Start:`, `Description:`, `Question:`, `Options:`) MUST strictly remain in English verbatim, regardless of the conversation language. The model is strictly instructed never to translate field keywords.
 ---
 
 ## 5. Testing & Verification

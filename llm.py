@@ -39,18 +39,18 @@ def compress_image(image_bytes: bytes, max_dim: int = 1280, quality: int = 85) -
         return image_bytes
 
 _QUESTION_PREFIX_RE = re.compile(
-    r"^(?:question|kérdés|kerdes|szavazás|szavazas|frage|pregunta|q|poll|title|cím|cim|topic|téma|tema)\s*[:：\-]\s*(.*)$",
+    r"^question\s*[:：\-]\s*(.*)$",
     re.IGNORECASE,
 )
 _OPTIONS_HEADER_RE = re.compile(
-    r"^(?:options?|opciók?|opciok?|choices?|answers?|válaszok?|valaszok?|lehetőségek?|lehetosegek?|optionen|antworten|opciones|respuestas)\s*[:：\-]?\s*$",
+    r"^options?\s*[:：\-]?\s*$",
     re.IGNORECASE,
 )
 _OPTION_BULLET_RE = re.compile(
     r"^(?:[-*•–—+>]|(?:\d+|[a-zA-Z])[\.\)]|\[\d+\]|\(\d+\))\s*(.*)$"
 )
 _OPTION_PREFIX_RE = re.compile(
-    r"^(?:option|opció|opcio)\s*\d*\s*[:：\-]\s*(.*)$",
+    r"^option\s*\d*\s*[:：\-]\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -618,7 +618,8 @@ Prompt: <detailed English visual prompt describing the desired image or modifica
 Caption: <your in-character message or response in the chat language to accompany the image>
 Source: <message ID if referring to an image in transcript, or 'reply' if replying to a photo message, or 'new'>
 Mode: <'modify' if changing an existing image, or 'generate' if creating a fresh image>
-</GENERATE_IMAGE>"""
+</GENERATE_IMAGE>
+CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Prompt:', 'Caption:', 'Source:', 'Mode:' and tag names verbatim. NEVER translate these field labels into Hungarian or any other language."""
         schedule_section = """[Scheduled Replies & Reminders]
 If a user asks you to remind them, check something later, or schedule a periodic message/check:
 1. For one-shot replies/reminders:
@@ -640,7 +641,8 @@ Description: <Comprehensive instruction detailing what to say or check periodica
 Output:
 <SCHEDULE:cancel:schedule_id>
 
-IMPORTANT: In the SAME turn, write your normal in-character reply to the user confirming that you scheduled or canceled the reminder! Never leave the reply empty when scheduling or canceling."""
+IMPORTANT: In the SAME turn, write your normal in-character reply to the user confirming that you scheduled or canceled the reminder! Never leave the reply empty when scheduling or canceling.
+CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Time:', 'Interval:', 'Start:', 'Description:' and tag names verbatim. NEVER translate these field labels into Hungarian or any other language."""
 
         poll_section = """[Group Poll Capability]
 If a user asks you to create, start, or post a poll, or if an interesting debate or group voting topic fits the conversation:
@@ -652,7 +654,8 @@ Options:
 - Option 2
 - Option 3
 </POLL>
-You may include both your in-character text message and the <POLL> block in the same response."""
+You may include both your in-character text message and the <POLL> block in the same response.
+CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Question:' and 'Options:' and tag names '<POLL>' and '</POLL>' verbatim. NEVER translate these keywords into Hungarian or any other language (e.g. NEVER write 'Kérdés:' or 'Opciók:'), even though the question text and options themselves are in the chat language."""
 
         if can_search:
             search_section = """[Real-Time Web Search & Grounding]
@@ -673,6 +676,7 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
 - You MUST select EXACTLY ONE primary action per turn: Output '<NO_REPLY>', OR output a single '<REACTION:emoji>', OR write a short text reply. DO NOT combine a text reply and an emoji reaction in the same response.
 - When scheduling or canceling a reminder via `<SCHEDULE:...>`, you MUST provide an in-character text confirmation in addition to the `<SCHEDULE:...>` block.
 - When creating a poll via `<POLL>`, you may include an introductory in-character text message in addition to the `<POLL>` block.
+- PROTOCOL KEYWORDS RULE: When using special protocol tags (<GENERATE_IMAGE>, <SCHEDULE:...>, <POLL>), all tag names and field labels ('Prompt:', 'Caption:', 'Source:', 'Mode:', 'Time:', 'Interval:', 'Start:', 'Description:', 'Question:', 'Options:') MUST strictly remain in English verbatim. NEVER translate protocol tags or field labels into the conversation language.
 - STRICT REACTION RULE: Do NOT use <REACTION:emoji> as a passive default. When talkativeness is low, '<NO_REPLY>' MUST be heavily preferred over reacting in 95% of cases. Only react if a message genuinely warrants a strong reaction.
 - To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.
@@ -1313,6 +1317,7 @@ Options:
 - Option 2
 - Option 3
 </POLL>
+CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Question:' and 'Options:' and tag names '<POLL>' and '</POLL>' verbatim. NEVER translate these keywords into Hungarian or any other language (e.g. NEVER write 'Kérdés:' or 'Opciók:'), even though the question text and options themselves are in the chat language.
 Rules: Do not refer to yourself as an AI or mention that this is automated. Speak in character."""
 
         model_name = self.params.model_name
