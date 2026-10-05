@@ -185,10 +185,25 @@ Managed by `MemoryManager` via atomic replacement:
   </SCHEDULE:periodic>
   ```
 - `<SCHEDULE:cancel:id>` or `<SCHEDULE:cancel>id</SCHEDULE:cancel>`: Cancels an active scheduled timer by ID.
+- `<FORGET>`: Clears or updates permanent memory entries upon user request. Accompanied by in-character confirmation text:
+  ```text
+  <FORGET>
+  Facts to Discard:
+  - <topic or text pattern to remove>
+  Facts to Update:
+  - Topic: <topic>
+    Content: <remaining content after removing the forgotten information>
+  Dynamics to Discard:
+  - <member name or relation to remove>
+  Jokes to Discard:
+  - <title or context to remove>
+  </FORGET>
+  ```
+  Or for wiping all memory: `<FORGET>ALL</FORGET>` (or `<FORGET:all>`).
 
 
 ### Protocol Keyword Invariant
-All protocol tags (`<GENERATE_IMAGE>`, `<SCHEDULE:...>`, `<POLL>`, etc.) and their inner field keywords (`Prompt:`, `Caption:`, `Source:`, `Mode:`, `Time:`, `Interval:`, `Start:`, `Description:`, `Question:`, `Options:`) MUST strictly remain in English verbatim, regardless of the conversation language. The model is strictly instructed never to translate field keywords.
+All protocol tags (`<GENERATE_IMAGE>`, `<SCHEDULE:...>`, `<POLL>`, `<FORGET>`, etc.) and their inner field keywords (`Prompt:`, `Caption:`, `Source:`, `Mode:`, `Time:`, `Interval:`, `Start:`, `Description:`, `Question:`, `Options:`, `Facts to Discard:`, `Facts to Update:`, `Dynamics to Discard:`, `Jokes to Discard:`, `Topic:`, `Content:`) MUST strictly remain in English verbatim, regardless of the conversation language. The model is strictly instructed never to translate field keywords.
 ---
 
 ## 5. Testing & Verification

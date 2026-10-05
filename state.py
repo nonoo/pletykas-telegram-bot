@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -686,6 +687,44 @@ class StateManager:
             if len(self.memory_history) > MEMORY_HISTORY_SIZE:
                 self.memory_history = self.memory_history[-MEMORY_HISTORY_SIZE:]
             self.save_memory_history()
+    def clear_memory_history(self) -> None:
+        """Clears memory history ring buffer."""
+        with self._memhistory_lock:
+            self.memory_history = []
+            self.save_memory_history()
+
+    def scrub_memory_history(self, targets: List[str]) -> int:
+        """Redacts or cleans messages in memory_history that match any of the given forget targets,
+        preventing future LLM curation runs from re-extracting forgotten information.
+        Returns the number of scrubbed messages.
+        """
+        if not targets:
+            return 0
+        cleaned_targets = [str(t).strip().lower() for t in targets if str(t).strip()]
+        if not cleaned_targets:
+            return 0
+
+        scrubbed_count = 0
+        with self._memhistory_lock:
+            for item in self.memory_history:
+                text = str(item.get("text", ""))
+                text_lower = text.lower()
+                matched = False
+                for target in cleaned_targets:
+                    if target in text_lower:
+                        matched = True
+                        break
+                    parts = [p.strip() for p in re.split(r"[:\-,]", target) if len(p.strip()) >= 3]
+                    if parts and all(p in text_lower for p in parts):
+                        matched = True
+                        break
+                if matched:
+                    item["text"] = "[Content removed upon user forget request]"
+                    scrubbed_count += 1
+            if scrubbed_count > 0:
+                self.save_memory_history()
+        return scrubbed_count
+
     def get_messages_since_last_curation(self) -> int:
         return int(self.data.get("messages_since_last_curation", 0))
 

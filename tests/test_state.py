@@ -634,3 +634,32 @@ def test_state_history_thread_safety():
         assert not errors, f"Thread errors encountered: {errors}"
         assert len(sm.get_chat_history()) == CHAT_HISTORY_SIZE
         assert len(sm.get_memory_history()) == MEMORY_HISTORY_SIZE
+
+def test_state_clear_and_scrub_memory_history():
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        sm.append_memory_message({"id": 1, "text": "Alice: I love Rust programming"})
+        sm.append_memory_message({"id": 2, "text": "Bob: I live in Berlin"})
+        sm.append_memory_message({"id": 3, "text": "Charlie: Hello everyone"})
+
+        assert len(sm.get_memory_history()) == 3
+
+        # Scrub target "Berlin"
+        scrubbed = sm.scrub_memory_history(["Berlin"])
+        assert scrubbed == 1
+
+        mem_hist = sm.get_memory_history()
+        assert mem_hist[0]["text"] == "Alice: I love Rust programming"
+        assert mem_hist[1]["text"] == "[Content removed upon user forget request]"
+        assert mem_hist[2]["text"] == "Charlie: Hello everyone"
+
+        # Test clearing
+        sm.clear_memory_history()
+        assert len(sm.get_memory_history()) == 0
+
+        # Test scrubbing empty / None
+        assert sm.scrub_memory_history([]) == 0
+        assert sm.scrub_memory_history([""]) == 0

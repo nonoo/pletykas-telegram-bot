@@ -1676,3 +1676,188 @@ async def test_scheduled_reply_with_poll(test_setup):
         poll_kwargs = mock_context.bot.send_poll.call_args[1]
         assert poll_kwargs["question"] == "Kész a feladat?"
         assert poll_kwargs["options"] == ["Igen", "Nem"]
+
+
+def test_is_forget_request(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    # Direct Hungarian requests mentioning bot or nicknames
+    assert handlers._is_forget_request("Pletykas, felejtsd el, hogy Alex Berlinben él") is True
+    assert handlers._is_forget_request("Pletyi felejtsd el kérlek a macskámat") is True
+    assert handlers._is_forget_request("felejtsd el, hogy Alex Berlinben él") is True
+    assert handlers._is_forget_request("kérlek felejtsd el ezt a dolgot") is True
+    assert handlers._is_forget_request("töröld a memóriádból a címemet") is True
+    assert handlers._is_forget_request("töröld ki az emlékeidből ezt") is True
+    assert handlers._is_forget_request("töröld az összes emléket") is True
+
+    # Direct English requests
+    assert handlers._is_forget_request("@pletykas please forget my age", bot_username="pletykas") is True
+    assert handlers._is_forget_request("forget that Alice likes pineapple") is True
+    assert handlers._is_forget_request("please forget everything about Bob") is True
+    assert handlers._is_forget_request("clear all memory") is True
+    assert handlers._is_forget_request("erase this from your memory") is True
+
+    # Non-forget messages
+    assert handlers._is_forget_request("Szia Pletykas, mi újság?") is False
+    assert handlers._is_forget_request("I love this weather!") is False
+
+    # Inter-user chat talking to someone else (not the bot)
+    mock_other_user_msg = MagicMock()
+    mock_other_user_msg.text = "Bob, felejtsd el amit mondtam"
+    mock_other_user_msg.reply_to_message = None
+    assert handlers._is_forget_request(mock_other_user_msg, bot_username="pletykas_bot", bot_name="Pletykas") is False
+
+    # Replying to bot's message with a forget request
+    mock_bot_reply = MagicMock()
+    mock_bot_reply.text = "felejtsd el kérlek"
+    mock_bot_reply.reply_to_message = MagicMock()
+    mock_bot_reply.reply_to_message.from_user.is_bot = True
+    assert handlers._is_forget_request(mock_bot_reply) is True
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_with_forget_tag(test_setup):
+    p, s, m, llm, handlers = test_setup
+    m.add_memory("Alice", "Lives in Berlin and writes Rust")
+    m.add_memory("Bob", "Loves pineapple pizza and lives in Munich")
+    m.add_dynamic(["Alice", "Bob"], "Former roommates in Berlin")
+    m.add_inside_joke("Berlin Wall", "Debugging marathon in Berlin")
+
+    s.append_memory_message({"id": 100, "text": "Alice: I live in Berlin"})
+    s.append_memory_message({"id": 101, "text": "Bob: Me too"})
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7001))
+
+    # Model outputs <FORGET> tag updating Alice and discarding Berlin Wall joke and Bob
+    llm_output = """<FORGET>
+Facts to Update:
+- Topic: Alice
+  Content: Writes Rust
+Facts to Discard:
+- Bob
+Dynamics to Discard:
+- Alice & Bob
+Jokes to Discard:
+- Berlin Wall
+</FORGET>
+Milyen Berlin? Már nem is emlékszem semmi ilyesmire! 😉"""
+
+    # Append trigger message to chat history
+    trigger_entry = {
+        "id": 1234,
+        "from_user_id": 42,
+        "from_user_name": "Alice",
+        "text": "Pletykas, felejtsd el Berlint!",
+        "timestamp_str": "12:00",
+        "media_type": "none",
+        "media_b64": None,
+    }
+    s.append_chat_message(trigger_entry)
+
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_output, None, None, None))):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+
+    # Check memory state
+    memories = m.get_all_memories()
+    assert len(memories["memories"]) == 1
+    assert memories["memories"][0]["topic"] == "Alice"
+    assert memories["memories"][0]["content"] == "Writes Rust"
+    assert len(memories["dynamics"]) == 0
+    assert len(memories["inside_jokes"]) == 0
+
+    # Check memory history was scrubbed
+    mem_hist = s.get_memory_history()
+    assert "[Content removed upon user forget request]" in mem_hist[0]["text"]
+
+    # Check reply delivered to Telegram
+    mock_context.bot.send_message.assert_awaited_once()
+    sent_text = mock_context.bot.send_message.call_args[1]["text"]
+    assert "<FORGET>" not in sent_text
+    assert "Milyen Berlin?" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_forget_fallback_curate_forget(test_setup):
+    p, s, m, llm, handlers = test_setup
+    m.add_memory("Béla", "Londonban él")
+
+    s.append_memory_message({"id": 102, "text": "Béla: Londonban élek"})
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7002))
+
+    trigger_entry = {
+        "id": 1235,
+        "from_user_id": 42,
+        "from_user_name": "Béla",
+        "text": "Pletykas felejtsd el hogy Londonban élek!",
+        "timestamp_str": "12:05",
+        "media_type": "none",
+        "media_b64": None,
+    }
+    s.append_chat_message(trigger_entry)
+
+    # Conversational model returns <NO_REPLY> (forgot the tag)
+    mock_curate_forget_result = {
+        "clear_all": False,
+        "facts_to_discard": ["Béla"],
+        "facts_to_update": [],
+        "dynamics_to_discard": [],
+        "jokes_to_discard": [],
+        "raw_targets": [],
+    }
+
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("<NO_REPLY>", None, None, None))), \
+         patch.object(llm, "curate_forget", AsyncMock(return_value=mock_curate_forget_result)) as mock_curate:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1235)
+        mock_curate.assert_awaited_once()
+
+    # Memory was cleared
+    assert len(m.get_all_memories()["memories"]) == 0
+
+    # Bot sent confirmation message even though model returned <NO_REPLY>
+    mock_context.bot.send_message.assert_awaited_once()
+    reply = mock_context.bot.send_message.call_args[1]["text"]
+    assert "kitöröltem" in reply or "cleared" in reply
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_forget_all(test_setup):
+    p, s, m, llm, handlers = test_setup
+    m.add_memory("Alice", "Data")
+    m.add_dynamic(["Alice", "Bob"], "Friends")
+    m.add_inside_joke("Joke", "Lore")
+    s.append_memory_message({"id": 1, "text": "secret"})
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7003))
+
+    trigger_entry = {
+        "id": 1236,
+        "from_user_id": 42,
+        "from_user_name": "Admin",
+        "text": "Pletykas töröld az összes emléket!",
+        "timestamp_str": "12:10",
+        "media_type": "none",
+        "media_b64": None,
+    }
+    s.append_chat_message(trigger_entry)
+
+    llm_out = "<FORGET>ALL</FORGET>\nMinden emléket töröltem a fejemből! 🧼"
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_out, None, None, None))):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1236)
+
+    assert len(m.get_all_memories()["memories"]) == 0
+    assert len(m.get_all_memories()["dynamics"]) == 0
+    assert len(m.get_all_memories()["inside_jokes"]) == 0
+    assert not any(msg["id"] == 1 for msg in s.get_memory_history())
+    assert not any("secret" in msg.get("text", "") for msg in s.get_memory_history())

@@ -1,4 +1,5 @@
 import io
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 import pytest
@@ -957,3 +958,118 @@ Options:
     assert spec["options"][0] == "Apple"
     assert spec["options"][1] == "Banana"
     assert spec["options"][2] == "Option 0"
+
+
+def test_extract_forget_structured():
+    from llm import extract_forget
+    text = """Már el is felejtettem! 😉
+<FORGET>
+Facts to Discard:
+- Alice: Lives in Berlin
+- Bob
+Facts to Update:
+- Topic: Charlie
+  Content: Senior frontend developer
+Dynamics to Discard:
+- Alice & Bob
+Jokes to Discard:
+- Tab War
+</FORGET>
+Semmi ilyenre nem emlékszem!"""
+
+    cleaned, spec = extract_forget(text)
+    assert "<FORGET>" not in cleaned
+    assert "</FORGET>" not in cleaned
+    assert "Már el is felejtettem! 😉" in cleaned
+    assert "Semmi ilyenre nem emlékszem!" in cleaned
+    assert spec is not None
+    assert spec["clear_all"] is False
+    assert spec["facts_to_discard"] == ["Alice: Lives in Berlin", "Bob"]
+    assert spec["facts_to_update"] == [{"topic": "Charlie", "content": "Senior frontend developer"}]
+    assert spec["dynamics_to_discard"] == ["Alice & Bob"]
+    assert spec["jokes_to_discard"] == ["Tab War"]
+
+
+def test_extract_forget_all():
+    from llm import extract_forget
+    text = "Teljes amnézia!\n<FORGET>\nALL\n</FORGET>"
+    cleaned, spec = extract_forget(text)
+    assert cleaned == "Teljes amnézia!"
+    assert spec["clear_all"] is True
+
+    text2 = "<FORGET:all>"
+    cleaned2, spec2 = extract_forget(text2)
+    assert cleaned2 == ""
+    assert spec2["clear_all"] is True
+
+
+def test_extract_forget_inline_and_bullets():
+    from llm import extract_forget
+    text = "Rendben! <FORGET:Berlin>\nViszlát!"
+    cleaned, spec = extract_forget(text)
+    assert "<FORGET" not in cleaned
+    assert "Rendben!" in cleaned
+    assert "Viszlát!" in cleaned
+    assert "Berlin" in spec["raw_targets"]
+
+    text2 = """<FORGET>
+- Alice moved to Berlin
+- Pineapple pizza
+</FORGET>"""
+    cleaned2, spec2 = extract_forget(text2)
+    assert spec2["raw_targets"] == ["Alice moved to Berlin", "Pineapple pizza"]
+
+
+@pytest.mark.asyncio
+async def test_curate_forget_genai():
+    p = Params()
+    p.model_name = "gemini-2.5-flash"
+    p.model_api_base = ""
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    mock_output = """```json
+{
+  "clear_all": false,
+  "facts_to_discard": ["Alice"],
+  "facts_to_update": [{"topic": "Bob", "content": "Lives in Munich"}],
+  "dynamics_to_discard": ["Alice & Bob"],
+  "jokes_to_discard": ["Berlin Wall"]
+}
+```"""
+    with patch.object(client, "_call_genai", AsyncMock(return_value=(mock_output, 100, 40))):
+        res = await client.curate_forget(
+            current_memories={"memories": [], "dynamics": [], "inside_jokes": []},
+            forget_request_text="Felejtsd el Berlint és Alice-t!",
+            sender_name="Bob",
+            recent_transcript="Bob: felejtsd el Alice-t",
+        )
+        assert res["clear_all"] is False
+        assert res["facts_to_discard"] == ["Alice"]
+        assert res["facts_to_update"] == [{"topic": "Bob", "content": "Lives in Munich"}]
+        assert res["dynamics_to_discard"] == ["Alice & Bob"]
+        assert res["jokes_to_discard"] == ["Berlin Wall"]
+
+
+@pytest.mark.asyncio
+async def test_curate_forget_openai():
+    p = Params()
+    p.model_name = "custom-llm"
+    p.model_api_base = "https://custom.api.com"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    mock_output = json.dumps({
+        "clear_all": True,
+        "facts_to_discard": [],
+        "facts_to_update": [],
+        "dynamics_to_discard": [],
+        "jokes_to_discard": [],
+    })
+    with patch.object(client, "_call_openai_compatible", AsyncMock(return_value=(mock_output, 80, 25))):
+        res = await client.curate_forget(
+            current_memories={"memories": [], "dynamics": [], "inside_jokes": []},
+            forget_request_text="Töröld az összes emléked!",
+            sender_name="Admin",
+        )
+        assert res["clear_all"] is True

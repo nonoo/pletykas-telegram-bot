@@ -128,6 +128,118 @@ def extract_poll(text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         "options": cleaned_opts,
     }
 
+def extract_forget(text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Extracts <FORGET>...</FORGET> or <FORGET:target> block and strips it from text."""
+    if not text:
+        return text, None
+
+    inline_target = ""
+    body = ""
+    cleaned_text = text
+
+    closed_pat = r"<FORGET(?::\s*([^>]+))?>([\s\S]*?)</FORGET>"
+    closed_match = re.search(closed_pat, text, re.IGNORECASE)
+    if closed_match:
+        inline_target = (closed_match.group(1) or "").strip()
+        body = (closed_match.group(2) or "").strip()
+        cleaned_text = (text[:closed_match.start()] + " " + text[closed_match.end():]).strip()
+    else:
+        inline_pat = r"<FORGET:\s*([^>]+)>"
+        inline_match = re.search(inline_pat, text, re.IGNORECASE)
+        if inline_match:
+            inline_target = inline_match.group(1).strip()
+            cleaned_text = (text[:inline_match.start()] + " " + text[inline_match.end():]).strip()
+        else:
+            unclosed_pat = r"<FORGET>([\s\S]*)$"
+            unclosed_match = re.search(unclosed_pat, text, re.IGNORECASE)
+            if unclosed_match:
+                body = (unclosed_match.group(1) or "").strip()
+                cleaned_text = text[:unclosed_match.start()].strip()
+            else:
+                return text.strip(), None
+
+    forget_spec: Dict[str, Any] = {
+        "clear_all": False,
+        "facts_to_discard": [],
+        "facts_to_update": [],
+        "dynamics_to_discard": [],
+        "jokes_to_discard": [],
+        "raw_targets": [],
+    }
+
+    if inline_target.upper() == "ALL" or body.upper() == "ALL":
+        forget_spec["clear_all"] = True
+        return cleaned_text, forget_spec
+
+    if inline_target and not body:
+        forget_spec["raw_targets"].append(inline_target)
+        return cleaned_text, forget_spec
+
+    current_section: Optional[str] = None
+    pending_update_topic: Optional[str] = None
+
+    for line in body.splitlines():
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+
+        lower_line = line_clean.lower()
+        if "facts to discard" in lower_line:
+            current_section = "facts_to_discard"
+            continue
+        elif "facts to update" in lower_line:
+            current_section = "facts_to_update"
+            continue
+        elif "dynamics to discard" in lower_line:
+            current_section = "dynamics_to_discard"
+            continue
+        elif "jokes to discard" in lower_line:
+            current_section = "jokes_to_discard"
+            continue
+        elif lower_line == "all":
+            forget_spec["clear_all"] = True
+            continue
+
+        # In facts_to_update: handle Topic: ... and Content: ...
+        if current_section == "facts_to_update":
+            topic_match = re.match(r"^(?:-\s*)?Topic:\s*(.*)$", line_clean, re.IGNORECASE)
+            content_match = re.match(r"^(?:-\s*)?Content:\s*(.*)$", line_clean, re.IGNORECASE)
+            if topic_match:
+                pending_update_topic = topic_match.group(1).strip()
+            elif content_match and pending_update_topic:
+                content_val = content_match.group(1).strip()
+                forget_spec["facts_to_update"].append({
+                    "topic": pending_update_topic,
+                    "content": content_val,
+                })
+                pending_update_topic = None
+            else:
+                single_match = re.match(r"^(?:-\s*)?(?:Topic:\s*)?([^:]+):\s*(.*)$", line_clean, re.IGNORECASE)
+                if single_match:
+                    top = single_match.group(1).strip()
+                    con = single_match.group(2).strip()
+                    if top and con:
+                        forget_spec["facts_to_update"].append({"topic": top, "content": con})
+            continue
+
+        val = re.sub(r"^[-*•]\s*", "", line_clean).strip()
+        if not val:
+            continue
+
+        if current_section == "facts_to_discard":
+            forget_spec["facts_to_discard"].append(val)
+        elif current_section == "dynamics_to_discard":
+            forget_spec["dynamics_to_discard"].append(val)
+        elif current_section == "jokes_to_discard":
+            forget_spec["jokes_to_discard"].append(val)
+        else:
+            forget_spec["raw_targets"].append(val)
+
+    if inline_target and inline_target not in forget_spec["raw_targets"]:
+        forget_spec["raw_targets"].append(inline_target)
+
+    return cleaned_text, forget_spec
+
 
 class LLMClient:
     def __init__(self, params: Params, state: StateManager):
@@ -549,6 +661,14 @@ class LLMClient:
     def extract_poll(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Public helper to extract <POLL>...</POLL> block and strip it from text."""
         return extract_poll(text)
+
+    def _extract_forget(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Extracts <FORGET>...</FORGET> block and strips it from text."""
+        return extract_forget(text)
+
+    def extract_forget(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Public helper to extract <FORGET>...</FORGET> block and strip it from text."""
+        return extract_forget(text)
     def _check_incapable_retry(self, response_text: str) -> Tuple[bool, str]:
         """Detects if model indicated it cannot fulfill the request (e.g. needs web search / large model)."""
         if not response_text:
@@ -644,6 +764,30 @@ Output:
 IMPORTANT: In the SAME turn, write your normal in-character reply to the user confirming that you scheduled or canceled the reminder! Never leave the reply empty when scheduling or canceling.
 CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Time:', 'Interval:', 'Start:', 'Description:' and tag names verbatim. NEVER translate these field labels into Hungarian or any other language."""
 
+
+        forget_section = """[Forgetting & Memory Clearing Capability]
+If a user in the group asks you to forget something, clear or erase information, stop remembering a detail, or retracts personal facts/lore:
+You MUST output a <FORGET> block specifying the items to remove or update from [Current Memory]:
+<FORGET>
+Facts to Discard:
+- <topic or text of fact to remove completely>
+Facts to Update:
+- Topic: <topic>
+  Content: <new content after removing the forgotten detail>
+Dynamics to Discard:
+- <member name or relation to remove>
+Jokes to Discard:
+- <title or context to remove>
+</FORGET>
+If the user asks to forget all memories ("forget everything", "töröld az összes emléket", "clear all memory"), output:
+<FORGET>
+ALL
+</FORGET>
+
+CRITICAL PROTOCOL RULES FOR FORGETTING:
+1. Always keep the English field labels verbatim: 'Facts to Discard:', 'Facts to Update:', 'Dynamics to Discard:', 'Jokes to Discard:', 'Topic:', 'Content:'. Do not translate these labels into Hungarian or any other language.
+2. In the SAME turn, write your normal in-character reply to the user confirming that you forgot the information. Never output ONLY the <FORGET> block without an accompanying response.
+3. Be thorough: if the request implies removing related details (e.g. "forget everything about X"), discard all relevant facts, dynamics, and jokes."""
         poll_section = """[Group Poll Capability]
 If a user asks you to create, start, or post a poll, or if an interesting debate or group voting topic fits the conversation:
 Output an optional short conversational message introducing the poll, followed by a poll block:
@@ -675,8 +819,9 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
         output_rules = f"""[Output Rules]
 - You MUST select EXACTLY ONE primary action per turn: Output '<NO_REPLY>', OR output a single '<REACTION:emoji>', OR write a short text reply. DO NOT combine a text reply and an emoji reaction in the same response.
 - When scheduling or canceling a reminder via `<SCHEDULE:...>`, you MUST provide an in-character text confirmation in addition to the `<SCHEDULE:...>` block.
+- When clearing or updating memory via `<FORGET>`, you MUST provide an in-character text confirmation in addition to the `<FORGET>` block.
 - When creating a poll via `<POLL>`, you may include an introductory in-character text message in addition to the `<POLL>` block.
-- PROTOCOL KEYWORDS RULE: When using special protocol tags (<GENERATE_IMAGE>, <SCHEDULE:...>, <POLL>), all tag names and field labels ('Prompt:', 'Caption:', 'Source:', 'Mode:', 'Time:', 'Interval:', 'Start:', 'Description:', 'Question:', 'Options:') MUST strictly remain in English verbatim. NEVER translate protocol tags or field labels into the conversation language.
+- PROTOCOL KEYWORDS RULE: When using special protocol tags (<GENERATE_IMAGE>, <SCHEDULE:...>, <POLL>, <FORGET>), all tag names and field labels ('Prompt:', 'Caption:', 'Source:', 'Mode:', 'Time:', 'Interval:', 'Start:', 'Description:', 'Question:', 'Options:', 'Facts to Discard:', 'Facts to Update:', 'Dynamics to Discard:', 'Jokes to Discard:', 'Topic:', 'Content:') MUST strictly remain in English verbatim. NEVER translate protocol tags or field labels into the conversation language.
 - STRICT REACTION RULE: Do NOT use <REACTION:emoji> as a passive default. When talkativeness is low, '<NO_REPLY>' MUST be heavily preferred over reacting in 95% of cases. Only react if a message genuinely warrants a strong reaction.
 - To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.
@@ -689,6 +834,7 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
 
 {schedule_section}
 
+{forget_section}
 
 {poll_section}
 {search_section}
@@ -1452,6 +1598,7 @@ Your task is to update the group's long-term memory with new facts, interpersona
 
 [Instruction]
 Extract new knowledge, update outdated facts, and prune obsolete information.
+CRITICAL FORGETTING RULE: If anyone in the conversation asked to forget, retract, delete, or stop remembering any information, you MUST ensure that information is thoroughly discarded (placed in 'facts_to_discard', 'dynamics_to_discard', or 'jokes_to_discard', or updated via 'facts_to_update'). NEVER re-add or retain any information that a user requested to be forgotten or erased!
 Output strictly a JSON object with this exact structure:
 {{
   "facts_to_add": [{{"topic": "person or subject", "content": "concise permanent fact"}}],
@@ -1523,5 +1670,118 @@ If no changes are warranted in a category, return empty lists.
                 return parsed
         except Exception as e:
             logger.error("Failed to parse memory curation JSON: %s (raw: %s)", e, raw_response)
+
+        return default_result
+
+    async def curate_forget(
+        self,
+        current_memories: Dict[str, Any],
+        forget_request_text: str,
+        sender_name: str = "",
+        recent_transcript: str = "",
+    ) -> Dict[str, Any]:
+        """Analyzes a forget request and determines which facts, dynamics, and jokes should be discarded or updated."""
+        facts_list = current_memories.get("memories", [])
+        dynamics_list = current_memories.get("dynamics", [])
+        jokes_list = current_memories.get("inside_jokes", [])
+
+        current_summary = {
+            "facts": [{"topic": m.get("topic"), "content": m.get("content")} for m in facts_list],
+            "dynamics": [{"members": d.get("members"), "relation": d.get("relation")} for d in dynamics_list],
+            "inside_jokes": [{"title": j.get("title"), "context": j.get("context")} for j in jokes_list],
+        }
+
+        default_result: Dict[str, Any] = {
+            "clear_all": False,
+            "facts_to_discard": [],
+            "facts_to_update": [],
+            "dynamics_to_discard": [],
+            "jokes_to_discard": [],
+            "raw_targets": [],
+        }
+
+        prompt = f"""A user in the group chat requested the bot to forget something.
+Your task is to analyze the user's forget request against the current memory entries and determine exactly what must be cleared or updated so that the information is thoroughly removed from memory.
+
+[Current Memory Entries]
+{json.dumps(current_summary, indent=2, ensure_ascii=False)}
+
+[Forget Request Message]
+From: {sender_name or 'User'}
+Message: {forget_request_text}
+
+[Recent Context]
+{recent_transcript}
+
+Guidelines:
+1. If the user asks to forget all memories ("forget everything", "töröld az összes emléket", "clear all memory"), set "clear_all": true.
+2. If an entire fact should be removed, place its topic (or exact content) in "facts_to_discard".
+3. If an existing fact contains multiple pieces of information and only one piece was asked to be forgotten, keep the remaining details and put the updated fact in "facts_to_update".
+4. If interpersonal dynamics or inside jokes relate to the forgotten information, place them in "dynamics_to_discard" or "jokes_to_discard".
+5. Be thorough: resolve personal references (e.g. "my cat" said by "Béla" refers to facts about Béla's cat).
+6. If the request does not match anything in current memory, return empty lists.
+
+Output strictly a JSON object with this exact structure:
+{{
+  "clear_all": false,
+  "facts_to_discard": ["topic or fact to remove"],
+  "facts_to_update": [{{"topic": "topic name", "content": "remaining content without forgotten detail"}}],
+  "dynamics_to_discard": ["member name or relation to remove"],
+  "jokes_to_discard": ["title of joke to remove"]
+}}
+
+[Thinking Instruction]
+{self._get_thinking_instruction(self.params.model_thinking_level)}"""
+
+        model_name = self.params.model_name
+        api_key = self.params.model_api_key
+        api_base = self.params.model_api_base
+        thinking_level = self.params.model_thinking_level
+        raw_response = ""
+
+        try:
+            if self._is_genai_model(model_name, api_base):
+                raw_response, _, _ = await self._call_genai(
+                    api_key=api_key,
+                    model_name=model_name,
+                    contents=[prompt],
+                    thinking_level=thinking_level,
+                    max_output_tokens=200_000,
+                )
+            else:
+                messages = [
+                    {"role": "system", "content": "You are a precise data curation assistant. Output strictly valid JSON."},
+                    {"role": "user", "content": prompt},
+                ]
+                raw_response, _, _ = await self._call_openai_compatible(
+                    api_base=api_base,
+                    api_key=api_key,
+                    model_name=model_name,
+                    messages=messages,
+                    thinking_level=thinking_level,
+                    max_tokens=200_000,
+                )
+        except Exception as e:
+            logger.error("Failed model call in curate_forget: %s", e)
+            return default_result
+
+        json_match = re.search(r"\{[\s\S]*\}", raw_response)
+        if not json_match:
+            logger.warning("No JSON structure found in curate_forget response: %s", raw_response)
+            return default_result
+
+        try:
+            parsed = json.loads(json_match.group(0))
+            if isinstance(parsed, dict):
+                return {
+                    "clear_all": bool(parsed.get("clear_all", False)),
+                    "facts_to_discard": list(parsed.get("facts_to_discard", [])) if isinstance(parsed.get("facts_to_discard"), list) else [],
+                    "facts_to_update": list(parsed.get("facts_to_update", [])) if isinstance(parsed.get("facts_to_update"), list) else [],
+                    "dynamics_to_discard": list(parsed.get("dynamics_to_discard", [])) if isinstance(parsed.get("dynamics_to_discard"), list) else [],
+                    "jokes_to_discard": list(parsed.get("jokes_to_discard", [])) if isinstance(parsed.get("jokes_to_discard"), list) else [],
+                    "raw_targets": [],
+                }
+        except Exception as e:
+            logger.error("Failed to parse curate_forget JSON: %s (raw: %s)", e, raw_response)
 
         return default_result

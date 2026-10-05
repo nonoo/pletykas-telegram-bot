@@ -246,3 +246,86 @@ def test_memory_file_parse_error_quits():
         with pytest.raises(SystemExit) as exc_info:
             mm.load()
         assert exc_info.value.code == 1
+
+def test_memory_apply_forget_and_target_matching():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        mm = MemoryManager(mf)
+        mm.load()
+
+        mm.add_memory("Alice", "Lives in Berlin and writes Rust")
+        mm.add_memory("Bob", "Loves pineapple pizza and works in Munich")
+        mm.add_dynamic(["Alice", "Bob"], "Former roommates in Berlin")
+        mm.add_inside_joke("Berlin Wall of Code", "Debugging marathon in Berlin")
+        mm.add_inside_joke("Pineapple Gate", "Pizza topping debate")
+
+        # Test partial update on Alice (forgetting Berlin, keeping Rust)
+        # Test discarding pineapple joke
+        forget_spec = {
+            "facts_to_update": [{"topic": "Alice", "content": "Writes Rust"}],
+            "jokes_to_discard": ["Pineapple Gate"],
+        }
+        summary = mm.apply_forget(forget_spec)
+        assert summary["updated_facts"] == 1
+        assert summary["discarded_jokes"] == 1
+
+        memories = mm.get_all_memories()["memories"]
+        assert len(memories) == 2
+        alice_mem = next(m for m in memories if m["topic"] == "Alice")
+        assert alice_mem["content"] == "Writes Rust"
+
+        # Test formatted discard: "- (Bob): pineapple"
+        summary2 = mm.apply_forget({"facts_to_discard": ["- (Bob): pineapple"]})
+        assert summary2["discarded_facts"] == 1
+        assert len(mm.get_all_memories()["memories"]) == 1
+
+        # Test dynamic discard with members and relation
+        summary3 = mm.apply_forget({"dynamics_to_discard": ["Alice & Bob: Berlin"]})
+        assert summary3["discarded_dynamics"] == 1
+        assert len(mm.get_all_memories()["dynamics"]) == 0
+
+        # Test dict target in discard_memory and discard_inside_joke
+        assert mm.discard_inside_joke({"title": "Berlin Wall of Code"}) is True
+        assert len(mm.get_all_memories()["inside_jokes"]) == 0
+
+
+def test_memory_apply_forget_clear_all():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        mm = MemoryManager(mf)
+        mm.load()
+
+        mm.add_memory("Alice", "Lives in Berlin")
+        mm.add_dynamic(["Alice", "Bob"], "Friends")
+        mm.add_inside_joke("Joke", "Context")
+
+        summary = mm.apply_forget({"clear_all": True})
+        assert summary["discarded_facts"] == 1
+        assert summary["discarded_dynamics"] == 1
+        assert summary["discarded_jokes"] == 1
+
+        all_m = mm.get_all_memories()
+        assert len(all_m["memories"]) == 0
+        assert len(all_m["dynamics"]) == 0
+        assert len(all_m["inside_jokes"]) == 0
+
+
+def test_memory_discard_any_does_not_short_circuit():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        mm = MemoryManager(mf)
+        mm.load()
+
+        # All three reference "Alice"
+        mm.add_memory("Alice", "Engineer")
+        mm.add_dynamic(["Alice", "Bob"], "Coworkers")
+        mm.add_inside_joke("Alice's Typo", "Hilarious bug")
+
+        # discard_any("Alice") should remove from all three without stopping at facts
+        res = mm.discard_any("Alice")
+        assert res is True
+
+        all_m = mm.get_all_memories()
+        assert len(all_m["memories"]) == 0
+        assert len(all_m["dynamics"]) == 0
+        assert len(all_m["inside_jokes"]) == 0

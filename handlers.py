@@ -998,6 +998,99 @@ class BotHandlers:
             if re.search(pattern, text, re.IGNORECASE):
                 return True
 
+        # 5. Forget request directed at the bot
+        if self._is_forget_request(message, bot_username=bot_username, bot_name=bot_name, bot_id=bot_id):
+            return True
+
+        return False
+
+    def _is_forget_request(
+        self,
+        message: Any,
+        bot_username: str = "",
+        bot_name: str = "",
+        bot_id: Optional[int] = None,
+    ) -> bool:
+        """Determines if a message is asking the bot to forget something from memory."""
+        text = ""
+        if hasattr(message, "text") or hasattr(message, "caption"):
+            text = getattr(message, "text", "") or getattr(message, "caption", "") or ""
+        elif isinstance(message, dict):
+            text = message.get("text", "") or message.get("caption", "") or ""
+        elif isinstance(message, str):
+            text = message
+
+        if not text:
+            return False
+
+        clean_text = text.strip()
+        lower_text = clean_text.lower()
+
+        # Keywords indicating forget / delete / clear from memory intent
+        forget_patterns = [
+            r"\bfelejtsd\s+el\b",
+            r"\bfelejts\s+el\b",
+            r"\bfelejtse\s+el\b",
+            r"\bfelejtsétek\s+el\b",
+            r"\bfelejtsük\s+el\b",
+            r"\bne\s+emlékezz(?:él|etek)?\b",
+            r"\bforget\b",
+            r"\berase\s+(?:.*?\s+)?(?:from\s+)?memory\b",
+            r"\bclear\s+(?:.*?\s+)?(?:from\s+)?memory\b",
+            r"\bdelete\s+(?:.*?\s+)?(?:from\s+)?memory\b",
+            r"\bwipe\s+(?:.*?\s+)?(?:from\s+)?memory\b",
+            r"\btöröld\s+(?:.*?\s+)?(?:a\s+memóriádból|az\s+emlékeidből|az\s+összes\s+emléket|a\s+memóriából)\b",
+            r"\btorold\s+(?:.*?\s+)?(?:a\s+memoriadbol|az\s+emlekeidbol|az\s+osszes\s+emleket|a\s+memoriabol)\b",
+        ]
+
+        has_forget_keyword = any(re.search(pat, lower_text, re.IGNORECASE) for pat in forget_patterns)
+        if not has_forget_keyword:
+            return False
+
+        # 1. If replying directly to bot's message
+        reply_to = getattr(message, "reply_to_message", None) if not isinstance(message, dict) else None
+        if reply_to and getattr(reply_to, "from_user", None):
+            if reply_to.from_user.is_bot:
+                return True
+
+        # 2. Check candidate names for bot
+        candidates: List[str] = []
+        if bot_username:
+            candidates.append(bot_username.lstrip("@"))
+        if bot_name:
+            candidates.append(bot_name)
+        for default_name in ("Pletykás", "Pletykas", "Pletyi", "Pletyo", "Pletyó", "bot"):
+            candidates.append(default_name)
+        candidates.extend(self.state.get_nicknames())
+
+        for cand in candidates:
+            if cand and isinstance(cand, str):
+                clean_cand = cand.strip().lstrip("@")
+                if clean_cand and re.search(rf"(?:^|[^\w@])@?{re.escape(clean_cand.lower())}(?:[^\w]|$)", lower_text):
+                    return True
+
+        # 3. Explicit reference to bot's memory
+        memory_refs = [
+            r"memóriádból", r"memóriádban", r"emlékeidből", r"memóriából",
+            r"memoriadbol", r"memoriadban", r"emlekeidbol", r"memoriabol",
+            r"from\s+your\s+memory", r"in\s+your\s+memory", r"your\s+memory",
+        ]
+        if any(re.search(ref, lower_text) for ref in memory_refs):
+            return True
+
+        # 4. Starts directly with an imperative forget command
+        direct_imperatives = [
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?felejtsd\s+el\b",
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?felejts\s+el\b",
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?forget\b",
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?töröld\s+(?:ki\s+)?a\s+memóriádból\b",
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?torold\s+(?:ki\s+)?a\s+memoriadbol\b",
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?töröld\s+az\s+összes\s+emléket\b",
+            r"^(?:kérlek\s+|kerlek\s+|please\s+)?clear\s+(?:all\s+)?memory\b",
+        ]
+        if any(re.search(imp, clean_text, re.IGNORECASE) for imp in direct_imperatives):
+            return True
+
         return False
     # --- Debounce & Evaluation Pipeline ---
 
@@ -1268,6 +1361,97 @@ class BotHandlers:
                     logger.error("Failed to generate or send image: %s", e)
                     if is_direct_trigger:
                         reply_text = "sorry, I couldn't generate the image... 🎨❌"
+
+            # 2.5. Memory Clearing & Forgetting Action
+            forget_spec = None
+            if reply_text:
+                reply_text, forget_spec = self.llm.extract_forget(reply_text)
+
+            trigger_text = trigger_entry.get("text", "") if trigger_entry else ""
+            sender_name = trigger_entry.get("from_user_name", "") if trigger_entry else ""
+            bot_first = getattr(context.bot, "first_name", None) if context.bot else None
+            bot_display_name = bot_first if isinstance(bot_first, str) else "Pletykas"
+            bot_user = getattr(context.bot, "username", None) if context.bot else None
+            bot_uname = bot_user if isinstance(bot_user, str) else ""
+            is_forget_msg = self._is_forget_request(trigger_text, bot_username=bot_uname, bot_name=bot_display_name)
+
+            if not forget_spec and is_forget_msg:
+                logger.info("Forget request detected in message without <FORGET> tag; running curate_forget analysis...")
+                try:
+                    forget_spec = await self.llm.curate_forget(
+                        current_memories=self.memory.get_all_memories(),
+                        forget_request_text=trigger_text,
+                        sender_name=sender_name,
+                        recent_transcript=transcript,
+                    )
+                except Exception as e:
+                    logger.error("curate_forget failed: %s", e)
+                    forget_spec = None
+
+            if forget_spec:
+                self.memory.create_backup()
+                summary = self.memory.apply_forget(forget_spec)
+
+                scrub_targets: List[str] = []
+                if forget_spec.get("clear_all"):
+                    self.state.clear_memory_history()
+                else:
+                    for f in forget_spec.get("facts_to_discard", []):
+                        if isinstance(f, str) and f.strip():
+                            scrub_targets.append(f.strip())
+                    for u in forget_spec.get("facts_to_update", []):
+                        if isinstance(u, dict) and u.get("topic"):
+                            scrub_targets.append(str(u["topic"]).strip())
+                    for d in forget_spec.get("dynamics_to_discard", []):
+                        if isinstance(d, str) and d.strip():
+                            scrub_targets.append(d.strip())
+                    for j in forget_spec.get("jokes_to_discard", []):
+                        if isinstance(j, str) and j.strip():
+                            scrub_targets.append(j.strip())
+                    for r in forget_spec.get("raw_targets", []):
+                        if isinstance(r, str) and r.strip():
+                            scrub_targets.append(r.strip())
+
+                    if trigger_text:
+                        m_cmd = re.search(
+                            r"\b(?:felejtsd\s+el|felejts\s+el|felejtse\s+el|forget|töröld\s+(?:ki\s+)?(?:a\s+memóriádból)?)\s+(?:hogy\s+|that\s+|about\s+)?(.*)",
+                            trigger_text,
+                            re.IGNORECASE,
+                        )
+                        if m_cmd:
+                            raw_target = m_cmd.group(1).strip()
+                            clean_target = re.sub(r"[!?,.]+$", "", raw_target).strip()
+                            if clean_target and len(clean_target) >= 3:
+                                scrub_targets.append(clean_target)
+                                for w in re.findall(r"\w+", clean_target):
+                                    if len(w) >= 4 and w.lower() not in ("hogy", "that", "this", "about", "please", "kérlek", "kerlek"):
+                                        scrub_targets.append(w)
+                                        if len(w) >= 5 and w.endswith("t"):
+                                            scrub_targets.append(w[:-1])
+
+                    if scrub_targets:
+                        scrubbed = self.state.scrub_memory_history(scrub_targets)
+                        logger.info("Scrubbed %d messages from memory history matching forget targets", scrubbed)
+                logger.info(
+                    "Thoroughly cleared memory upon request: discarded_facts=%d, updated_facts=%d, discarded_dyn=%d, discarded_jokes=%d",
+                    summary.get("discarded_facts", 0),
+                    summary.get("updated_facts", 0),
+                    summary.get("discarded_dynamics", 0),
+                    summary.get("discarded_jokes", 0),
+                )
+
+                if self.state.is_debug_mode():
+                    self._log_debug_group_msg(
+                        "MEMORY_FORGET",
+                        f"Forget Request: {trigger_text}\nApplied Spec: {json.dumps(forget_spec, ensure_ascii=False)}\nSummary: {json.dumps(summary)}",
+                    )
+
+                if not reply_text or reply_text.strip() == "<NO_REPLY>":
+                    lang = self.state.get_language().lower()
+                    if "hungarian" in lang or "magyar" in lang:
+                        reply_text = "Rendben, ezt teljesen kitöröltem az emlékezetemből! 🤐"
+                    else:
+                        reply_text = "Understood, that has been thoroughly cleared from my memory! 🤐"
 
             # 3. Text Message and/or Poll Action
             poll_spec = None
