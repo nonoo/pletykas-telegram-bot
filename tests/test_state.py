@@ -74,6 +74,7 @@ def test_state_system_prompt():
         eff = sm.get_effective_system_prompt()
         assert "Always communicate in English." in eff
         assert "Use Telegram HTML markdown. Only use the following HTML tags b, i, u, s, a, code, blockquote. Do not use any other HTML tags. Do not use LaTeX for formatting." in eff
+        assert "Never send the same message twice in a row" in eff
         sm.set_language("Hungarian")
         assert "Always communicate in Hungarian." in sm.get_effective_system_prompt()
 

@@ -470,7 +470,8 @@ class StateManager:
         prompt = (
             f"{base}\n\n"
             f"Always communicate in {lang}.\n"
-            "Use Telegram HTML markdown. Only use the following HTML tags b, i, u, s, a, code, blockquote. Do not use any other HTML tags. Do not use LaTeX for formatting."
+            "Use Telegram HTML markdown. Only use the following HTML tags b, i, u, s, a, code, blockquote. Do not use any other HTML tags. Do not use LaTeX for formatting.\n"
+            "Never send the same message twice in a row: if your most recent message in the transcript is identical or nearly identical to the reply you are about to write, do not repeat it — output <NO_REPLY> or write something clearly different."
         )
         nicks = self.get_nicknames()
         if nicks:
