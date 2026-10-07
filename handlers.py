@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import difflib
 import html
 import io
 import json
@@ -139,6 +140,35 @@ def split_into_html_pre_chunks(raw_text: str, header: str = "", max_escaped_len:
     return messages
 
 
+# Consecutive-duplicate protection: the bot must never post the same message twice in a row.
+REPEAT_SIMILARITY_THRESHOLD = 0.9
+REPEAT_FUZZY_MIN_CHARS = 8
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def normalize_message_text(text: str) -> str:
+    """Normalizes message text for consecutive-duplicate detection (tags, entities, whitespace, case)."""
+    plain = html.unescape(_HTML_TAG_PATTERN.sub(" ", text or ""))
+    return _WHITESPACE_PATTERN.sub(" ", plain).strip().casefold()
+
+
+def is_repeated_message(previous_text: str, candidate_text: str) -> bool:
+    """True when `candidate_text` is the same or nearly identical to `previous_text`."""
+    previous = normalize_message_text(previous_text)
+    candidate = normalize_message_text(candidate_text)
+    if not previous or not candidate:
+        return False
+    if previous == candidate:
+        return True
+    if min(len(previous), len(candidate)) < REPEAT_FUZZY_MIN_CHARS:
+        return False
+    matcher = difflib.SequenceMatcher(None, previous, candidate)
+    if matcher.quick_ratio() < REPEAT_SIMILARITY_THRESHOLD:
+        return False
+    return matcher.ratio() >= REPEAT_SIMILARITY_THRESHOLD
+
+
 INTERVAL_UNIT_MAP = {
     "y": "years", "yr": "years", "yrs": "years", "year": "years", "years": "years",
     "mo": "months", "month": "months", "months": "months",
@@ -270,6 +300,29 @@ class BotHandlers:
             mapped = EMOJI_REACTION_MAP[norm]
             return mapped.replace("\ufe0f", "")
         return None
+
+    # --- Consecutive Duplicate Guard ---
+
+    def _get_last_bot_message_text(self, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+        """Returns the text of the most recent message this bot itself posted to the group."""
+        bot_id = getattr(context.bot, "id", None)
+        if bot_id is None:
+            return None
+        for item in reversed(self.state.get_chat_history()):
+            if item.get("from_user_id") == bot_id:
+                return item.get("text") or ""
+        return None
+
+    def _suppress_repeated_reply(self, text: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Returns True when `text` repeats the bot's own previous group message and must not be sent."""
+        previous = self._get_last_bot_message_text(context)
+        if previous is None or not is_repeated_message(previous, text):
+            return False
+        preview = normalize_message_text(text)[:120]
+        logger.warning("Suppressed repeated bot message (identical/near-identical to previous group message): %s", preview)
+        if self.state.is_debug_mode():
+            self._log_debug_group_msg("SUPPRESSED", f"Duplicate reply not sent (matches previous bot message): {preview}")
+        return True
 
 
     # --- Authorization & Routing Middleware ---
@@ -485,6 +538,9 @@ class BotHandlers:
             return False, "LLM returned empty spontaneous message."
 
         cleaned_text, poll_spec = self.llm.extract_poll(response)
+        suppressed_repeat = bool(cleaned_text) and self._suppress_repeated_reply(cleaned_text, context)
+        if suppressed_repeat:
+            cleaned_text = None
 
         sent_any = False
         sent_texts: List[str] = []
@@ -544,6 +600,8 @@ class BotHandlers:
 
         if sent_any:
             return True, "\n\n".join(sent_texts)
+        if suppressed_repeat:
+            return False, "Skipped: the generated message repeated the previous bot message."
         return False, "LLM returned empty spontaneous message."
     # --- Scheduled Replies ---
 
@@ -655,6 +713,8 @@ class BotHandlers:
 
             if reply_text:
                 reply_text, poll_spec = self.llm.extract_poll(reply_text)
+                if reply_text and self._suppress_repeated_reply(reply_text, context):
+                    reply_text = None
                 sent_msg = None
                 if reply_text:
                     try:
@@ -1458,6 +1518,9 @@ class BotHandlers:
             if reply_text:
                 reply_text, poll_spec = self.llm.extract_poll(reply_text)
 
+            if reply_text and self._suppress_repeated_reply(reply_text, context):
+                reply_text = None
+
             if reply_text:
                 reply_to_id = trigger_msg_id if is_direct_trigger else None
                 try:
@@ -1510,17 +1573,18 @@ class BotHandlers:
                 )
         except Exception as e:
             logger.error("Error during evaluation execution: %s", e, exc_info=True)
-            if is_direct_trigger:
+            fallback_text = "sorry, got a bit tangled up in my thoughts... I'll be right back! 💫"
+            if is_direct_trigger and not self._suppress_repeated_reply(fallback_text, context):
                 try:
                     sent_err = await context.bot.send_message(
                         chat_id=chat_id,
-                        text="sorry, got a bit tangled up in my thoughts... I'll be right back! 💫",
+                        text=fallback_text,
                         reply_to_message_id=trigger_msg_id,
                     )
                     if self.state.is_debug_mode():
                         self._log_debug_group_msg(
                             "OUTGOING",
-                            f"Chat ID: {chat_id} | Message ID: {sent_err.message_id} | Reply to msg ID: {trigger_msg_id}\nType: Error Fallback Message\nText: sorry, got a bit tangled up in my thoughts... I'll be right back! 💫",
+                            f"Chat ID: {chat_id} | Message ID: {sent_err.message_id} | Reply to msg ID: {trigger_msg_id}\nType: Error Fallback Message\nText: {fallback_text}",
                         )
                 except Exception:
                     pass

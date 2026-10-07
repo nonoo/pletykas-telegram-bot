@@ -11,6 +11,7 @@ An autonomous, multi-modal Telegram group chatbot designed to seamlessly integra
 - **Single Group Restriction**: Locks exclusively to an authorized `GROUP_CHAT_ID`. If added to unauthorized chats, it logs an alert and leaves automatically.
 - **Strict Private Admin Interface**: Administrative slash commands are only accepted in private chats with authorized `ADMIN_USERIDS`.
 - **Pure LLM Autonomy**: Decides dynamically whether to reply, react with an emoji, request image generation/editing, or remain silent (`<NO_REPLY>`).
+- **No Consecutive Duplicates**: A text reply that repeats the bot's own previous group message (identical or at least 90% similar after normalization) is suppressed before dispatch, for conversational, scheduled, and spontaneous messages alike.
 - **Debounced Cooldown Timer**: Rapid consecutive messages reset a debounce timer (`cooldown_sec`), batching human chatter into a cohesive context before model evaluation.
 - **Multimodal Image Support**: Ingests photos directly, generates visual descriptions, and supports text-to-image and image-to-image editing using `<GENERATE_IMAGE>`.
 - **Dynamic Memory Management**: Automatically distills facts, group dynamics, and inside jokes every 20 messages into `pletykas-memory.json` with rolling `.bak` backups.

@@ -7,7 +7,7 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
-from handlers import BotHandlers
+from handlers import BotHandlers, is_repeated_message, normalize_message_text
 from llm import LLMClient
 from memory import MemoryManager
 from params import Params
@@ -588,7 +588,8 @@ async def test_reaction_dispatch_and_error_handling(test_setup):
 
     # 2. Reaction_invalid error from Telegram API is caught gracefully
     mock_bot.set_message_reaction = AsyncMock(side_effect=Exception("Reaction_invalid"))
-    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=eval_res)):
+    distinct_res = ("Nice message, indeed", ("😄", 1234), None, None)
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=distinct_res)):
         await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
     # Reply was still delivered even though reaction failed
     assert mock_bot.send_message.call_count >= 2
@@ -1861,3 +1862,117 @@ async def test_execute_evaluation_forget_all(test_setup):
     assert len(m.get_all_memories()["inside_jokes"]) == 0
     assert not any(msg["id"] == 1 for msg in s.get_memory_history())
     assert not any("secret" in msg.get("text", "") for msg in s.get_memory_history())
+
+
+def _bot_history_entry(text: str, msg_id: int = 9000) -> dict:
+    """Builds a chat-history entry representing a message the bot itself posted."""
+    return {
+        "id": msg_id,
+        "from_user_id": 9999,
+        "from_user_name": "Pletykas",
+        "timestamp_epoch": 0.0,
+        "timestamp_str": "12:00",
+        "reply_to_msg_id": None,
+        "reply_to_user_name": None,
+        "text": text,
+        "media_type": "none",
+        "media_b64": None,
+    }
+
+
+def test_normalize_and_is_repeated_message():
+    # HTML tags, entities, whitespace, and case are normalized away
+    assert normalize_message_text("Szia, <b>világ</b>!") == "szia, világ !"
+    assert normalize_message_text("  Több\n\tsor  ") == "több sor"
+    assert normalize_message_text("Pletyi &amp; Pletyó") == "pletyi & pletyó"
+
+    # Exact repeats (modulo formatting) are detected
+    assert is_repeated_message("Szia, <b>világ</b>!", "Szia, <b>világ</b>!") is True
+    assert is_repeated_message("ok", "OK") is True
+    # Nearly identical longer messages are detected
+    assert is_repeated_message("Szerintem ez egy remek ötlet 😄", "Szerintem ez egy remek ötlet 😃") is True
+    # Different content is not a repeat
+    assert is_repeated_message("Szerintem ez egy remek ötlet", "Ki hoz sütit a buliba?") is False
+    # Very short messages only match exactly
+    assert is_repeated_message("igen", "igen!") is False
+    # Empty texts are never treated as repeats
+    assert is_repeated_message("", "bármi") is False
+    assert is_repeated_message("bármi", "") is False
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_suppresses_repeated_reply(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=3001))
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_bot_history_entry("Képzeld, ma <b>végre</b> kisütött a nap! ☀️", msg_id=8000))
+
+    # Same reply as the bot's previous message -> suppressed, nothing recorded
+    duplicate = ("Képzeld, ma végre kisütött a nap! ☀️", None, None, None)
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=duplicate)):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+    mock_bot.send_message.assert_not_awaited()
+    assert s.get_chat_history()[-1]["id"] == 8000
+
+    # A clearly different reply is delivered and recorded
+    distinct = ("Na, és ki hoz sütit a buliba? 🍪", None, None, None)
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=distinct)):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1235)
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.call_args.kwargs["text"] == distinct[0]
+    assert s.get_chat_history()[-1]["text"] == distinct[0]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_reply_callback_suppresses_repeated_reply(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=5001))
+    mock_context = MagicMock(bot=mock_bot, job_queue=MagicMock())
+
+    s.append_chat_message(_bot_history_entry("Ideje inni egy kávét! ☕", msg_id=8100))
+    s_id = s.add_scheduled_reply({
+        "id": "sched_repeat_1",
+        "type": "oneshot",
+        "target_msg_id": 42,
+        "target_time": "2026-09-26T14:00:00+00:00",
+        "interval_str": None,
+        "interval_spec": None,
+        "description": "Remind everyone about coffee",
+        "created_at": "2026-09-26T12:00:00+00:00",
+    })
+    job_mock = MagicMock()
+    job_mock.data = {"schedule_id": s_id}
+    mock_context.job = job_mock
+
+    with patch.object(llm, "generate_scheduled_reply", AsyncMock(return_value="Ideje inni egy kávét! ☕")):
+        await handlers._scheduled_reply_callback(mock_context)
+
+    mock_bot.send_message.assert_not_awaited()
+    # Oneshot schedule is still consumed
+    assert s.get_scheduled_reply(s_id) is None
+
+
+@pytest.mark.asyncio
+async def test_spontaneous_message_suppresses_repeated_reply(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=4001))
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_bot_history_entry("Na, ki unatkozik? 🎲", msg_id=8200))
+
+    with patch.object(llm, "generate_spontaneous_message", AsyncMock(return_value="Na, ki unatkozik? 🎲")):
+        ok, detail = await handlers.trigger_spontaneous_message(mock_context)
+
+    assert ok is False
+    assert "repeated" in detail
+    mock_bot.send_message.assert_not_awaited()
