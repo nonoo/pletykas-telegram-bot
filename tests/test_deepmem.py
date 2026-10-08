@@ -151,6 +151,46 @@ def test_model_mismatch_and_malformed_tolerated():
         assert idx2.sync([("memories", e1)], lambda texts: [[1.0, 0.0]]) == 1
 
 
+def test_identity_mismatch_discards_on_dim_or_base_change():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "emb.json")
+        e1 = _fact("A", "one")
+        real_hash = entry_hash(e1, "memories")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"model": "m", "dim": 1536, "base": "https://x/v1", "vectors": {real_hash: [1.0, 0.0]}},
+                f,
+            )
+
+        # Matching identity -> cache kept (nothing re-embedded)
+        idx = DeepMemoryIndex(path, embed_model="m", embed_dim=1536, embed_base="https://x/v1")
+        idx.load()
+        assert idx.count_vectors() == 1
+        assert idx.sync([("memories", e1)], lambda texts: [[9.0, 9.0]]) == 0
+        assert idx.query([1.0, 0.0], [("memories", e1)], min_score=0.0)
+
+        # Dim-only change, model name unchanged -> discarded and re-embedded
+        idx2 = DeepMemoryIndex(path, embed_model="m", embed_dim=0, embed_base="https://x/v1")
+        idx2.load()
+        assert idx2.count_vectors() == 0
+        assert idx2.sync([("memories", e1)], lambda texts: [[1.0, 0.0]]) == 1
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        assert (saved["model"], saved["dim"], saved["base"]) == ("m", 0, "https://x/v1")
+
+        # Base-only change -> discarded as well
+        idx3 = DeepMemoryIndex(path, embed_model="m", embed_dim=0, embed_base="https://other/v1")
+        idx3.load()
+        assert idx3.count_vectors() == 0
+
+        # Legacy sidecar without dim/base fields -> not trusted, discarded
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"model": "m", "vectors": {real_hash: [1.0, 0.0]}}, f)
+        idx4 = DeepMemoryIndex(path, embed_model="m", embed_dim=0, embed_base="https://x/v1")
+        idx4.load()
+        assert idx4.count_vectors() == 0
+
+
 def test_format_hits():
     idx = DeepMemoryIndex()
     assert idx.format_hits([]) == ""

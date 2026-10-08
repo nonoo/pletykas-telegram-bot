@@ -51,15 +51,26 @@ class DeepMemoryIndex:
         self,
         sidecar_path: str = "pletykas-deepmemory-embeddings.json",
         embed_model: str = "google/gemini-embedding-2",
+        embed_dim: int = 0,
+        embed_base: str = "",
     ):
-        # The literal default must match the params.py default (model_embed_name).
-        # Production passes the configured model explicitly, so a future model
-        # swap invalidates stale vectors via the model-mismatch rule in load().
+        # The literal defaults must match params.py (model_embed_name / model_embed_dim).
+        # Production passes the configured values explicitly; any change to the
+        # model name, output dimension, or endpoint base invalidates stale vectors
+        # via the identity check in load(). Dimension must be part of the identity
+        # on its own: old-width vectors are silently skipped by query(), and sync()
+        # never re-embeds hashes that are already present, so a dim-only change
+        # would otherwise disable deep recall forever.
         self._embed_model = embed_model
+        self._embed_dim = embed_dim
+        self._embed_base = embed_base
         self._sidecar_path = sidecar_path
         self._lock = threading.RLock()
         self._vectors: Dict[str, List[float]] = {}
-        self._model = ""
+
+    def _signature(self) -> str:
+        """Cache-invalidating identity of the embedding configuration."""
+        return f"{self._embed_model}|dim={self._embed_dim}|base={self._embed_base}"
 
     def load(self) -> None:
         with self._lock:
@@ -74,11 +85,13 @@ class DeepMemoryIndex:
                 if not isinstance(vectors, dict):
                     raise ValueError("sidecar 'vectors' is not an object")
                 model = data.get("model", "")
-                if model != self._embed_model:
+                dim = data.get("dim", 0)
+                base = data.get("base", "")
+                if model != self._embed_model or dim != self._embed_dim or base != self._embed_base:
                     logger.warning(
-                        "Deep-memory embeddings sidecar model mismatch (%r != %r); discarding cache",
-                        model,
-                        self._embed_model,
+                        "Deep-memory embeddings sidecar identity mismatch (%s != %s); discarding cache",
+                        f"{model}|dim={dim}|base={base}",
+                        self._signature(),
                     )
                     self._vectors = {}
                 else:
@@ -87,7 +100,6 @@ class DeepMemoryIndex:
                         for key, vec in vectors.items()
                         if isinstance(vec, list)
                     }
-                self._model = self._embed_model
             except Exception as e:
                 logger.warning(
                     "Discarding malformed deep-memory embeddings sidecar (%s): %s",
@@ -95,12 +107,16 @@ class DeepMemoryIndex:
                     e,
                 )
                 self._vectors = {}
-                self._model = self._embed_model
 
     def save(self) -> None:
         # No backup rotation: this cache is fully regenerable from the deep store.
         with self._lock:
-            data = {"model": self._model or self._embed_model, "vectors": self._vectors}
+            data = {
+                "model": self._embed_model,
+                "dim": self._embed_dim,
+                "base": self._embed_base,
+                "vectors": self._vectors,
+            }
             directory = os.path.dirname(self._sidecar_path) or "."
             fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-deepmem-emb-", suffix=".json")
             try:
@@ -135,7 +151,6 @@ class DeepMemoryIndex:
             self._vectors = pruned
             missing = [(h, text) for h, text in current.items() if text and h not in self._vectors]
             if not missing:
-                self._model = self._embed_model
                 if dropped:
                     self.save()
                 return 0

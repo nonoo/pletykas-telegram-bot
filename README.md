@@ -28,7 +28,7 @@ An autonomous, multi-modal Telegram group chatbot designed to seamlessly integra
 - **Primary Conversational Model** (`MODEL_NAME`): Default `deepseek-flash` (or Google Gemini/Gemma models).
 - **Vision Model** (`MODEL_LARGE_NAME`): Default `gemini-flash-latest` for high-fidelity photo captioning and visual descriptions.
 - **Image Generation Model** (`MODEL_IMAGE_NAME`, `MODEL_IMAGE_SIZE`): Default `gemini-3.1-flash-lite-image` (or OpenAI DALL-E / compatible image endpoints), default size `1K`.
-- **Embedding Model** (`MODEL_EMBED_NAME`): OpenAI-compatible `/embeddings` route for deep-memory recall, default `google/gemini-embedding-2`. Falls back to the primary key/base unless `MODEL_EMBED_*` is set.
+- **Embedding Model** (`MODEL_EMBED_NAME`): OpenAI-compatible `/embeddings` route for deep-memory recall, default `google/gemini-embedding-2`. Falls back to the primary key/base unless `MODEL_EMBED_*` is set. Changing the model, `MODEL_EMBED_DIM`, or the effective base invalidates the sidecar vector cache, which is re-embedded automatically on startup.
 
 ---
 
