@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 200_000
 
+# OpenRouter app attribution (shown in OpenRouter logs/rankings); sent only to openrouter.ai API bases.
+OPENROUTER_APP_REFERER = "https://github.com/nonoo/pletykas-telegram-bot/"
+OPENROUTER_APP_TITLE = "Pletykas"
+
 _WEB_TOOL_TAG_RE = re.compile(r"<(?:WEB_SEARCH|FETCH_URL):\s*[^>]*>", re.IGNORECASE)
 
 # Per-request timeouts that override the shared 120s session default.
@@ -333,6 +337,15 @@ class LLMClient:
         name = model_name.lower()
         return name.startswith("gemini") or name.startswith("gemma") or name.startswith("imagen")
 
+    def _openrouter_app_headers(self, api_base: str) -> Dict[str, str]:
+        """Returns OpenRouter app-attribution headers for openrouter.ai API bases (empty elsewhere)."""
+        if "openrouter.ai" not in api_base.lower():
+            return {}
+        return {
+            "HTTP-Referer": OPENROUTER_APP_REFERER,
+            "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+        }
+
     def _get_thinking_instruction(self, thinking_level: str) -> str:
         """Returns prompt instruction according to configured thinking level."""
         tl = thinking_level.strip().lower()
@@ -370,6 +383,7 @@ class LLMClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        headers.update(self._openrouter_app_headers(api_base))
         payload = {
             "model": model_name,
             "messages": messages,
@@ -500,6 +514,7 @@ class LLMClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        headers.update(self._openrouter_app_headers(api_base))
         payload: Dict[str, Any] = {"model": model_name, "input": texts}
         if dim > 0:
             payload["dimensions"] = dim
@@ -1435,6 +1450,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         if not self._is_genai_model(img_name, img_base):
             session = await self._get_session()
             headers = {"Authorization": f"Bearer {img_key}"}
+            headers.update(self._openrouter_app_headers(img_base))
 
             if base_image_bytes:
                 # Modifying existing image via /images/edits

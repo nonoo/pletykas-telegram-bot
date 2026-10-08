@@ -158,6 +158,7 @@ Managed by `MemoryManager` (same schema, validation, and daily 3-file backup rot
 ### Protocols
 - If `model_api_base` is empty and the model name begins with `gemini`, `gemma`, or `imagen`, `google-genai` SDK is used asynchronously (`client.aio`).
 - Otherwise, requests are routed to OpenAI-compatible `/chat/completions`, `/images/generations`, and `/images/edits`.
+- OpenRouter App Attribution: every request to an `openrouter.ai` API base (chat, embeddings, images) carries the app-identification headers `HTTP-Referer: https://github.com/nonoo/pletykas-telegram-bot/` and `X-OpenRouter-Title: Pletykas` (constants in `llm.py`, `_openrouter_app_headers`); non-OpenRouter bases never receive them. No config settings exist for this.
 
 ### Special Protocol Tags
 - `<NO_REPLY>`: The model decides to stay silent.

@@ -29,6 +29,7 @@ An autonomous, multi-modal Telegram group chatbot designed to seamlessly integra
 - **Vision Model** (`MODEL_LARGE_NAME`): Default `gemini-flash-latest` for high-fidelity photo captioning and visual descriptions.
 - **Image Generation Model** (`MODEL_IMAGE_NAME`, `MODEL_IMAGE_SIZE`): Default `gemini-3.1-flash-lite-image` (or OpenAI DALL-E / compatible image endpoints), default size `1K`.
 - **Embedding Model** (`MODEL_EMBED_NAME`): OpenAI-compatible `/embeddings` route for deep-memory recall, default `google/gemini-embedding-2`. Falls back to the primary key/base unless `MODEL_EMBED_*` is set. Changing the model, `MODEL_EMBED_DIM`, or the effective base invalidates the sidecar vector cache, which is re-embedded automatically on startup.
+- **OpenRouter App Attribution**: Requests to `openrouter.ai` API bases (chat, vision, embeddings, images) carry `HTTP-Referer: https://github.com/nonoo/pletykas-telegram-bot/` and `X-OpenRouter-Title: Pletykas` headers, so usage appears under the app's name in OpenRouter logs and rankings. Non-OpenRouter endpoints never receive them; no settings.
 
 ---
 

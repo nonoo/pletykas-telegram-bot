@@ -138,6 +138,53 @@ async def test_generate_image_openai_route_generates_and_edits():
     assert [call.args[0] for call in session.post.call_args_list] == ["https://api.test/v1/images/edits"]
 
 
+@pytest.mark.asyncio
+async def test_openrouter_app_attribution_headers():
+    chat_body = json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    client = LLMClient(Params(), StateManager("test.json"))
+
+    # Chat completions on an OpenRouter base carry app attribution alongside auth
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, chat_body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        await client._call_openai_compatible("https://openrouter.ai/api/v1", "key", "model", [{"role": "user", "content": "hi"}])
+    headers = session.post.call_args.kwargs["headers"]
+    assert headers["HTTP-Referer"] == "https://github.com/nonoo/pletykas-telegram-bot/"
+    assert headers["X-OpenRouter-Title"] == "Pletykas"
+    assert headers["Authorization"] == "Bearer key"
+
+    # Other providers never receive attribution headers
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, chat_body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        await client._call_openai_compatible("https://api.test", "key", "model", [{"role": "user", "content": "hi"}])
+    headers = session.post.call_args.kwargs["headers"]
+    assert "HTTP-Referer" not in headers
+    assert "X-OpenRouter-Title" not in headers
+
+    # Embeddings on an OpenRouter base carry app attribution
+    embed_client = _embed_client(api_base="https://openrouter.ai/api/v1")
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, json.dumps({"data": [{"index": 0, "embedding": [1.0, 0.0]}]})))
+    with patch.object(embed_client, "_get_session", AsyncMock(return_value=session)):
+        await embed_client.embed_texts(["x"])
+    headers = session.post.call_args.kwargs["headers"]
+    assert headers["HTTP-Referer"] == "https://github.com/nonoo/pletykas-telegram-bot/"
+    assert headers["X-OpenRouter-Title"] == "Pletykas"
+
+    # Image generation on an OpenRouter base carries app attribution
+    p_img = Params()
+    p_img.model_image_name = "openai/gpt-image-1"
+    p_img.model_image_api_base = "https://openrouter.ai/api/v1"
+    p_img.model_image_api_key = "img-key"
+    img_client = LLMClient(p_img, StateManager("test.json"))
+    img_body = json.dumps({"data": [{"b64_json": base64.b64encode(b"img-bytes").decode()}]})
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, img_body))
+    with patch.object(img_client, "_get_session", AsyncMock(return_value=session)):
+        assert await img_client.generate_image("a cat") == b"img-bytes"
+    assert session.post.call_args.args[0] == "https://openrouter.ai/api/v1/images/generations"
+    headers = session.post.call_args.kwargs["headers"]
+    assert headers["HTTP-Referer"] == "https://github.com/nonoo/pletykas-telegram-bot/"
+    assert headers["X-OpenRouter-Title"] == "Pletykas"
+
+
 def test_extract_reaction():
     p = Params()
     s = StateManager("test.json")
