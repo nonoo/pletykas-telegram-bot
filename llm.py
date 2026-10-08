@@ -1575,8 +1575,24 @@ Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak direc
             logger.error("Error generating scheduled reply: %s", e)
             return None
 
-    async def curate_memory(self, current_memories: Dict[str, Any], recent_transcript: str) -> Dict[str, Any]:
-        """Analyzes recent conversation history to extract long-term facts, group dynamics, and inside jokes."""
+    async def curate_memory(
+        self,
+        current_memories: Dict[str, Any],
+        recent_transcript: str,
+        deep_memories: Optional[Dict[str, Any]] = None,
+        archive_candidates: Optional[Dict[str, Any]] = None,
+        archive_age_days: int = 7,
+    ) -> Dict[str, Any]:
+        """Analyzes recent conversation history to extract long-term facts, group dynamics, and inside jokes.
+
+        `deep_memories` is the deep (archived) store's get_all_memories() dict, shown
+        as a read-only reference (None = backward-compatible, section omitted).
+        `archive_candidates` is a precomputed {"facts": [...], "dynamics": [...],
+        "jokes": [...]} summary of hot entries older than `archive_age_days`; the
+        CALLER does the age filtering, this method only renders it, and None/empty
+        omits the section. `archive_age_days` <= 0 disables the age-based rule
+        (0 disables age candidacy; the archive lists themselves stay available).
+        """
         facts_list = current_memories.get("memories", [])
         dynamics_list = current_memories.get("dynamics", [])
         jokes_list = current_memories.get("inside_jokes", [])
@@ -1587,27 +1603,56 @@ Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak direc
             "inside_jokes": [{"title": j.get("title"), "context": j.get("context")} for j in jokes_list],
         }
 
+        deep_section = ""
+        if deep_memories is not None:
+            deep_summary = {
+                "facts": [{"topic": m.get("topic"), "content": m.get("content")} for m in deep_memories.get("memories", [])],
+                "dynamics": [{"members": d.get("members"), "relation": d.get("relation")} for d in deep_memories.get("dynamics", [])],
+                "inside_jokes": [{"title": j.get("title"), "context": j.get("context")} for j in deep_memories.get("inside_jokes", [])],
+            }
+            deep_section = f"\n[Deep Memory Entries (archived, read-only reference)]\n{json.dumps(deep_summary, indent=2, ensure_ascii=False)}\n"
+
+        candidates_section = ""
+        if archive_candidates:
+            candidates_section = f"\n[Archive Candidates (hot entries older than {archive_age_days} days)]\n{json.dumps(archive_candidates, indent=2, ensure_ascii=False)}\n"
+
+        age_rule = ""
+        if archive_age_days > 0:
+            age_rule = (
+                f"Entries older than {archive_age_days} days SHOULD be moved to the archive "
+                f"(facts_to_archive / dynamics_to_archive / jokes_to_archive) unless they are still "
+                f"actively referenced in the recent conversation.\n"
+            )
+
         prompt = f"""Review the recent conversation transcript and the current memory entries.
 Your task is to update the group's long-term memory with new facts, interpersonal dynamics, and inside jokes.
 
 [Current Memory Entries]
 {json.dumps(current_summary, indent=2, ensure_ascii=False)}
-
+{deep_section}{candidates_section}
 [Recent Conversation Transcript]
 {recent_transcript}
 
 [Instruction]
 Extract new knowledge, update outdated facts, and prune obsolete information.
+{age_rule}You may also archive entries for other reasons (obsolete or superseded information). When archived information resurfaces and is relevant again, restore it via the promote lists (facts_to_promote / dynamics_to_promote / jokes_to_promote).
+NEVER re-add a fact that is already present in deep memory: return it in the corresponding promote list instead.
 CRITICAL FORGETTING RULE: If anyone in the conversation asked to forget, retract, delete, or stop remembering any information, you MUST ensure that information is thoroughly discarded (placed in 'facts_to_discard', 'dynamics_to_discard', or 'jokes_to_discard', or updated via 'facts_to_update'). NEVER re-add or retain any information that a user requested to be forgotten or erased!
 Output strictly a JSON object with this exact structure:
 {{
   "facts_to_add": [{{"topic": "person or subject", "content": "concise permanent fact"}}],
   "facts_to_update": [{{"topic": "existing topic", "content": "updated content"}}],
   "facts_to_discard": ["topic or content of fact to remove"],
+  "facts_to_archive": ["topic of active fact to move to the archive"],
+  "facts_to_promote": ["topic of archived fact to restore to active memory"],
   "dynamics_to_add": [{{"members": ["Alice", "Bob"], "relation": "relationship summary"}}],
   "dynamics_to_discard": ["members or relationship to remove"],
+  "dynamics_to_archive": ["members of dynamic to archive"],
+  "dynamics_to_promote": ["members of archived dynamic to restore"],
   "jokes_to_add": [{{"title": "joke title", "context": "lore description"}}],
-  "jokes_to_discard": ["title of joke to remove"]
+  "jokes_to_discard": ["title of joke to remove"],
+  "jokes_to_archive": ["title of joke to archive"],
+  "jokes_to_promote": ["title of archived joke to restore"]
 }}
 If no changes are warranted in a category, return empty lists.
 
@@ -1649,10 +1694,16 @@ If no changes are warranted in a category, return empty lists.
             "facts_to_add": [],
             "facts_to_update": [],
             "facts_to_discard": [],
+            "facts_to_archive": [],
+            "facts_to_promote": [],
             "dynamics_to_add": [],
             "dynamics_to_discard": [],
+            "dynamics_to_archive": [],
+            "dynamics_to_promote": [],
             "jokes_to_add": [],
             "jokes_to_discard": [],
+            "jokes_to_archive": [],
+            "jokes_to_promote": [],
         }
 
         # Safe regex extraction
@@ -1679,8 +1730,12 @@ If no changes are warranted in a category, return empty lists.
         forget_request_text: str,
         sender_name: str = "",
         recent_transcript: str = "",
-    ) -> Dict[str, Any]:
-        """Analyzes a forget request and determines which facts, dynamics, and jokes should be discarded or updated."""
+    ) -> Optional[Dict[str, Any]]:
+        """Analyzes a forget request and determines which facts, dynamics, and jokes should be discarded or updated.
+
+        Returns None when the analysis call or its parsing fails; a parsed spec
+        with empty lists is a valid "nothing to forget" result.
+        """
         facts_list = current_memories.get("memories", [])
         dynamics_list = current_memories.get("dynamics", [])
         jokes_list = current_memories.get("inside_jokes", [])
@@ -1689,15 +1744,6 @@ If no changes are warranted in a category, return empty lists.
             "facts": [{"topic": m.get("topic"), "content": m.get("content")} for m in facts_list],
             "dynamics": [{"members": d.get("members"), "relation": d.get("relation")} for d in dynamics_list],
             "inside_jokes": [{"title": j.get("title"), "context": j.get("context")} for j in jokes_list],
-        }
-
-        default_result: Dict[str, Any] = {
-            "clear_all": False,
-            "facts_to_discard": [],
-            "facts_to_update": [],
-            "dynamics_to_discard": [],
-            "jokes_to_discard": [],
-            "raw_targets": [],
         }
 
         prompt = f"""A user in the group chat requested the bot to forget something.
@@ -1763,12 +1809,12 @@ Output strictly a JSON object with this exact structure:
                 )
         except Exception as e:
             logger.error("Failed model call in curate_forget: %s", e)
-            return default_result
+            return None
 
         json_match = re.search(r"\{[\s\S]*\}", raw_response)
         if not json_match:
             logger.warning("No JSON structure found in curate_forget response: %s", raw_response)
-            return default_result
+            return None
 
         try:
             parsed = json.loads(json_match.group(0))
@@ -1784,4 +1830,4 @@ Output strictly a JSON object with this exact structure:
         except Exception as e:
             logger.error("Failed to parse curate_forget JSON: %s (raw: %s)", e, raw_response)
 
-        return default_result
+        return None

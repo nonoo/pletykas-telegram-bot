@@ -1,13 +1,14 @@
 import asyncio
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import html
 import os
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
-from handlers import BotHandlers, is_repeated_message, normalize_message_text
+from handlers import BotHandlers, _compute_archive_candidates, is_repeated_message, normalize_message_text
 from llm import LLMClient
 from memory import MemoryManager
 from params import Params
@@ -1502,6 +1503,183 @@ async def test_history_curation_concurrent_lock(test_setup):
         handlers._curation_lock.release()
 
 
+def _days_ago_iso(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seed_memory_file(path: str, memories=None, dynamics=None, inside_jokes=None) -> MemoryManager:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "version": 1,
+            "last_curated_at": "",
+            "memories": memories or [],
+            "dynamics": dynamics or [],
+            "inside_jokes": inside_jokes or [],
+        }, f)
+    mm = MemoryManager(path)
+    mm.load()
+    return mm
+
+
+def test_compute_archive_candidates_age_basis():
+    now = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+    hot = {
+        "memories": [
+            # Old created_at but refreshed recently => updated_at is the age basis
+            {"topic": "Updated recently", "content": "x",
+             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-10-07T00:00:00Z"},
+            {"topic": "Never refreshed", "content": "x",
+             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"},
+            # Undateable entries are never candidates
+            {"topic": "Undateable", "content": "x"},
+        ],
+        "dynamics": [{"members": ["A", "B"], "relation": "r", "created_at": "2026-01-01T00:00:00Z"}],
+        "inside_jokes": [{"title": "J", "context": "c", "created_at": "2026-10-08T00:00:00Z"}],
+    }
+    candidates = _compute_archive_candidates(hot, 7, now=now)
+    assert candidates["facts"] == ["Never refreshed"]
+    assert candidates["dynamics"] == ["A & B"]
+    assert candidates["jokes"] == []
+
+
+@pytest.mark.asyncio
+async def test_curate_worker_archive_candidates(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        old_ts = _days_ago_iso(8)
+        mid_ts = _days_ago_iso(3)
+        fresh_ts = _days_ago_iso(0)
+        handlers.memory = _seed_memory_file(
+            os.path.join(td, "hot.json"),
+            memories=[
+                {"topic": "Old topic", "content": "old", "created_at": old_ts, "updated_at": old_ts},
+                {"topic": "Mid topic", "content": "mid", "created_at": mid_ts, "updated_at": mid_ts},
+                {"topic": "Fresh topic", "content": "fresh", "created_at": fresh_ts, "updated_at": fresh_ts},
+            ],
+            dynamics=[{"members": ["Alice", "Bob"], "relation": "Old friends", "created_at": old_ts}],
+            inside_jokes=[{"title": "Old joke", "context": "old context", "created_at": old_ts}],
+        )
+        handlers.deep_memory = _seed_memory_file(os.path.join(td, "deep.json"))
+
+        captured = {}
+
+        async def fake_curate(current_memories, recent_transcript, deep_memories=None,
+                              archive_candidates=None, archive_age_days=7):
+            captured["deep_memories"] = deep_memories
+            captured["archive_candidates"] = archive_candidates
+            captured["archive_age_days"] = archive_age_days
+            return {}
+
+        with patch.object(llm, "curate_memory", AsyncMock(side_effect=fake_curate)):
+            # Case A: default age (7 days) => only the 8-day-old entries are candidates
+            await handlers.trigger_curation(blocking=True)
+            assert captured["archive_age_days"] == 7
+            assert captured["archive_candidates"] == {
+                "facts": ["Old topic"], "dynamics": ["Alice & Bob"], "jokes": ["Old joke"],
+            }
+            assert captured["deep_memories"] == {"memories": [], "dynamics": [], "inside_jokes": []}
+
+            # Case B: 2-day age => the 8-day and 3-day facts are both candidates
+            s.set_deep_archive_days(2)
+            await handlers.trigger_curation(blocking=True)
+            assert captured["archive_age_days"] == 2
+            assert captured["archive_candidates"]["facts"] == ["Old topic", "Mid topic"]
+
+            # Case C: 0 disables age candidacy entirely
+            s.set_deep_archive_days(0)
+            await handlers.trigger_curation(blocking=True)
+            assert captured["archive_candidates"] is None
+            assert captured["archive_age_days"] == 0
+
+
+@pytest.mark.asyncio
+async def test_curate_worker_archive_and_promote_moves(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        old_ts = _days_ago_iso(9)
+        fresh_ts = _days_ago_iso(0)
+        archived_ts = _days_ago_iso(30)
+        handlers.memory = _seed_memory_file(
+            os.path.join(td, "hot.json"),
+            memories=[
+                {"topic": "Old topic", "content": "old content", "created_at": old_ts, "updated_at": old_ts},
+                {"topic": "Fresh topic", "content": "fresh", "created_at": fresh_ts, "updated_at": fresh_ts},
+            ],
+            dynamics=[{"members": ["Alice", "Bob"], "relation": "Old friends", "created_at": old_ts}],
+        )
+        handlers.deep_memory = _seed_memory_file(
+            os.path.join(td, "deep.json"),
+            memories=[{"topic": "Archived topic", "content": "archived content",
+                       "created_at": archived_ts, "updated_at": archived_ts}],
+        )
+
+        verdict = {
+            "facts_to_archive": ["Old topic"],
+            "facts_to_promote": ["Archived topic"],
+            "dynamics_to_archive": ["Alice & Bob"],
+        }
+        with patch.object(llm, "curate_memory", AsyncMock(return_value=verdict)):
+            summary = await handlers.trigger_curation(blocking=True)
+
+        assert summary["archived_facts"] == 1
+        assert summary["archived_dynamics"] == 1
+        assert summary["promoted_facts"] == 1
+        assert summary["promoted_dynamics"] == 0
+        assert summary["promoted_jokes"] == 0
+
+        hot = handlers.memory.get_all_memories()
+        hot_topics = [f["topic"] for f in hot["memories"]]
+        assert "Old topic" not in hot_topics
+        assert "Fresh topic" in hot_topics
+        assert "Archived topic" in hot_topics
+        # Promoted entry keeps its ORIGINAL timestamps
+        promoted = next(f for f in hot["memories"] if f["topic"] == "Archived topic")
+        assert promoted["created_at"] == archived_ts
+        assert promoted["updated_at"] == archived_ts
+        assert hot["dynamics"] == []
+
+        deep = handlers.deep_memory.get_all_memories()
+        deep_topics = [f["topic"] for f in deep["memories"]]
+        assert "Old topic" in deep_topics
+        assert "Archived topic" not in deep_topics
+        # Archived entry keeps its ORIGINAL timestamps
+        archived = next(f for f in deep["memories"] if f["topic"] == "Old topic")
+        assert archived["created_at"] == old_ts
+        assert archived["updated_at"] == old_ts
+        assert len(deep["dynamics"]) == 1
+        assert deep["dynamics"][0]["members"] == ["Alice", "Bob"]
+        assert deep["dynamics"][0]["created_at"] == old_ts
+
+
+@pytest.mark.asyncio
+async def test_curate_worker_forced_eviction_cap(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        facts = []
+        seeded_ts = {}
+        for i in range(305):
+            ts = _days_ago_iso(305 - i)  # f0 oldest, f304 newest
+            seeded_ts[f"f{i}"] = ts
+            facts.append({"topic": f"f{i}", "content": f"c{i}", "created_at": ts, "updated_at": ts})
+        handlers.memory = _seed_memory_file(os.path.join(td, "hot.json"), memories=facts)
+        handlers.deep_memory = _seed_memory_file(os.path.join(td, "deep.json"))
+
+        with patch.object(llm, "curate_memory", AsyncMock(return_value={})):
+            summary = await handlers.trigger_curation(blocking=True)
+
+        hot = handlers.memory.get_all_memories()["memories"]
+        deep = handlers.deep_memory.get_all_memories()["memories"]
+        assert len(hot) == 300
+        assert sorted(f["topic"] for f in deep) == ["f0", "f1", "f2", "f3", "f4"]
+        assert summary["archived_facts"] == 5
+        evicted = next(f for f in deep if f["topic"] == "f0")
+        assert evicted["created_at"] == seeded_ts["f0"]
+        assert evicted["updated_at"] == seeded_ts["f0"]
+
+
 @pytest.mark.asyncio
 async def test_cmd_curate_admin_flow(test_setup):
     p, s, m, llm, handlers = test_setup
@@ -1759,7 +1937,9 @@ Milyen Berlin? Már nem is emlékszem semmi ilyesmire! 😉"""
     }
     s.append_chat_message(trigger_entry)
 
-    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_output, None, None, None))):
+    # Forget-request analysis unavailable (None): the inline <FORGET> spec is applied as fallback
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_output, None, None, None))), \
+         patch.object(llm, "curate_forget", AsyncMock(return_value=None)):
         await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
 
     # Check memory state
@@ -1854,7 +2034,9 @@ async def test_execute_evaluation_forget_all(test_setup):
     s.append_chat_message(trigger_entry)
 
     llm_out = "<FORGET>ALL</FORGET>\nMinden emléket töröltem a fejemből! 🧼"
-    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_out, None, None, None))):
+    # Forget-request analysis unavailable (None): the inline <FORGET>ALL</FORGET> is applied as fallback
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_out, None, None, None))), \
+         patch.object(llm, "curate_forget", AsyncMock(return_value=None)):
         await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1236)
 
     assert len(m.get_all_memories()["memories"]) == 0
@@ -1862,6 +2044,132 @@ async def test_execute_evaluation_forget_all(test_setup):
     assert len(m.get_all_memories()["inside_jokes"]) == 0
     assert not any(msg["id"] == 1 for msg in s.get_memory_history())
     assert not any("secret" in msg.get("text", "") for msg in s.get_memory_history())
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_forget_clears_both_stores(test_setup, caplog):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        hot_ts = _days_ago_iso(1)
+        deep_ts = _days_ago_iso(60)
+        handlers.memory = _seed_memory_file(
+            os.path.join(td, "hot.json"),
+            memories=[{"topic": "Titok", "content": "hot secret", "created_at": hot_ts, "updated_at": hot_ts}],
+        )
+        handlers.deep_memory = _seed_memory_file(
+            os.path.join(td, "deep.json"),
+            memories=[{"topic": "Titok", "content": "archived secret", "created_at": deep_ts, "updated_at": deep_ts}],
+        )
+
+        s.append_memory_message({"id": 300, "text": "Titok: valami titkos dolog"})
+
+        mock_context = MagicMock()
+        mock_context.bot.id = 9999
+        mock_context.bot.first_name = "Pletykas"
+        mock_context.bot.username = "pletykas_bot"
+        mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7004))
+
+        trigger_entry = {
+            "id": 1300,
+            "from_user_id": 42,
+            "from_user_name": "Béla",
+            "text": "Pletykas felejtsd el hogy Titok!",
+            "timestamp_str": "12:20",
+            "media_type": "none",
+            "media_b64": None,
+        }
+        s.append_chat_message(trigger_entry)
+
+        forget_spec = {
+            "clear_all": False,
+            "facts_to_discard": ["Titok"],
+            "facts_to_update": [],
+            "dynamics_to_discard": [],
+            "jokes_to_discard": [],
+            "raw_targets": [],
+        }
+
+        with caplog.at_level(logging.INFO, logger="handlers"):
+            with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("<NO_REPLY>", None, None, None))), \
+                 patch.object(llm, "curate_forget", AsyncMock(return_value=forget_spec)) as mock_curate:
+                await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1300)
+
+        # Forget analysis saw BOTH stores' entries
+        mock_curate.assert_awaited_once()
+        seen = mock_curate.call_args[1]["current_memories"]["memories"]
+        assert len(seen) == 2
+        assert {f["content"] for f in seen} == {"hot secret", "archived secret"}
+
+        # Both stores cleaned; counts summed in the log line
+        assert handlers.memory.get_all_memories()["memories"] == []
+        assert handlers.deep_memory.get_all_memories()["memories"] == []
+        assert "discarded_facts=2" in caplog.text
+
+        # Confirmation message still sent
+        mock_context.bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_forget_request_overrides_inline_spec(test_setup, caplog):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        hot_ts = _days_ago_iso(1)
+        deep_ts = _days_ago_iso(60)
+        handlers.memory = _seed_memory_file(
+            os.path.join(td, "hot.json"),
+            memories=[{"topic": "Zaj", "content": "csak a hot tárban él", "created_at": hot_ts, "updated_at": hot_ts}],
+        )
+        handlers.deep_memory = _seed_memory_file(
+            os.path.join(td, "deep.json"),
+            memories=[{"topic": "Titok", "content": "archivált titok", "created_at": deep_ts, "updated_at": deep_ts}],
+        )
+
+        mock_context = MagicMock()
+        mock_context.bot.id = 9999
+        mock_context.bot.first_name = "Pletykas"
+        mock_context.bot.username = "pletykas_bot"
+        mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7005))
+
+        trigger_entry = {
+            "id": 1400,
+            "from_user_id": 42,
+            "from_user_name": "Béla",
+            "text": "Pletykas felejtsd el a Titkot!",
+            "timestamp_str": "12:30",
+            "media_type": "none",
+            "media_b64": None,
+        }
+        s.append_chat_message(trigger_entry)
+
+        # Conversational model is blind to deep entries: its inline block targets a hot bystander
+        llm_output = "<FORGET>\nFacts to Discard:\n- Zaj\n</FORGET>\nRendben, elfelejtettem! 🤐"
+
+    # Combined-store analysis (hot+deep visible) targets the archived topic instead
+    analyzed_spec = {
+        "clear_all": False,
+        "facts_to_discard": ["Titok"],
+        "facts_to_update": [],
+        "dynamics_to_discard": [],
+        "jokes_to_discard": [],
+        "raw_targets": [],
+    }
+
+    with caplog.at_level(logging.INFO, logger="handlers"):
+        with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(llm_output, None, None, None))), \
+             patch.object(llm, "curate_forget", AsyncMock(return_value=analyzed_spec)) as mock_curate:
+            await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1400)
+
+    mock_curate.assert_awaited_once()
+    seen = mock_curate.call_args[1]["current_memories"]["memories"]
+    assert {f["topic"] for f in seen} == {"Zaj", "Titok"}
+
+    # The analysis' spec won: archived target gone from deep, hot bystander untouched
+    assert handlers.deep_memory.get_all_memories()["memories"] == []
+    assert [f["topic"] for f in handlers.memory.get_all_memories()["memories"]] == ["Zaj"]
+    assert "Replacing inline <FORGET> spec" in caplog.text
+    assert "discarded_facts=1" in caplog.text
 
 
 def _bot_history_entry(text: str, msg_id: int = 9000) -> dict:

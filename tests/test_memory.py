@@ -93,6 +93,59 @@ def test_memory_load_backfills_updated_at_from_created_at():
         assert all_m[1]["updated_at"] == ""
 
 
+def test_memory_pop_and_append_entry():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        mm = MemoryManager(mf)
+        mm.load()
+
+        with patch("memory._utc_iso_now", return_value="2026-01-01T00:00:00Z"):
+            mm.add_memory("Alice", "Lives in Berlin")
+        mm.add_dynamic(["Alice", "Bob"], "Friends")
+        mm.add_inside_joke("Joke1", "Ctx")
+
+        popped = mm.pop_memory("Alice")
+        assert popped is not None
+        assert popped["topic"] == "Alice"
+        assert popped["created_at"] == "2026-01-01T00:00:00Z"
+        assert popped["updated_at"] == "2026-01-01T00:00:00Z"
+        assert mm.get_all_memories()["memories"] == []
+        assert mm.pop_memory("Alice") is None
+
+        # Pop persists to disk
+        mm2 = MemoryManager(mf)
+        mm2.load()
+        assert mm2.get_all_memories()["memories"] == []
+
+        popped_dyn = mm.pop_dynamic("Alice")
+        assert popped_dyn is not None
+        assert popped_dyn["relation"] == "Friends"
+        assert mm.get_all_memories()["dynamics"] == []
+        assert mm.pop_dynamic("nobody") is None
+
+        popped_joke = mm.pop_inside_joke("Joke1")
+        assert popped_joke is not None
+        assert popped_joke["context"] == "Ctx"
+        assert mm.pop_inside_joke("Joke1") is None
+
+        # append_entry copies the entry VERBATIM (no timestamp rewrite)
+        target = MemoryManager(os.path.join(td, "deep.json"))
+        target.load()
+        target.append_entry("memories", popped)
+        target.append_entry("dynamics", {"members": ["A"], "relation": "x"})
+        got = target.get_all_memories()
+        assert got["memories"] == [popped]
+        assert got["memories"][0]["created_at"] == "2026-01-01T00:00:00Z"
+        assert got["dynamics"] == [{"members": ["A"], "relation": "x"}]
+
+        # Mutating the source dict after append does not affect the stored copy
+        popped["content"] = "Changed"
+        assert target.get_all_memories()["memories"][0]["content"] == "Lives in Berlin"
+
+        with pytest.raises(ValueError):
+            target.append_entry("unknown_section", {})
+
+
 def test_memory_discard_by_content_or_topic():
     with tempfile.TemporaryDirectory() as td:
         mf = os.path.join(td, "mem.json")
@@ -115,6 +168,39 @@ def test_memory_discard_by_content_or_topic():
         # Discard joke by title
         assert mm.discard_inside_joke("Tabs") is True
         assert len(mm.get_all_memories()["inside_jokes"]) == 0
+
+
+def test_forget_targets_do_not_over_delete():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        mm = MemoryManager(mf)
+
+        mm.add_memory('Norbert "Nonoo" Varga', "On 2026-09-30 at 09:05 said he had already woken up and worked but was on the retyó")
+        mm.add_memory('Norbert "Nonoo" Varga', "On 2026-10-08 at 10:02 tested Pletykas with 'pletyi teszt'")
+        mm.add_memory("Pletykas", "On 2026-10-08 at 10:03 responded to Norbert, the test was successful")
+        mm.add_dynamic(["Norbert", "Pletykas"], "Norbert teases Pletykas about the retyó")
+
+        # A long structured target removes ONLY the entry it describes: sharing the
+        # topic plus one common word ("2026", "was", ...) must not match anything else.
+        target = '(Norbert "Nonoo" Varga): On 2026-10-08 at 10:02 tested Pletykas with \'pletyi teszt\''
+        assert mm.discard_memory(target) is True
+        facts = mm.get_all_memories()["memories"]
+        assert len(facts) == 2
+        assert all("pletyi teszt" not in f["content"] for f in facts)
+
+        # Same class of structured target must not nuke a dynamic by member name alone
+        assert mm.discard_dynamic("(Norbert & Pletykas): something completely unrelated") is False
+        assert len(mm.get_all_memories()["dynamics"]) == 1
+
+        # Quoted topics still match exactly
+        mm.add_memory("Deepmem teszt téma", "Ez egy régi, archívumba való teszt bejegyzés")
+        assert mm.discard_memory('"Deepmem teszt téma"') is True
+        assert all(f["topic"] != "Deepmem teszt téma" for f in mm.get_all_memories()["memories"])
+
+        # The unstructured topic+phrase heuristic still works when EVERY content word is present
+        mm.add_memory("Alice", "Lives in Berlin")
+        assert mm.discard_memory("Alice lives in Berlin") is True
+        assert all(f["topic"] != "Alice" for f in mm.get_all_memories()["memories"])
 
 
 def test_memory_discard_any():

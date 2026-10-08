@@ -267,6 +267,60 @@ def parse_schedule_time(time_str: str, tz: Any, now: datetime) -> Optional[datet
         return None
 
 
+def _entry_age_dt(entry: Dict[str, Any], use_updated_at: bool = False) -> Optional[datetime]:
+    """Parses an entry's age-basis timestamp as an aware UTC datetime; None when missing/unparseable."""
+    if use_updated_at:
+        ts = str(entry.get("updated_at") or entry.get("created_at") or "")
+    else:
+        ts = str(entry.get("created_at") or "")
+    if not ts.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _compute_archive_candidates(hot_memories: Dict[str, Any], archive_days: int,
+                                now: Optional[datetime] = None) -> Dict[str, List[str]]:
+    """Lists hot entries older than `archive_days` in compact form for the curator prompt.
+
+    Age basis: facts use updated_at if present else created_at; dynamics and jokes
+    use created_at only. Entries with missing/unparseable timestamps are NEVER
+    candidates (never archive what you cannot date).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cutoff = timedelta(days=archive_days)
+    candidates: Dict[str, List[str]] = {"facts": [], "dynamics": [], "jokes": []}
+
+    for m in hot_memories.get("memories", []):
+        dt = _entry_age_dt(m, use_updated_at=True)
+        if dt is not None and (now - dt) > cutoff:
+            topic = str(m.get("topic", "")).strip()
+            if topic:
+                candidates["facts"].append(topic)
+
+    for d in hot_memories.get("dynamics", []):
+        dt = _entry_age_dt(d)
+        if dt is not None and (now - dt) > cutoff:
+            members = " & ".join(str(x) for x in d.get("members", []))
+            if members:
+                candidates["dynamics"].append(members)
+
+    for j in hot_memories.get("inside_jokes", []):
+        dt = _entry_age_dt(j)
+        if dt is not None and (now - dt) > cutoff:
+            title = str(j.get("title", "")).strip()
+            if title:
+                candidates["jokes"].append(title)
+
+    return candidates
+
+
 class BotHandlers:
     def __init__(self, params: Params, state: StateManager, memory: MemoryManager, llm: LLMClient,
                  deep_memory: Optional[MemoryManager] = None):
@@ -895,11 +949,25 @@ class BotHandlers:
             transcript = self._format_transcript(mem_history)
             current_memories = self.memory.get_all_memories()
 
+            # Age-based archive candidacy: 0 disables it (no candidates computed)
+            archive_days = self.state.get_deep_archive_days()
+            if archive_days > 0:
+                archive_candidates = _compute_archive_candidates(current_memories, archive_days)
+            else:
+                archive_candidates = None
+            deep_current = self.deep_memory.get_all_memories()
+
             loop = asyncio.new_event_loop()
             try:
                 asyncio.set_event_loop(loop)
                 curation = loop.run_until_complete(
-                    self.llm.curate_memory(current_memories, transcript)
+                    self.llm.curate_memory(
+                        current_memories,
+                        transcript,
+                        deep_memories=deep_current,
+                        archive_candidates=archive_candidates,
+                        archive_age_days=archive_days,
+                    )
                 )
             finally:
                 try:
@@ -957,6 +1025,83 @@ class BotHandlers:
                 if self.memory.discard_inside_joke(str(target)):
                     discarded_jokes += 1
 
+            # Deep-memory moves: archive hot -> deep, promote deep -> hot.
+            # Cross-store moves are pop-then-append (two atomic saves). Holding both
+            # managers' locks simultaneously is not possible by design, so a crash
+            # between the two saves can lose at most the ONE entry being moved
+            # (accepted: archived entries are low value). Each manager self-locks.
+            self.deep_memory.create_backup()
+            archived_facts = 0
+            archived_dyn = 0
+            archived_jokes = 0
+            promoted_facts = 0
+            promoted_dyn = 0
+            promoted_jokes = 0
+
+            for target in curation.get("facts_to_archive", []):
+                entry = self.memory.pop_memory(target)
+                if entry:
+                    self.deep_memory.append_entry("memories", entry)
+                    archived_facts += 1
+
+            for target in curation.get("dynamics_to_archive", []):
+                entry = self.memory.pop_dynamic(target)
+                if entry:
+                    self.deep_memory.append_entry("dynamics", entry)
+                    archived_dyn += 1
+
+            for target in curation.get("jokes_to_archive", []):
+                entry = self.memory.pop_inside_joke(target)
+                if entry:
+                    self.deep_memory.append_entry("inside_jokes", entry)
+                    archived_jokes += 1
+
+            for target in curation.get("facts_to_promote", []):
+                entry = self.deep_memory.pop_memory(target)
+                if entry:
+                    self.memory.append_entry("memories", entry)
+                    promoted_facts += 1
+
+            for target in curation.get("dynamics_to_promote", []):
+                entry = self.deep_memory.pop_dynamic(target)
+                if entry:
+                    self.memory.append_entry("dynamics", entry)
+                    promoted_dyn += 1
+
+            for target in curation.get("jokes_to_promote", []):
+                entry = self.deep_memory.pop_inside_joke(target)
+                if entry:
+                    self.memory.append_entry("inside_jokes", entry)
+                    promoted_jokes += 1
+
+            # Forced-eviction fallback: hard cap against pathological hot-fact growth
+            # (count-based, intentionally far above any healthy hot set). Oldest
+            # facts by the same age basis move to deep; undateable entries count as
+            # oldest. Dynamics/jokes have no forced eviction (their volume is low).
+            HOT_FACT_HARD_CAP = 300
+            if len(self.memory.get_all_memories()["memories"]) > HOT_FACT_HARD_CAP:
+                logger.warning(
+                    "Hot memory exceeds %d facts; force-evicting oldest facts to deep memory.",
+                    HOT_FACT_HARD_CAP,
+                )
+                while len(self.memory.get_all_memories()["memories"]) > HOT_FACT_HARD_CAP:
+                    facts = self.memory.get_all_memories()["memories"]
+                    oldest = min(
+                        facts,
+                        key=lambda f: _entry_age_dt(f, use_updated_at=True) or datetime.min.replace(tzinfo=timezone.utc),
+                    )
+                    entry = self.memory.pop_memory({
+                        "topic": oldest.get("topic", ""),
+                        "content": oldest.get("content", ""),
+                    })
+                    if not entry:
+                        logger.warning("Forced eviction could not pop the oldest fact; stopping eviction.")
+                        break
+                    self.deep_memory.append_entry("memories", entry)
+                    archived_facts += 1
+
+            # Phase 3 hook: refresh deep-memory embedding vectors here (after moves).
+
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.memory.set_last_curated_at(now_iso)
 
@@ -968,6 +1113,12 @@ class BotHandlers:
                 "discarded_dynamics": discarded_dyn,
                 "added_jokes": added_jokes,
                 "discarded_jokes": discarded_jokes,
+                "archived_facts": archived_facts,
+                "archived_dynamics": archived_dyn,
+                "archived_jokes": archived_jokes,
+                "promoted_facts": promoted_facts,
+                "promoted_dynamics": promoted_dyn,
+                "promoted_jokes": promoted_jokes,
             }
             logger.info("Memory consolidation completed in worker thread: %s", summary)
             return summary
@@ -1000,6 +1151,16 @@ class BotHandlers:
             reply_part = f" (replying to {msg['reply_to_user_name']})" if msg.get("reply_to_user_name") else ""
             lines.append(f"[ID: {msg.get('id')}] [{msg.get('timestamp_str')}] [{msg.get('from_user_name')}]{reply_part}: {msg.get('text')}")
         return "\n".join(lines)
+
+    def _combined_store_memories(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Hot + deep entries concatenated, so forget analysis can target archived items too."""
+        hot = self.memory.get_all_memories()
+        deep = self.deep_memory.get_all_memories()
+        return {
+            "memories": list(hot.get("memories", [])) + list(deep.get("memories", [])),
+            "dynamics": list(hot.get("dynamics", [])) + list(deep.get("dynamics", [])),
+            "inside_jokes": list(hot.get("inside_jokes", [])) + list(deep.get("inside_jokes", [])),
+        }
 
     def _is_direct_trigger(
         self,
@@ -1446,22 +1607,38 @@ class BotHandlers:
             bot_uname = bot_user if isinstance(bot_user, str) else ""
             is_forget_msg = self._is_forget_request(trigger_text, bot_username=bot_uname, bot_name=bot_display_name)
 
-            if not forget_spec and is_forget_msg:
-                logger.info("Forget request detected in message without <FORGET> tag; running curate_forget analysis...")
+            if is_forget_msg:
+                # The conversational model only sees hot entries, so an inline
+                # <FORGET> spec cannot target archived (deep) topics. On an
+                # explicit forget request the combined-store analysis is
+                # authoritative and supersedes the inline spec; None (analysis
+                # failure) keeps whatever the inline block proposed.
+                logger.info("Forget request detected; running curate_forget analysis over combined hot+deep stores...")
                 try:
-                    forget_spec = await self.llm.curate_forget(
-                        current_memories=self.memory.get_all_memories(),
+                    analyzed_spec = await self.llm.curate_forget(
+                        current_memories=self._combined_store_memories(),
                         forget_request_text=trigger_text,
                         sender_name=sender_name,
                         recent_transcript=transcript,
                     )
                 except Exception as e:
                     logger.error("curate_forget failed: %s", e)
-                    forget_spec = None
+                    analyzed_spec = None
+                if analyzed_spec is not None:
+                    if forget_spec is not None:
+                        logger.info("Replacing inline <FORGET> spec with curate_forget analysis.")
+                    forget_spec = analyzed_spec
 
             if forget_spec:
                 self.memory.create_backup()
+                self.deep_memory.create_backup()
+                # Apply the SAME spec to BOTH stores and sum the counters, so
+                # archived entries are forgotten too (clear_all wipes both tiers).
+                # apply_forget itself stays single-store; the caller loops.
                 summary = self.memory.apply_forget(forget_spec)
+                deep_summary = self.deep_memory.apply_forget(forget_spec)
+                for key in ("discarded_facts", "updated_facts", "discarded_dynamics", "discarded_jokes"):
+                    summary[key] = summary.get(key, 0) + deep_summary.get(key, 0)
 
                 scrub_targets: List[str] = []
                 if forget_spec.get("clear_all"):

@@ -249,7 +249,7 @@ class MemoryManager:
                 return True
             return False
 
-        clean = str(target).strip().lower()
+        clean = str(target).strip().strip('"\u201c\u201d\u2018\u2019').lower()
         if not clean:
             return False
 
@@ -267,12 +267,18 @@ class MemoryManager:
             if cand_topic and (cand_topic == m_topic or cand_topic in m_topic or m_topic in cand_topic):
                 if not cand_content or cand_content in m_content or m_content in cand_content:
                     return True
+            # A structured "topic: content" target decides on its structure alone.
+            # Falling through to the fuzzy heuristics below let a long spec string
+            # delete every entry that merely shared the topic and one word.
+            return False
 
         # If topic is in target (e.g. "Alice lives in Berlin" where topic is "Alice")
         if m_topic and m_topic in clean:
             content_words = [w for w in re.findall(r"\w+", m_content) if len(w) >= 3]
-            clean_words = [w for w in re.findall(r"\w+", clean) if len(w) >= 3]
-            if not content_words or any(w in clean_words for w in content_words):
+            clean_words = set(re.findall(r"\w+", clean))
+            # ALL content words must appear in the target: one shared common word
+            # (a date, "was", "the") must never be enough to delete an entry.
+            if not content_words or all(w in clean_words for w in content_words):
                 return True
 
         if m_content in clean:
@@ -294,6 +300,19 @@ class MemoryManager:
                 self.save()
                 return True
             return False
+
+    def pop_memory(self, target: Any) -> Optional[Dict[str, Any]]:
+        """Removes and returns the FIRST fact entry matching `target` (timestamps intact), or None."""
+        with self._lock:
+            if not target:
+                return None
+            memories = self.data.get("memories", [])
+            for idx, m in enumerate(memories):
+                if isinstance(m, dict) and self._matches_memory_target(m, target):
+                    removed = memories.pop(idx)
+                    self.save()
+                    return removed
+            return None
 
     # Dynamics
     def add_dynamic(self, members: List[str], relation: str) -> None:
@@ -333,6 +352,9 @@ class MemoryManager:
             if any(m in d_members for m in cand_members):
                 if not cand_relation or cand_relation in d_relation or d_relation in cand_relation:
                     return True
+            # Same rule as facts: a structured target must not fall through to
+            # member-name-only matching, which over-deleted on long spec strings.
+            return False
 
         if clean == d_relation or clean in d_relation or d_relation in clean:
             return True
@@ -356,6 +378,19 @@ class MemoryManager:
                 self.save()
                 return True
             return False
+
+    def pop_dynamic(self, target: Any) -> Optional[Dict[str, Any]]:
+        """Removes and returns the FIRST dynamic entry matching `target` (timestamps intact), or None."""
+        with self._lock:
+            if not target:
+                return None
+            dynamics = self.data.get("dynamics", [])
+            for idx, d in enumerate(dynamics):
+                if isinstance(d, dict) and self._matches_dynamic_target(d, target):
+                    removed = dynamics.pop(idx)
+                    self.save()
+                    return removed
+            return None
 
     # Inside Jokes
     def add_inside_joke(self, title: str, context: str) -> None:
@@ -389,11 +424,13 @@ class MemoryManager:
         prefix_match = re.match(r"^(?:-\s*)?(?:\(([^)]+)\)|([^:]+)):\s*(.*)$", clean)
         if prefix_match:
             cand_title = (prefix_match.group(1) or prefix_match.group(2) or "").strip().lower()
-            cand_ctx = prefix_match.group(3).strip().lower()
+            cand_ctx = (prefix_match.group(3) or "").strip().lower()
             if cand_title and (cand_title in j_title or j_title in cand_title):
                 return True
             if cand_ctx and (cand_ctx in j_context or j_context in cand_ctx):
                 return True
+            # Same rule as facts/dynamics: a structured target decides alone.
+            return False
 
         if clean == j_title or clean in j_title or j_title in clean:
             return True
@@ -417,6 +454,19 @@ class MemoryManager:
                 return True
             return False
 
+    def pop_inside_joke(self, target: Any) -> Optional[Dict[str, Any]]:
+        """Removes and returns the FIRST inside joke matching `target` (timestamps intact), or None."""
+        with self._lock:
+            if not target:
+                return None
+            jokes = self.data.get("inside_jokes", [])
+            for idx, j in enumerate(jokes):
+                if isinstance(j, dict) and self._matches_inside_joke_target(j, target):
+                    removed = jokes.pop(idx)
+                    self.save()
+                    return removed
+            return None
+
     # Generic Discard
     def discard_any(self, target: Any) -> bool:
         with self._lock:
@@ -424,6 +474,21 @@ class MemoryManager:
             r2 = self.discard_dynamic(target)
             r3 = self.discard_inside_joke(target)
             return r1 or r2 or r3
+
+    def append_entry(self, section: str, entry: Dict[str, Any]) -> None:
+        """Appends a shallow copy of `entry` VERBATIM (no timestamp rewrite) to `section`.
+
+        Intended for cross-store moves (archive/promote): the moved entry must keep
+        its original created_at/updated_at. A move is two atomic saves (pop in the
+        source store, append here) and callers must NOT hold both manager locks at
+        once; a crash between the two saves loses at most the one entry being moved
+        (accepted: archived entries are low value).
+        """
+        if section not in ("memories", "dynamics", "inside_jokes"):
+            raise ValueError(f"Unknown memory section: {section}")
+        with self._lock:
+            self.data.setdefault(section, []).append(dict(entry))
+            self.save()
 
     def apply_forget(self, forget_spec: Dict[str, Any]) -> Dict[str, int]:
         """Applies a forget specification, thoroughly removing or updating matching memories."""

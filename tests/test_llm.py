@@ -596,6 +596,83 @@ async def test_curate_memory_uses_small_model_200k_tokens():
 
 
 @pytest.mark.asyncio
+async def test_curate_memory_archive_promote_keys_and_prompt_sections():
+    p = Params()
+    p.model_name = "gemini-2.5-flash"
+    p.model_api_base = ""
+    p.model_api_key = "test-key"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    mock_llm_output = json.dumps({
+        "facts_to_archive": ["Old topic"],
+        "facts_to_promote": ["Archived topic"],
+        "dynamics_to_archive": ["Alice & Bob"],
+        "dynamics_to_promote": ["Carl & Dana"],
+        "jokes_to_archive": ["Old joke"],
+        "jokes_to_promote": ["Old archived joke"],
+    })
+
+    deep = {"memories": [{"topic": "Archived topic", "content": "x"}], "dynamics": [], "inside_jokes": []}
+    candidates = {"facts": ["Old topic"], "dynamics": [], "jokes": []}
+
+    with patch.object(client, "_call_genai", AsyncMock(return_value=(mock_llm_output, 10, 10))) as mock_call:
+        res = await client.curate_memory(
+            {"memories": [], "dynamics": [], "inside_jokes": []},
+            "transcript",
+            deep_memories=deep,
+            archive_candidates=candidates,
+            archive_age_days=3,
+        )
+
+    assert res["facts_to_archive"] == ["Old topic"]
+    assert res["facts_to_promote"] == ["Archived topic"]
+    assert res["dynamics_to_archive"] == ["Alice & Bob"]
+    assert res["dynamics_to_promote"] == ["Carl & Dana"]
+    assert res["jokes_to_archive"] == ["Old joke"]
+    assert res["jokes_to_promote"] == ["Old archived joke"]
+
+    prompt = mock_call.call_args[1]["contents"][0]
+    assert "[Deep Memory Entries (archived, read-only reference)]" in prompt
+    assert "Archived topic" in prompt
+    assert "[Archive Candidates (hot entries older than 3 days)]" in prompt
+    assert "Entries older than 3 days SHOULD be moved to the archive" in prompt
+
+
+@pytest.mark.asyncio
+async def test_curate_memory_backward_compat_missing_keys():
+    p = Params()
+    p.model_name = "gemini-2.5-flash"
+    p.model_api_base = ""
+    p.model_api_key = "test-key"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    # Old-model output without archive/promote keys => empty lists, no crash
+    mock_output = '{"facts_to_add": [{"topic": "Alice", "content": "Lives in Berlin"}]}'
+    with patch.object(client, "_call_genai", AsyncMock(return_value=(mock_output, 10, 10))) as mock_call:
+        res = await client.curate_memory({"memories": [], "dynamics": [], "inside_jokes": []}, "transcript")
+
+    for key in ("facts_to_archive", "facts_to_promote", "dynamics_to_archive",
+                "dynamics_to_promote", "jokes_to_archive", "jokes_to_promote"):
+        assert res[key] == []
+    assert len(res["facts_to_add"]) == 1
+
+    # No deep store passed and no candidates => sections omitted, but the default
+    # age rule (7 days) is still rendered
+    prompt = mock_call.call_args[1]["contents"][0]
+    assert "[Deep Memory Entries" not in prompt
+    assert "[Archive Candidates" not in prompt
+    assert "Entries older than 7 days SHOULD be moved to the archive" in prompt
+
+    # 0 days disables the age rule entirely
+    with patch.object(client, "_call_genai", AsyncMock(return_value=(mock_output, 10, 10))) as mock_call0:
+        await client.curate_memory({"memories": [], "dynamics": [], "inside_jokes": []}, "transcript", archive_age_days=0)
+    prompt0 = mock_call0.call_args[1]["contents"][0]
+    assert "SHOULD be moved to the archive" not in prompt0
+
+
+@pytest.mark.asyncio
 async def test_debug_mode_stdout_logging(capsys):
     p = Params()
     p.model_name = "test-model"
@@ -1073,3 +1150,30 @@ async def test_curate_forget_openai():
             sender_name="Admin",
         )
         assert res["clear_all"] is True
+
+
+@pytest.mark.asyncio
+async def test_curate_forget_failure_returns_none():
+    p = Params()
+    p.model_name = "custom-llm"
+    p.model_api_base = "https://custom.api.com"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    # Unparseable response -> None, so the caller can keep an inline spec
+    with patch.object(client, "_call_openai_compatible", AsyncMock(return_value=("no json here", 10, 5))):
+        res = await client.curate_forget(
+            current_memories={"memories": [], "dynamics": [], "inside_jokes": []},
+            forget_request_text="Felejtsd el Berlint!",
+            sender_name="Bob",
+        )
+        assert res is None
+
+    # Model call failure -> None
+    with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=RuntimeError("boom"))):
+        res = await client.curate_forget(
+            current_memories={"memories": [], "dynamics": [], "inside_jokes": []},
+            forget_request_text="Felejtsd el Berlint!",
+            sender_name="Bob",
+        )
+        assert res is None

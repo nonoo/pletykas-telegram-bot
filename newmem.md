@@ -343,6 +343,13 @@ Work:
 - Find the caller of `curate_forget` in handlers.py (grep `curate_forget`).
   Change it to pass COMBINED hot+deep entries as `current_memories`
   (concatenate the three lists), so the LLM can target archived items.
+- PRECEDENCE (live-gate finding): the conversational model only sees hot
+  entries, so its inline `<FORGET>` block cannot target archived topics.
+  On an explicit forget request (`_is_forget_request` true) the combined-store
+  analysis is authoritative and SUPERSEDES the inline spec; it must also run
+  when an inline spec exists. `curate_forget` returns `None` on any call/parse
+  failure (a parsed empty spec stays a dict), letting the caller fall back to
+  the inline spec only when analysis is unavailable.
 - Change the `apply_forget` call site to apply the returned spec to BOTH
   `self.memory` and `self.deep_memory`, summing the four counters.
   `clear_all` therefore wipes both stores. Add `create_backup()` on deep
@@ -353,6 +360,20 @@ Work:
   semantics; the caller loops over stores).
 Tests: seed hot + deep with the same forgettable topic; mock `curate_forget`
 to discard it; assert both stores no longer contain it and counts sum.
+
+INCIDENT (live gate 2026-10-08): the real forget spec carried long
+`(topic): content` strings; `_matches_*_target` fell through to fuzzy
+heuristics after a failed structured parse — `m_topic in clean` + ANY shared
+content word (dates/`was`/`the`) — and `apply_forget` deleted 57 hot + 3 deep
+entries for a 2-item spec. Fixed in `memory.py`: quoted targets are
+quote-normalized (exact-topic path), a structured `(topic): content` /
+`(members): relation` / `(title): context` target decides on its structure
+alone (no fuzzy fallthrough), and the topic-in-target heuristic requires ALL
+content words. Regression test:
+`tests/test_memory.py::test_forget_targets_do_not_over_delete`.
+Known wart (unchanged): `apply_forget` counters increment per spec ITEM that
+removed >=1 entry, not per removed entry — a legit topic target that matches
+N entries still logs 1.
 
 Phase 2 verification gate: `pytest` green; manual scenario — seed an entry older
 than the configured age (default 7 days), run `/curate`, confirm it moved to
