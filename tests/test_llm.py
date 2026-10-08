@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1177,3 +1178,170 @@ async def test_curate_forget_failure_returns_none():
             sender_name="Bob",
         )
         assert res is None
+
+
+def _embedding_resp(status, body):
+    return MagicMock(status=status, text=AsyncMock(return_value=body))
+
+
+def _fake_session(post_impl):
+    """Session whose post() delegates to post_impl(url, **kwargs) -> response object."""
+    session = MagicMock()
+
+    def post(url, **kwargs):
+        resp = post_impl(url, **kwargs)
+        return AsyncMock(__aenter__=AsyncMock(return_value=resp), __aexit__=AsyncMock())
+
+    session.post = MagicMock(side_effect=post)
+    return session
+
+
+def _embed_client(dim=0, api_base="https://api.test"):
+    p = Params()
+    p.model_api_base = api_base
+    p.model_api_key = "k"
+    p.model_embed_dim = dim
+    s = StateManager("test.json")
+    return LLMClient(p, s)
+
+
+@pytest.mark.asyncio
+async def test_embed_texts_happy_path_sorted_and_dimensions():
+    body = json.dumps({"data": [
+        {"index": 1, "embedding": [0.0, 1.0]},
+        {"index": 0, "embedding": [1.0, 0.0]},
+    ]})
+    client = _embed_client(dim=0)
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        vectors = await client.embed_texts(["first", "second"])
+    assert vectors == [[1.0, 0.0], [0.0, 1.0]]  # sorted by index even when data arrives out of order
+    assert session.post.call_args.args[0] == "https://api.test/embeddings"
+    payload = session.post.call_args.kwargs["json"]
+    assert payload["model"] == "google/gemini-embedding-2"
+    assert payload["input"] == ["first", "second"]
+    assert "dimensions" not in payload
+
+    client_dim = _embed_client(dim=768)
+    session_dim = _fake_session(lambda url, **kw: _embedding_resp(200, body))
+    with patch.object(client_dim, "_get_session", AsyncMock(return_value=session_dim)):
+        await client_dim.embed_texts(["first", "second"])
+    assert session_dim.post.call_args.kwargs["json"]["dimensions"] == 768
+
+
+@pytest.mark.asyncio
+async def test_embed_texts_degraded_paths_return_empty():
+    client = _embed_client()
+
+    # Count mismatch (1 vector for 2 texts) -> []
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, json.dumps({"data": [{"index": 0, "embedding": [1.0]}]})))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        assert await client.embed_texts(["a", "b"]) == []
+
+    # HTTP 500 -> []
+    session = _fake_session(lambda url, **kw: _embedding_resp(500, "server error"))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        assert await client.embed_texts(["a"]) == []
+
+    # Empty input -> [] without any HTTP call
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, "{}"))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        assert await client.embed_texts([]) == []
+    session.post.assert_not_called()
+
+    # No embed api_base anywhere -> [] (fail fast, no malformed URL request)
+    client_no_base = _embed_client(api_base="")
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, "{}"))
+    with patch.object(client_no_base, "_get_session", AsyncMock(return_value=session)):
+        assert await client_no_base.embed_texts(["a"]) == []
+    session.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_embed_texts_timeout_uses_5s_budget():
+    client = _embed_client()
+
+    def post_impl(url, **kw):
+        raise asyncio.TimeoutError()
+
+    session = _fake_session(post_impl)
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        assert await client.embed_texts(["x"]) == []
+    assert session.post.call_args.kwargs["timeout"].total == 5
+
+
+@pytest.mark.asyncio
+async def test_embed_texts_chunks_batches_over_64():
+    client = _embed_client()
+    texts = [f"t{i}" for i in range(130)]
+
+    calls = []
+
+    def post_impl(url, **kw):
+        payload = kw["json"]
+        calls.append(payload["input"])
+        body = json.dumps({"data": [
+            {"index": i, "embedding": [float(len(t))]} for i, t in enumerate(payload["input"])
+        ]})
+        return _embedding_resp(200, body)
+
+    session = _fake_session(post_impl)
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        vectors = await client.embed_texts(texts)
+
+    # Split into provider-safe chunks, preserving input order across chunks
+    assert [len(c) for c in calls] == [64, 64, 2]
+    assert calls[0] + calls[1] + calls[2] == texts
+    assert vectors == [[float(len(t))] for t in texts]
+
+    # A failing chunk aborts the whole embed (no further requests)
+    fail_calls = []
+
+    def post_fail_second(url, **kw):
+        fail_calls.append(kw["json"]["input"])
+        if len(fail_calls) == 2:
+            return _embedding_resp(500, "boom")
+        n = len(kw["json"]["input"])
+        body = json.dumps({"data": [{"index": i, "embedding": [1.0]} for i in range(n)]})
+        return _embedding_resp(200, body)
+
+    session2 = _fake_session(post_fail_second)
+    with patch.object(client, "_get_session", AsyncMock(return_value=session2)):
+        assert await client.embed_texts(texts) == []
+    assert len(fail_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_timeout_applied_and_curation_exempt():
+    client = _embed_client()
+    chat_body = json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, chat_body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="tr",
+            bot_username="bot",
+            is_direct_trigger=True,
+            talkativeness=5,
+        )
+        assert session.post.call_args.kwargs["timeout"].total == 10
+
+        await client.curate_memory({"memories": [], "dynamics": [], "inside_jokes": []}, "transcript")
+        assert "timeout" not in session.post.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_chat_timeout_error_propagates_from_transport():
+    client = _embed_client()
+
+    def post_impl(url, **kw):
+        raise asyncio.TimeoutError()
+
+    session = _fake_session(post_impl)
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        with pytest.raises(asyncio.TimeoutError):
+            await client._call_openai_compatible(
+                "https://api.test", "k", "model", [{"role": "user", "content": "hi"}],
+                timeout_sec=10,
+            )

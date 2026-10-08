@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -147,6 +148,17 @@ def main():
 
         handlers.schedule_spontaneous_job(DummyContext(application))
         handlers.load_and_schedule_pending_replies(DummyContext(application))
+
+        # One-shot embedding backfill for pre-existing deep-memory entries.
+        # Daemon thread: never blocks startup or shutdown.
+        def _backfill_deep_embeddings() -> None:
+            try:
+                handlers._refresh_deep_embeddings()
+                logger.info("Deep-memory embedding backfill finished.")
+            except Exception as e:
+                logger.warning("Deep-memory embedding backfill failed: %s", e)
+
+        threading.Thread(target=_backfill_deep_embeddings, name="deepmem-backfill", daemon=True).start()
         logger.info("Pletykas bot initialized successfully.")
 
     async def post_shutdown(application: Application) -> None:

@@ -30,6 +30,7 @@ pletykas-telegram-bot/
 ├── params.py                   # CLI & ENV argument parser, fallback logic, access validation
 ├── state.py                    # StateManager: atomic persistence of pletykas-state.json, usage stats, sliding histories
 ├── memory.py                   # MemoryManager: atomic persistence of pletykas-memory.json, schema validation, backup rotation
+├── deepmem.py                  # DeepMemoryIndex: embedding sidecar cache + cosine retrieval for the deep tier
 ├── llm.py                      # Multi-model client: Google GenAI + OpenAI-compatible endpoints, tag parsing
 ├── handlers.py                 # BotHandlers: message ingestion, debounce, dispatch, admin slash commands, spontaneous revival
 ├── requirements.txt            # Python dependencies
@@ -46,6 +47,7 @@ pletykas-telegram-bot/
     ├── test_params.py          # Unit tests for CLI and environment parsing
     ├── test_state.py           # Unit tests for state persistence, timezone, sleep schedule, rollups
     ├── test_memory.py          # Unit tests for memory CRUD, validation, backup rotation
+    ├── test_deepmem.py         # Unit tests for embedding cache sync/query and sidecar IO
     ├── test_llm.py             # Unit tests for image compression, tag extraction, memory curation
     ├── test_handlers.py        # Unit tests for message handling, debounce, admin commands
     └── smoke_test.py           # End-to-end integration test

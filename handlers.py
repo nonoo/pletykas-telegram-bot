@@ -28,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 
+from deepmem import DeepMemoryIndex
 from llm import LLMClient, compress_image
 from memory import MemoryManager, validate_memory_dict
 from params import Params
@@ -63,7 +64,10 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 <b>Memory Management</b>
 /memories - Upload memories JSON file as-is
 /memories load - Expect a memories JSON file upload to validate and load
-/cancel - Abort a pending memory or prompt upload
+/deepmemories - Upload deep memories JSON file as-is
+/deepmemories load - Expect a deep memories JSON file upload to validate and load
+/archive_age [days] - View or adjust hot-memory archive age in days (0 disables)
+/cancel - Abort a pending memory, deep memory, or prompt upload
 /curate - Trigger immediate LLM reflection and consolidation of recent chat
 /help - Show this guide"""
 
@@ -337,11 +341,25 @@ class BotHandlers:
                 deep_path = "pletykas-deepmemory.json"
             deep_memory = MemoryManager(deep_path)
         self.deep_memory = deep_memory
+        # Deep-memory retrieval index (sidecar vectors, fixed default filename).
+        # Coerce defensively because unit tests may pass Mock params: a Mock
+        # attribute is not a str, and a real non-blank configured model name
+        # must reach the index so model swaps invalidate stale vectors via the
+        # model-mismatch rule.
+        embed_model_name = getattr(self.params, "model_embed_name", "")
+        if not isinstance(embed_model_name, str) or not embed_model_name.strip():
+            embed_model_name = "google/gemini-embedding-2"
+        self.deep_index = DeepMemoryIndex(embed_model=embed_model_name)
+        try:
+            self.deep_index.load()
+        except Exception as e:
+            logger.warning("Failed to load deep-memory embedding sidecar: %s", e)
         self.llm = llm
         self._debounce_jobs: Dict[int, Any] = {}
         self._active_evaluations: set[int] = set()
         self._waiting_for_memory_upload: set[int] = set()
         self._waiting_for_prompt_upload: set[int] = set()
+        self._waiting_for_deepmemory_upload: set[int] = set()
         self._curation_lock = threading.Lock()
         self._next_spontaneous_time: Optional[datetime] = None
     def _log_debug_group_msg(self, direction: str, text: str) -> None:
@@ -1100,7 +1118,8 @@ class BotHandlers:
                     self.deep_memory.append_entry("memories", entry)
                     archived_facts += 1
 
-            # Phase 3 hook: refresh deep-memory embedding vectors here (after moves).
+            # Phase 3 hook: after promotions/archives, refresh deep-memory embeddings.
+            self._refresh_deep_embeddings()
 
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self.memory.set_last_curated_at(now_iso)
@@ -1161,6 +1180,84 @@ class BotHandlers:
             "dynamics": list(hot.get("dynamics", [])) + list(deep.get("dynamics", [])),
             "inside_jokes": list(hot.get("inside_jokes", [])) + list(deep.get("inside_jokes", [])),
         }
+
+    def _deep_entry_list(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Flattens the deep store into (section, entry) pairs for indexing and querying."""
+        deep = self.deep_memory.get_all_memories()
+        return (
+            [("memories", e) for e in deep.get("memories", [])]
+            + [("dynamics", e) for e in deep.get("dynamics", [])]
+            + [("inside_jokes", e) for e in deep.get("inside_jokes", [])]
+        )
+
+    def _build_recall_query(self, trigger_entry: Optional[Dict[str, Any]]) -> str:
+        """Trigger text plus the immediately preceding chat message, capped at 500 chars."""
+        texts: List[str] = []
+        if trigger_entry and trigger_entry.get("text"):
+            texts.append(str(trigger_entry["text"]))
+        history = self.state.get_chat_history()
+        if trigger_entry:
+            for idx, item in enumerate(history):
+                if item.get("id") == trigger_entry.get("id"):
+                    if idx > 0 and history[idx - 1].get("text"):
+                        texts.append(str(history[idx - 1]["text"]))
+                    break
+        query = " / ".join(texts)
+        query = re.sub(r"\[Photo[^\]]*\]", "", query).strip()
+        return query[:500]
+
+    async def _recall_deep_memory(self, query_text: str) -> str:
+        """Embeds the query and returns formatted top deep-memory hits ('' when unavailable)."""
+        try:
+            if not query_text.strip():
+                return ""
+            flat = self._deep_entry_list()
+            if not flat:
+                return ""
+            vectors = await self.llm.embed_texts([query_text])
+            if not vectors:
+                return ""
+            hits = self.deep_index.query(vectors[0], flat)
+            if not hits:
+                return ""
+            if self.state.is_debug_mode():
+                labels = []
+                for score, section, entry in hits:
+                    if section == "memories":
+                        label = str(entry.get("topic", ""))
+                    elif section == "dynamics":
+                        label = " & ".join(str(m) for m in entry.get("members", []))
+                    else:
+                        label = str(entry.get("title", ""))
+                    labels.append(f"{score:.2f}:{label}")
+                self._log_debug_group_msg(
+                    "DEEPMEM RECALL",
+                    f"Query: {query_text[:200]}\nHits: " + ", ".join(labels),
+                )
+            return self.deep_index.format_hits(hits)
+        except Exception as e:
+            logger.warning("Deep-memory recall failed: %s", e)
+            return ""
+
+    def _refresh_deep_embeddings(self) -> None:
+        """Syncs the deep store's embedding vectors; never raises."""
+        try:
+            flat = self._deep_entry_list()
+
+            # asyncio.run is safe here: these call sites run either in the
+            # curation worker thread whose own loop was already closed, or in
+            # a fresh daemon thread — no loop is running in either.
+            async def _embed(texts: List[str]) -> List[List[float]]:
+                try:
+                    return await self.llm.embed_texts(texts)
+                finally:
+                    # The throwaway loop dies right after this call; drop the
+                    # session it cached so it is not reused by a later loop.
+                    await self.llm.close_thread_session()
+
+            self.deep_index.sync(flat, lambda texts: asyncio.run(_embed(texts)))
+        except Exception as e:
+            logger.warning("Deep-memory embedding refresh failed: %s", e)
 
     def _is_direct_trigger(
         self,
@@ -1422,9 +1519,14 @@ class BotHandlers:
                     self.state.save()
             else:
                 # Standard conversational evaluation
+                recall_query = self._build_recall_query(trigger_entry)
+                recalled = await self._recall_deep_memory(recall_query)
+                branch_memory_ctx = memory_ctx
+                if recalled:
+                    branch_memory_ctx = f"{memory_ctx}\n\n{recalled}" if memory_ctx else recalled
                 reply_text, reaction, image_spec, schedule_spec = await self.llm.evaluate_and_reply(
                     system_prompt=sys_prompt,
-                    memory_context=memory_ctx,
+                    memory_context=branch_memory_ctx,
                     transcript=transcript,
                     bot_username=bot_username,
                     is_direct_trigger=is_direct_trigger,
@@ -1810,6 +1912,18 @@ class BotHandlers:
                 await message.reply_text("⚠️ Expecting a JSON file document upload. Send /cancel to abort.")
                 return
 
+            # Check if admin is currently waiting to upload a deep memories JSON file
+            if user_id in self._waiting_for_deepmemory_upload:
+                if message.text and message.text.strip().lower() == "/cancel":
+                    self._waiting_for_deepmemory_upload.discard(user_id)
+                    await message.reply_text("❌ Deep memory upload cancelled.")
+                    return
+                if message.document:
+                    await self._process_deepmemory_upload(update, context, message.document)
+                    return
+                await message.reply_text("⚠️ Expecting a JSON file document upload for deep memories. Send /cancel to abort.")
+                return
+
             # Check if admin is currently waiting to upload a prompt text file
             if user_id in self._waiting_for_prompt_upload:
                 if message.text and message.text.strip().lower() == "/cancel":
@@ -1826,6 +1940,9 @@ class BotHandlers:
             caption = (message.caption or "").strip().lower()
             if message.document and caption.startswith("/memories load"):
                 await self._process_memory_upload(update, context, message.document)
+                return
+            if message.document and caption.startswith("/deepmemories load"):
+                await self._process_deepmemory_upload(update, context, message.document)
                 return
             if message.document and caption.startswith("/prompt load"):
                 await self._process_prompt_upload(update, context, message.document)
@@ -2047,6 +2164,16 @@ class BotHandlers:
                 next_sched_str = self.state.format_time(earliest)
         sched_status = f"{sched_count} active (Next: {next_sched_str})"
 
+        deep_all = self.deep_memory.get_all_memories()
+        archive_days = self.state.get_deep_archive_days()
+        archive_status = f"{archive_days} days" if archive_days > 0 else "disabled"
+        deep_status = (
+            f"{len(deep_all.get('memories', []))} facts, "
+            f"{len(deep_all.get('dynamics', []))} dynamics, "
+            f"{len(deep_all.get('inside_jokes', []))} jokes"
+        )
+        deep_vec_count = self.deep_index.count_vectors()
+
         text = (
             f"📊 <b>Pletykas Status</b>\n"
             f"• Group Chat ID: <code>{self.params.group_chat_id}</code>\n"
@@ -2062,6 +2189,9 @@ class BotHandlers:
             f"• Sleep Schedule: <code>{sleep_status}</code>\n"
             f"• Spontaneous Messages: <code>{spont_status}</code>\n"
             f"• Scheduled Replies: <code>{sched_status}</code>\n"
+            f"• Archive age: <code>{archive_status}</code>\n"
+            f"• Deep memory: <code>{deep_status}</code>\n"
+            f"• Deep vectors: <code>{deep_vec_count}</code>\n"
             f"• Models:\n"
             f"  - Primary: <code>{self.params.model_name}</code> (thinking: {tl_primary})\n"
             f"  - Larger: <code>{self.params.model_large_name}</code> (thinking: {tl_large})\n"
@@ -2108,6 +2238,32 @@ class BotHandlers:
             await update.effective_message.reply_text(f"✅ Cooldown debounce timer updated to: <b>{self.state.get_cooldown_sec()} seconds</b>", parse_mode=ParseMode.HTML)
         except ValueError:
             await update.effective_message.reply_text("❌ Please specify a non-negative integer in seconds (0 disables).")
+
+    async def cmd_archive_age(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update.effective_user.id if update.effective_user else None):
+            return
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+
+        args = context.args or []
+        if not args:
+            cur = self.state.get_deep_archive_days()
+            note = " (disabled)" if cur == 0 else ""
+            await update.effective_message.reply_text(
+                f"📦 Deep archive age is currently: <b>{cur} days</b>{note}", parse_mode=ParseMode.HTML
+            )
+            return
+
+        try:
+            val = int(args[0])
+            self.state.set_deep_archive_days(val)
+            cur = self.state.get_deep_archive_days()
+            note = " (disabled)" if cur == 0 else ""
+            await update.effective_message.reply_text(
+                f"✅ Deep archive age updated to: <b>{cur} days</b>{note}", parse_mode=ParseMode.HTML
+            )
+        except ValueError:
+            await update.effective_message.reply_text("❌ Please specify a non-negative integer in days (0 disables age-based archiving).")
 
     async def cmd_language(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_admin(update.effective_user.id if update.effective_user else None):
@@ -2628,11 +2784,13 @@ class BotHandlers:
             )
 
 
-    async def _process_memory_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any) -> None:
+    async def _process_memory_upload_to_store(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any,
+                                              store: MemoryManager, waiting_set: set, label: str) -> bool:
+        """Shared upload core: validates a JSON document and replaces `store`'s contents. Returns True on success."""
         user_id = update.effective_user.id if update.effective_user else None
         if not document:
             await update.effective_message.reply_text("❌ No document attached. Please upload a JSON file.")
-            return
+            return False
 
         file_name = document.file_name or ""
         if file_name and not file_name.lower().endswith(".json"):
@@ -2644,46 +2802,60 @@ class BotHandlers:
             await file_obj.download_to_memory(buf)
             raw_bytes = buf.getvalue()
         except Exception as e:
-            logger.error("Failed to download memory document from Telegram: %s", e)
+            logger.error("Failed to download %s document from Telegram: %s", label, e)
             await update.effective_message.reply_text(f"❌ Failed to download file: {html.escape(str(e))}")
-            return
+            return False
 
         try:
             content_str = raw_bytes.decode("utf-8")
         except UnicodeDecodeError as e:
             await update.effective_message.reply_text(f"❌ File must be UTF-8 encoded text: {html.escape(str(e))}")
-            return
+            return False
 
         try:
             parsed = json.loads(content_str)
         except json.JSONDecodeError as e:
             await update.effective_message.reply_text(f"❌ Invalid JSON format: {html.escape(str(e))}")
-            return
+            return False
 
         valid, err_msg, cleaned = validate_memory_dict(parsed)
         if not valid or cleaned is None:
-            await update.effective_message.reply_text(f"❌ Invalid memories JSON structure: {html.escape(err_msg)}")
-            return
+            await update.effective_message.reply_text(f"❌ Invalid {label} JSON structure: {html.escape(err_msg)}")
+            return False
 
-        backup_file = self.memory.create_backup()
-        self.memory.data = cleaned
-        self.memory.save()
-        self.memory.load()
+        backup_file = store.create_backup()
+        store.data = cleaned
+        store.save()
+        store.load()
         if user_id:
-            self._waiting_for_memory_upload.discard(user_id)
+            waiting_set.discard(user_id)
 
         facts_count = len(cleaned.get("memories", []))
         dyn_count = len(cleaned.get("dynamics", []))
         jokes_count = len(cleaned.get("inside_jokes", []))
         bak_note = f"\n📦 Backup created: <code>{html.escape(os.path.basename(backup_file))}</code>" if backup_file else ""
         await update.effective_message.reply_text(
-            f"✅ <b>Successfully validated and loaded new memories JSON!</b>\n"
+            f"✅ <b>Successfully validated and loaded new {label} JSON!</b>\n"
             f"• Facts: {facts_count}\n"
             f"• Group Dynamics: {dyn_count}\n"
             f"• Inside Jokes: {jokes_count}"
             f"{bak_note}",
             parse_mode=ParseMode.HTML,
         )
+        return True
+
+    async def _process_memory_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any) -> None:
+        await self._process_memory_upload_to_store(
+            update, context, document, self.memory, self._waiting_for_memory_upload, "memories"
+        )
+
+    async def _process_deepmemory_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any) -> None:
+        loaded = await self._process_memory_upload_to_store(
+            update, context, document, self.deep_memory, self._waiting_for_deepmemory_upload, "deep memories"
+        )
+        if loaded:
+            # New deep content has no cached vectors yet; backfill them in the background.
+            threading.Thread(target=self._refresh_deep_embeddings, daemon=True).start()
 
     async def cmd_memories(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_admin(update.effective_user.id if update.effective_user else None):
@@ -2734,6 +2906,55 @@ class BotHandlers:
                 parse_mode=ParseMode.HTML,
             )
 
+    async def cmd_deepmemories(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update.effective_user.id if update.effective_user else None):
+            return
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+
+        user_id = update.effective_user.id
+        args = context.args or []
+        subcommand = args[0].strip().lower() if args else ""
+
+        if subcommand == "load":
+            if update.effective_message.document:
+                await self._process_deepmemory_upload(update, context, update.effective_message.document)
+                return
+            if user_id:
+                self._waiting_for_deepmemory_upload.add(user_id)
+            await update.effective_message.reply_text(
+                "📥 <b>Upload Deep Memories JSON</b>\n"
+                "Please upload the new deep memories <code>.json</code> file as a document attachment.\n\n"
+                "The bot will check it for validity and replace current deep memories.\n"
+                "Send /cancel to abort.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if subcommand:
+            await update.effective_message.reply_text(
+                "❌ Usage: <code>/deepmemories</code> (download file) or <code>/deepmemories load</code> (upload new JSON file)",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # No args: upload the deep memories JSON file as-is to the admin
+        self.deep_memory.save()
+        if not os.path.exists(self.deep_memory.file_path):
+            await update.effective_message.reply_text("❌ Deep memory file does not exist on disk.")
+            return
+
+        with open(self.deep_memory.file_path, "rb") as f:
+            await update.effective_message.reply_document(
+                document=f,
+                filename=os.path.basename(self.deep_memory.file_path),
+                caption=(
+                    "🧠 <b>Deep Memories JSON</b>\n"
+                    "Edit this file and upload it with <code>/deepmemories load</code> to update deep memories."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
     async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_admin(update.effective_user.id if update.effective_user else None):
             return
@@ -2743,6 +2964,9 @@ class BotHandlers:
         cancelled = False
         if user_id and user_id in self._waiting_for_memory_upload:
             self._waiting_for_memory_upload.discard(user_id)
+            cancelled = True
+        if user_id and user_id in self._waiting_for_deepmemory_upload:
+            self._waiting_for_deepmemory_upload.discard(user_id)
             cancelled = True
         if user_id and user_id in self._waiting_for_prompt_upload:
             self._waiting_for_prompt_upload.discard(user_id)
@@ -2782,6 +3006,7 @@ class BotHandlers:
         application.add_handler(CommandHandler("status", self.cmd_status))
         application.add_handler(CommandHandler("talkativeness", self.cmd_talkativeness))
         application.add_handler(CommandHandler("cooldown", self.cmd_cooldown))
+        application.add_handler(CommandHandler(["archive_age", "archiveage"], self.cmd_archive_age))
         application.add_handler(CommandHandler("language", self.cmd_language))
         application.add_handler(CommandHandler("timezone", self.cmd_timezone))
         application.add_handler(CommandHandler("nicknames", self.cmd_nicknames))
@@ -2794,6 +3019,7 @@ class BotHandlers:
         application.add_handler(CommandHandler("debug", self.cmd_debug))
         application.add_handler(CommandHandler(["image_large", "image_large_model", "imagelarge"], self.cmd_image_large_model))
         application.add_handler(CommandHandler("memories", self.cmd_memories))
+        application.add_handler(CommandHandler("deepmemories", self.cmd_deepmemories))
         application.add_handler(CommandHandler(["search_small", "search_small_model", "searchsmall", "grounding_small"], self.cmd_search_small))
         application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         application.add_handler(CommandHandler("curate", self.cmd_curate))

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 import pytest
 
+from deepmem import DeepMemoryIndex
 from handlers import BotHandlers
 from llm import LLMClient
 from memory import MemoryManager
@@ -34,6 +35,10 @@ async def test_end_to_end_smoke_flow():
 
         llm = LLMClient(p, state)
         handlers = BotHandlers(p, state, memory, llm)
+        # Bind the deep store and the embedding sidecar to the temp dir: the
+        # constructor's defaults are repo-relative and would clobber live files.
+        handlers.deep_memory = MemoryManager(os.path.join(td, "deep.json"))
+        handlers.deep_index = DeepMemoryIndex(os.path.join(td, "deep-embeddings.json"), embed_model="test-embed")
 
         mock_bot = MagicMock()
         mock_bot.id = 9999

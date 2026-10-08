@@ -8,6 +8,7 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
+from deepmem import DeepMemoryIndex
 from handlers import BotHandlers, _compute_archive_candidates, is_repeated_message, normalize_message_text
 from llm import LLMClient
 from memory import MemoryManager
@@ -35,6 +36,10 @@ def test_setup():
 
         llm = LLMClient(p, s)
         handlers = BotHandlers(p, s, m, llm)
+        # Bind the deep store and the embedding sidecar to the temp dir: the
+        # constructor's defaults are repo-relative and would clobber live files.
+        handlers.deep_memory = MemoryManager(os.path.join(td, "deep.json"))
+        handlers.deep_index = DeepMemoryIndex(os.path.join(td, "deep-embeddings.json"), embed_model="test-embed")
         yield p, s, m, llm, handlers
 
 
@@ -1620,7 +1625,12 @@ async def test_curate_worker_archive_and_promote_moves(test_setup):
             "facts_to_promote": ["Archived topic"],
             "dynamics_to_archive": ["Alice & Bob"],
         }
-        with patch.object(llm, "curate_memory", AsyncMock(return_value=verdict)):
+
+        def fake_embed(texts):
+            return [[1.0, 0.0] if "Old topic" in t else [0.0, 1.0] for t in texts]
+
+        with patch.object(llm, "curate_memory", AsyncMock(return_value=verdict)), \
+             patch.object(llm, "embed_texts", AsyncMock(side_effect=fake_embed)) as mock_embed:
             summary = await handlers.trigger_curation(blocking=True)
 
         assert summary["archived_facts"] == 1
@@ -1651,6 +1661,11 @@ async def test_curate_worker_archive_and_promote_moves(test_setup):
         assert len(deep["dynamics"]) == 1
         assert deep["dynamics"][0]["members"] == ["Alice", "Bob"]
         assert deep["dynamics"][0]["created_at"] == old_ts
+
+        # Phase 3 hook: the worker-thread refresh embedded the post-move deep store
+        mock_embed.assert_awaited()
+        hits = handlers.deep_index.query([1.0, 0.0], handlers._deep_entry_list())
+        assert hits and hits[0][2]["topic"] == "Old topic"
 
 
 @pytest.mark.asyncio
@@ -2284,3 +2299,331 @@ async def test_spontaneous_message_suppresses_repeated_reply(test_setup):
     assert ok is False
     assert "repeated" in detail
     mock_bot.send_message.assert_not_awaited()
+
+
+def _user_history_entry(text: str, msg_id: int) -> dict:
+    """Builds a chat-history entry representing a group member's message."""
+    return {
+        "id": msg_id,
+        "from_user_id": 42,
+        "from_user_name": "Bob",
+        "timestamp_epoch": 0.0,
+        "timestamp_str": "12:01",
+        "reply_to_msg_id": None,
+        "reply_to_user_name": None,
+        "text": text,
+        "media_type": "none",
+        "media_b64": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_recall_deep_memory_hits_and_context_injection(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        handlers.deep_memory = _seed_memory_file(
+            os.path.join(td, "deep.json"),
+            memories=[{"topic": "Berlin", "content": "Alice lives in Berlin and works with Rust.",
+                       "created_at": _days_ago_iso(30), "updated_at": _days_ago_iso(30)}],
+            inside_jokes=[{"title": "Tab War", "context": "Indentation debate.",
+                           "created_at": _days_ago_iso(10)}],
+        )
+
+        def fake_embed(texts):
+            return [[1.0, 0.0] if "Berlin" in t else [0.0, 1.0] for t in texts]
+
+        assert handlers.deep_index.sync(handlers._deep_entry_list(), fake_embed) == 2
+
+        with patch.object(llm, "embed_texts", AsyncMock(return_value=[[1.0, 0.0]])):
+            recalled = await handlers._recall_deep_memory("Merre él Alice?")
+        assert "Berlin" in recalled
+        assert "Alice lives in Berlin" in recalled
+
+        # Full evaluation path: recall is appended to the memory context
+        s.append_chat_message(_user_history_entry("Merre él Alice?", 1234))
+        mock_bot = MagicMock()
+        mock_bot.id = 9999
+        mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=3001))
+        mock_context = MagicMock(bot=mock_bot)
+
+        with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("She lives in Berlin!", None, None, None))) as mock_eval, \
+             patch.object(llm, "embed_texts", AsyncMock(return_value=[[1.0, 0.0]])):
+            await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+        ctx_used = mock_eval.call_args.kwargs["memory_context"]
+        assert "Berlin" in ctx_used
+        assert recalled in ctx_used
+
+
+@pytest.mark.asyncio
+async def test_recall_deep_memory_degraded_returns_empty(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    # Blank query: no embedding attempt at all
+    with patch.object(llm, "embed_texts", AsyncMock(return_value=[[1.0, 0.0]])) as mock_embed:
+        assert await handlers._recall_deep_memory("   ") == ""
+    mock_embed.assert_not_awaited()
+
+    with tempfile.TemporaryDirectory() as td:
+        handlers.deep_memory = _seed_memory_file(
+            os.path.join(td, "deep.json"),
+            memories=[{"topic": "Berlin", "content": "Alice lives in Berlin.",
+                       "created_at": _days_ago_iso(30), "updated_at": _days_ago_iso(30)}],
+        )
+        handlers.deep_index.sync(handlers._deep_entry_list(), lambda texts: [[1.0, 0.0] for _ in texts])
+
+        # Embedding failure -> '' instead of raising
+        with patch.object(llm, "embed_texts", AsyncMock(side_effect=RuntimeError("embeddings down"))):
+            assert await handlers._recall_deep_memory("Merre él Alice?") == ""
+
+        # Full path: failed recall leaves the memory context untouched
+        s.append_chat_message(_user_history_entry("Merre él Alice?", 1234))
+        mock_bot = MagicMock()
+        mock_bot.id = 9999
+        mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=3001))
+        mock_context = MagicMock(bot=mock_bot)
+        expected_ctx = m.format_for_context()
+
+        with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("Hello!", None, None, None))) as mock_eval, \
+             patch.object(llm, "embed_texts", AsyncMock(return_value=[])):
+            await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+        assert mock_eval.call_args.kwargs["memory_context"] == expected_ctx
+
+
+@pytest.mark.asyncio
+async def test_refresh_deep_embeddings_syncs_in_worker_thread(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        handlers.deep_memory = _seed_memory_file(
+            os.path.join(td, "deep.json"),
+            memories=[{"topic": "Rust", "content": "Uses Rust daily.",
+                       "created_at": _days_ago_iso(5), "updated_at": _days_ago_iso(5)}],
+        )
+
+        with patch.object(llm, "embed_texts", AsyncMock(side_effect=lambda texts: [[1.0, 0.0] for _ in texts])) as mock_embed:
+            await asyncio.to_thread(handlers._refresh_deep_embeddings)
+        mock_embed.assert_awaited_once()
+
+        hits = handlers.deep_index.query([1.0, 0.0], handlers._deep_entry_list())
+        assert len(hits) == 1
+        assert hits[0][2]["topic"] == "Rust"
+
+        # An embedding failure is swallowed and never breaks the caller
+        handlers.deep_memory.add_memory("New", "brand new")
+        with patch.object(llm, "embed_texts", AsyncMock(side_effect=RuntimeError("down"))):
+            await asyncio.to_thread(handlers._refresh_deep_embeddings)  # must not raise
+        assert handlers.deep_index.query([1.0, 0.0], handlers._deep_entry_list())[0][2]["topic"] == "Rust"
+
+
+@pytest.mark.asyncio
+async def test_cmd_deepmemories_and_load_workflow(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_update = MagicMock()
+    mock_chat = MagicMock(type="private")
+    mock_user = MagicMock(id=p.admin_user_ids[0])
+    mock_msg = MagicMock()
+    mock_msg.document = None
+    mock_msg.reply_text = AsyncMock()
+    mock_msg.reply_document = AsyncMock()
+    mock_update.effective_chat = mock_chat
+    mock_update.effective_user = mock_user
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+
+    # 1. /deepmemories uploads the deep JSON file as document
+    mock_context.args = []
+    await handlers.cmd_deepmemories(mock_update, mock_context)
+    mock_msg.reply_document.assert_awaited_once()
+    assert "Deep Memories JSON" in mock_msg.reply_document.call_args[1]["caption"]
+
+    # 2. /deepmemories load prompts user and registers waiting state
+    mock_context.args = ["load"]
+    await handlers.cmd_deepmemories(mock_update, mock_context)
+    assert mock_user.id in handlers._waiting_for_deepmemory_upload
+
+    # 3. User sends valid JSON file document -> deep store replaced, vectors refreshed in background
+    new_deep_data = {
+        "version": 1,
+        "memories": [{"topic": "Archived", "content": "Old archived fact"}],
+        "dynamics": [],
+        "inside_jokes": [],
+    }
+    raw_bytes = json.dumps(new_deep_data).encode("utf-8")
+
+    mock_doc = MagicMock()
+    mock_doc.file_id = "deepdoc1"
+    mock_doc.file_name = "deep.json"
+    mock_file = MagicMock()
+
+    async def fake_download(buf):
+        buf.write(raw_bytes)
+
+    mock_file.download_to_memory = fake_download
+    mock_context.bot.get_file = AsyncMock(return_value=mock_file)
+
+    doc_msg = MagicMock()
+    doc_msg.document = mock_doc
+    doc_msg.text = None
+    doc_msg.caption = None
+    doc_msg.reply_text = AsyncMock()
+    doc_update = MagicMock()
+    doc_update.effective_chat = mock_chat
+    doc_update.effective_user = mock_user
+    doc_update.effective_message = doc_msg
+
+    with patch.object(handlers, "_refresh_deep_embeddings") as mock_refresh:
+        await handlers.on_message(doc_update, mock_context)
+        for _ in range(100):
+            if mock_refresh.called:
+                break
+            await asyncio.sleep(0.01)
+
+    assert mock_user.id not in handlers._waiting_for_deepmemory_upload
+    deep = handlers.deep_memory.get_all_memories()
+    assert [f["topic"] for f in deep["memories"]] == ["Archived"]
+    doc_msg.reply_text.assert_awaited()
+    assert "Successfully" in doc_msg.reply_text.call_args[0][0]
+    mock_refresh.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cmd_deepmemories_invalid_json_rejected(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_chat = MagicMock(type="private")
+    mock_user = MagicMock(id=p.admin_user_ids[0])
+    mock_context = MagicMock()
+
+    handlers._waiting_for_deepmemory_upload.add(mock_user.id)
+
+    raw_bytes = json.dumps([1, 2, 3]).encode("utf-8")
+    mock_doc = MagicMock()
+    mock_doc.file_id = "deepdoc2"
+    mock_doc.file_name = "bad.json"
+    mock_file = MagicMock()
+
+    async def fake_download(buf):
+        buf.write(raw_bytes)
+
+    mock_file.download_to_memory = fake_download
+    mock_context.bot.get_file = AsyncMock(return_value=mock_file)
+
+    doc_msg = MagicMock()
+    doc_msg.document = mock_doc
+    doc_msg.text = None
+    doc_msg.caption = None
+    doc_msg.reply_text = AsyncMock()
+    doc_update = MagicMock()
+    doc_update.effective_chat = mock_chat
+    doc_update.effective_user = mock_user
+    doc_update.effective_message = doc_msg
+
+    await handlers.on_message(doc_update, mock_context)
+
+    assert "Invalid deep memories JSON structure" in doc_msg.reply_text.call_args[0][0]
+    assert handlers.deep_memory.get_all_memories()["memories"] == []
+    # Still waiting for a valid file
+    assert mock_user.id in handlers._waiting_for_deepmemory_upload
+
+
+@pytest.mark.asyncio
+async def test_cmd_cancel_clears_deep_waiting_set(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_update = MagicMock()
+    mock_update.effective_chat = MagicMock(type="private")
+    mock_update.effective_user = MagicMock(id=p.admin_user_ids[0])
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+
+    handlers._waiting_for_deepmemory_upload.add(mock_update.effective_user.id)
+    await handlers.cmd_cancel(mock_update, mock_context)
+    assert mock_update.effective_user.id not in handlers._waiting_for_deepmemory_upload
+    assert "cancelled" in mock_msg.reply_text.call_args[0][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_cmd_archive_age_workflow(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_update = MagicMock()
+    mock_update.effective_chat = MagicMock(type="private")
+    mock_update.effective_user = MagicMock(id=p.admin_user_ids[0])
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+
+    # No args -> reports the default
+    mock_context.args = []
+    await handlers.cmd_archive_age(mock_update, mock_context)
+    assert "7 days" in mock_msg.reply_text.call_args[0][0]
+
+    # Set to 3 -> persists through the real state getter
+    mock_context.args = ["3"]
+    await handlers.cmd_archive_age(mock_update, mock_context)
+    assert s.get_deep_archive_days() == 3
+    assert "3 days" in mock_msg.reply_text.call_args[0][0]
+
+    # Set to 0 -> disabled
+    mock_context.args = ["0"]
+    await handlers.cmd_archive_age(mock_update, mock_context)
+    assert s.get_deep_archive_days() == 0
+    assert "disabled" in mock_msg.reply_text.call_args[0][0]
+
+    # Garbage -> usage error
+    mock_context.args = ["abc"]
+    await handlers.cmd_archive_age(mock_update, mock_context)
+    assert "non-negative integer" in mock_msg.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_cmd_archive_age_and_deepmemories_guards(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_update = MagicMock()
+    mock_update.effective_chat = MagicMock(type="private")
+    mock_update.effective_user = MagicMock(id=424242)
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_msg.reply_document = AsyncMock()
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+    mock_context.args = []
+
+    # Non-admin: silently ignored
+    await handlers.cmd_archive_age(mock_update, mock_context)
+    await handlers.cmd_deepmemories(mock_update, mock_context)
+    mock_msg.reply_text.assert_not_awaited()
+    mock_msg.reply_document.assert_not_awaited()
+
+    # Admin in a group chat: silently ignored
+    mock_update.effective_user = MagicMock(id=p.admin_user_ids[0])
+    mock_update.effective_chat = MagicMock(type="group")
+    await handlers.cmd_archive_age(mock_update, mock_context)
+    await handlers.cmd_deepmemories(mock_update, mock_context)
+    mock_msg.reply_text.assert_not_awaited()
+    mock_msg.reply_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_status_and_help_include_deep_surfaces(test_setup):
+    p, s, m, llm, handlers = test_setup
+    from handlers import HELP_MESSAGE
+
+    mock_update = MagicMock()
+    mock_update.effective_chat = MagicMock(type="private")
+    mock_update.effective_user = MagicMock(id=p.admin_user_ids[0])
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+
+    await handlers.cmd_status(mock_update, mock_context)
+    text = mock_msg.reply_text.call_args[0][0]
+    assert "Deep memory:" in text
+    assert "Deep vectors:" in text
+    assert "Archive age:" in text
+
+    assert "/deepmemories" in HELP_MESSAGE
+    assert "/deepmemories load" in HELP_MESSAGE
+    assert "/archive_age" in HELP_MESSAGE

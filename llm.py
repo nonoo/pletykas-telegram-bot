@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 200_000
 
+# Per-request timeouts that override the shared 120s session default.
+CHAT_TIMEOUT_SEC = 10          # conversational chat/vision: fail fast on the interactive path
+DEEPMEM_EMBED_TIMEOUT_SEC = 5  # deep-memory embeddings: tiny payloads, no retry
+EMBED_BATCH_SIZE = 64          # provider-safe /embeddings batch chunk (Google compat layer caps at 100)
+
 def compress_image(image_bytes: bytes, max_dim: int = 1280, quality: int = 85) -> bytes:
     """Downscales and compresses images to max_dim and JPEG format to prevent bloat."""
     try:
@@ -348,6 +353,7 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking_level: str = "",
+        timeout_sec: Optional[float] = None,
     ) -> Tuple[str, int, int]:
         """Calls an OpenAI/DeepSeek compatible /chat/completions endpoint."""
         session = await self._get_session()
@@ -377,7 +383,12 @@ class LLMClient:
         final_resp_text = ""
         final_status = 200
 
-        async with session.post(url, headers=headers, json=payload) as resp:
+        post_kwargs: Dict[str, Any] = {"headers": headers, "json": payload}
+        if timeout_sec is not None:
+            # Per-request override; when unset the session's 120s default applies.
+            post_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_sec)
+
+        async with session.post(url, **post_kwargs) as resp:
             resp_text = await resp.text()
             if resp.status == 400:
                 if self.state.is_debug_mode():
@@ -405,7 +416,7 @@ class LLMClient:
                 if retry_needed:
                     if self.state.is_debug_mode():
                         self._log_debug_payload(f"LLM RETRY REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
-                    async with session.post(url, headers=headers, json=payload) as retry_resp:
+                    async with session.post(url, **post_kwargs) as retry_resp:
                         retry_text = await retry_resp.text()
                         if retry_resp.status != 200:
                             if self.state.is_debug_mode():
@@ -441,6 +452,85 @@ class LLMClient:
         completion_tokens = usage.get("completion_tokens", 0) or 0
 
         return content, prompt_tokens, completion_tokens
+
+    async def _call_openai_embeddings(
+        self,
+        api_base: str,
+        api_key: str,
+        model_name: str,
+        texts: List[str],
+        dim: int = 0,
+    ) -> List[List[float]]:
+        """Embeds texts via an OpenAI-compatible /embeddings endpoint. Raises RuntimeError on any failure.
+
+        Texts are chunked (EMBED_BATCH_SIZE) because providers cap batch size, e.g. Google's
+        OpenAI-compat layer rejects batches over 100. Chunk results are concatenated in input order.
+        """
+        if not api_base or not api_base.strip():
+            raise RuntimeError("no embed api_base configured")
+        vectors: List[List[float]] = []
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            vectors.extend(
+                await self._post_embeddings_chunk(
+                    api_base, api_key, model_name, texts[start:start + EMBED_BATCH_SIZE], dim
+                )
+            )
+        return vectors
+
+    async def _post_embeddings_chunk(
+        self,
+        api_base: str,
+        api_key: str,
+        model_name: str,
+        texts: List[str],
+        dim: int = 0,
+    ) -> List[List[float]]:
+        """Single /embeddings request; returns vectors in input order. Raises RuntimeError on failure."""
+        session = await self._get_session()
+        url = api_base.rstrip("/") + "/embeddings"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: Dict[str, Any] = {"model": model_name, "input": texts}
+        if dim > 0:
+            payload["dimensions"] = dim
+        if self.state.is_debug_mode():
+            previews = ", ".join(f"[{len(t)}ch] {t[:80]}" for t in texts)
+            self._log_debug_payload(f"EMBED REQUEST: {url}", f"model={model_name} texts={len(texts)}\n{previews}")
+
+        req_timeout = aiohttp.ClientTimeout(total=DEEPMEM_EMBED_TIMEOUT_SEC)
+        async with session.post(url, headers=headers, json=payload, timeout=req_timeout) as resp:
+            resp_text = await resp.text()
+            if resp.status != 200:
+                if self.state.is_debug_mode():
+                    self._log_debug_payload(f"EMBED RESPONSE ({resp.status}): {url}", resp_text)
+                raise RuntimeError(f"Embeddings API error {resp.status}: {resp_text}")
+        data = json.loads(resp_text)
+        rows = sorted(data.get("data", []), key=lambda row: row.get("index", 0))
+        vectors = [[float(v) for v in row.get("embedding", [])] for row in rows]
+        if len(vectors) != len(texts) or any(not vec for vec in vectors):
+            raise RuntimeError(
+                f"embedding count/dimension mismatch: got {len(vectors)} vectors for {len(texts)} texts"
+            )
+        if self.state.is_debug_mode():
+            self._log_debug_payload(f"EMBED RESPONSE (200): {url}", f"{len(vectors)} vectors x {len(vectors[0])} dims")
+        return vectors
+
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Embeds texts for deep-memory retrieval. Returns [] on ANY failure (never raises)."""
+        if not texts:
+            return []
+        # Safety default literal must match the params.py default (model_embed_name).
+        model = self.params.model_embed_name or "google/gemini-embedding-2"
+        key = self.params.effective_embed_api_key
+        base = self.params.effective_embed_api_base
+        dim = self.params.model_embed_dim
+        try:
+            return await self._call_openai_embeddings(base, key, model, texts, dim)
+        except Exception as e:
+            logger.warning("Deep-memory embedding failed (model=%s): %s", model, e)
+            return []
 
     async def _call_genai(
         self,
@@ -970,6 +1060,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     model_name=m_name,
                     messages=messages,
                     thinking_level=m_tl,
+                    timeout_sec=CHAT_TIMEOUT_SEC,
                 )
 
         # 1. Primary (small) model invocation
@@ -1084,6 +1175,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 model_name=model_name,
                 messages=messages,
                 thinking_level=thinking_level,
+                timeout_sec=CHAT_TIMEOUT_SEC,
             )
 
 
@@ -1491,6 +1583,7 @@ Rules: Do not refer to yourself as an AI or mention that this is automated. Spea
                     model_name=model_name,
                     messages=messages,
                     thinking_level=self.params.model_thinking_level,
+                    timeout_sec=CHAT_TIMEOUT_SEC,
                 )
 
             res = raw_response.strip()
@@ -1566,6 +1659,7 @@ Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak direc
                     model_name=model_name,
                     messages=messages,
                     thinking_level=self.params.model_thinking_level,
+                    timeout_sec=CHAT_TIMEOUT_SEC,
                 )
 
             res = raw_response.strip()
@@ -1680,6 +1774,7 @@ If no changes are warranted in a category, return empty lists.
                 {"role": "system", "content": "You are a precise data curation assistant. Output strictly valid JSON."},
                 {"role": "user", "content": prompt},
             ]
+            # No timeout: large JSON output needs headroom
             raw_response, p_tokens, c_tokens = await self._call_openai_compatible(
                 api_base=api_base,
                 api_key=api_key,
@@ -1799,6 +1894,7 @@ Output strictly a JSON object with this exact structure:
                     {"role": "system", "content": "You are a precise data curation assistant. Output strictly valid JSON."},
                     {"role": "user", "content": prompt},
                 ]
+                # No timeout: large JSON output needs headroom
                 raw_response, _, _ = await self._call_openai_compatible(
                     api_base=api_base,
                     api_key=api_key,

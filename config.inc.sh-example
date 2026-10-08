@@ -27,6 +27,9 @@ MODEL_IMAGE_THINKING_LEVEL=""
 
 # Deep Memory Embedding Model (OpenAI-compatible /embeddings).
 # Uncomment to override; when unset the primary model's key/base apply.
+# Google's OpenAI-compat layer works too, e.g.:
+#   MODEL_EMBED_NAME="gemini-embedding-2"
+#   MODEL_EMBED_API_BASE="https://generativelanguage.googleapis.com/v1beta/openai"
 #MODEL_EMBED_NAME="google/gemini-embedding-2"
 #MODEL_EMBED_API_KEY=""
 #MODEL_EMBED_API_BASE=""
