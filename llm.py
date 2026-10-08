@@ -1466,6 +1466,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     if self.state.is_debug_mode():
                         self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>")
                     res = await resp.json()
+            else:
                 # Text to image via /images/generations
                 url = img_base.rstrip("/") + "/images/generations"
                 payload = {
@@ -1485,7 +1486,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                         self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
                         raise RuntimeError(f"OpenAI image generation error {resp.status}: {resp_text}")
                     res = json.loads(resp_text)
-
 
             item = res.get("data", [])[0]
             if "b64_json" in item:

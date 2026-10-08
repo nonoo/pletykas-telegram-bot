@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -109,6 +110,32 @@ async def test_openai_compatible_thinking_payload():
         await client._call_openai_compatible("https://api.test", "key", "model", [{"role": "user", "content": "hi"}], thinking_level="1024")
         payload = session.post.call_args.kwargs["json"]
         assert payload.get("thinking") == {"type": "enabled", "budget_tokens": 1024}
+
+
+@pytest.mark.asyncio
+async def test_generate_image_openai_route_generates_and_edits():
+    p = Params()
+    p.model_image_name = "openai/gpt-image-1"
+    p.model_image_api_base = "https://api.test/v1"
+    p.model_image_api_key = "img-key"
+    client = LLMClient(p, StateManager("test.json"))
+
+    # No source image -> fresh generation via /images/generations
+    gen_body = json.dumps({"data": [{"b64_json": base64.b64encode(b"gen-bytes").decode()}]})
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, gen_body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        assert await client.generate_image("a cat") == b"gen-bytes"
+    assert [call.args[0] for call in session.post.call_args_list] == ["https://api.test/v1/images/generations"]
+
+    # Source image -> single edit request via /images/edits, no follow-up generation
+    edit_resp = MagicMock(
+        status=200,
+        json=AsyncMock(return_value={"data": [{"b64_json": base64.b64encode(b"edited-bytes").decode()}]}),
+    )
+    session = _fake_session(lambda url, **kw: edit_resp)
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        assert await client.generate_image("a cat", base_image_bytes=b"src") == b"edited-bytes"
+    assert [call.args[0] for call in session.post.call_args_list] == ["https://api.test/v1/images/edits"]
 
 
 def test_extract_reaction():
