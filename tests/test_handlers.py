@@ -2299,6 +2299,18 @@ def _user_history_entry(text: str, msg_id: int) -> dict:
     }
 
 
+def test_deep_index_sidecar_derives_from_deepmemory_file(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    with tempfile.TemporaryDirectory() as td:
+        p.deepmemory_file = os.path.join(td, "deep.json")
+        fresh = BotHandlers(p, s, m, llm)
+        entry = {"topic": "A", "content": "one", "created_at": "2026-01-01T00:00:00Z"}
+        # The cache is written beside the configured deep store, not repo-relative
+        assert fresh.deep_index.sync([("memories", entry)], lambda texts: [[1.0, 0.0]]) == 1
+        assert os.path.exists(os.path.join(td, "deep-embeddings.json"))
+
+
 @pytest.mark.asyncio
 async def test_recall_deep_memory_hits_and_context_injection(test_setup):
     p, s, m, llm, handlers = test_setup

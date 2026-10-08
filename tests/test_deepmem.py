@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 
-from deepmem import DeepMemoryIndex, entry_hash, entry_text
+from deepmem import DeepMemoryIndex, entry_hash, entry_text, sidecar_path_for
 
 
 def _fact(topic, content, created="2026-01-01T00:00:00Z"):
@@ -149,6 +149,18 @@ def test_model_mismatch_and_malformed_tolerated():
         idx2 = DeepMemoryIndex(path)
         idx2.load()
         assert idx2.sync([("memories", e1)], lambda texts: [[1.0, 0.0]]) == 1
+
+
+def test_sidecar_path_derivation():
+    # Default store keeps the historical sidecar name (existing caches stay valid)
+    assert sidecar_path_for("pletykas-deepmemory.json") == "pletykas-deepmemory-embeddings.json"
+    # Relocated store keeps its cache beside it
+    assert sidecar_path_for("/data/store/deep.json") == "/data/store/deep-embeddings.json"
+    # Extension-less and dotted directory names
+    assert sidecar_path_for("deepmem") == "deepmem-embeddings.json"
+    assert sidecar_path_for("dir.v2/deep") == "dir.v2/deep-embeddings.json"
+    # Blank input falls back to the default store name
+    assert sidecar_path_for("  ") == "pletykas-deepmemory-embeddings.json"
 
 
 def test_identity_mismatch_discards_on_dim_or_base_change():

@@ -25,6 +25,19 @@ DEEPMEM_MIN_SCORE = 0.40
 DEEPMEM_TOP_K = 3
 
 
+def sidecar_path_for(deep_store_path: str) -> str:
+    """Derives the embeddings sidecar path from the deep-store file path.
+
+    The cache lives beside its store: `pletykas-deepmemory.json` maps to
+    `pletykas-deepmemory-embeddings.json` (the historical fixed name, so the
+    default configuration keeps its existing cache), and `/data/deep.json`
+    maps to `/data/deep-embeddings.json`. Blank input falls back to the
+    default store name.
+    """
+    path = str(deep_store_path).strip() or "pletykas-deepmemory.json"
+    return f"{os.path.splitext(path)[0]}-embeddings.json"
+
+
 def entry_text(entry: Dict[str, Any], section: str) -> str:
     """Canonical embeddable text for an entry (label + body, as shown to the model)."""
     if section == "memories":

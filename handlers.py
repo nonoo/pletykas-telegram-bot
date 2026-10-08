@@ -28,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 
-from deepmem import DeepMemoryIndex
+from deepmem import DeepMemoryIndex, sidecar_path_for
 from llm import LLMClient, compress_image
 from memory import MemoryManager, validate_memory_dict
 from params import Params
@@ -333,13 +333,16 @@ class BotHandlers:
         # tests), fall back to an EMPTY in-memory manager bound to the
         # configured deep-memory path — never the hot file, and not loaded
         # from disk (it only persists if code explicitly saves it).
+        deep_store_path = getattr(params, "deepmemory_file", "")
+        if not isinstance(deep_store_path, str) or not deep_store_path.strip():
+            deep_store_path = "pletykas-deepmemory.json"
         if deep_memory is None:
-            deep_path = getattr(params, "deepmemory_file", "")
-            if not isinstance(deep_path, str) or not deep_path.strip():
-                deep_path = "pletykas-deepmemory.json"
-            deep_memory = MemoryManager(deep_path)
+            deep_memory = MemoryManager(deep_store_path)
         self.deep_memory = deep_memory
-        # Deep-memory retrieval index (sidecar vectors, fixed default filename).
+        # Deep-memory retrieval index (sidecar vectors). The sidecar path is
+        # derived from the deep-store path so a relocated store keeps its cache
+        # beside it; the default store still maps to the historical
+        # pletykas-deepmemory-embeddings.json filename.
         # Coerce defensively because unit tests may pass Mock params: a Mock
         # attribute is not a str/int, and the real configured model name, output
         # dimension, and endpoint base must all reach the index so config swaps
@@ -354,6 +357,7 @@ class BotHandlers:
         if not isinstance(embed_base, str):
             embed_base = ""
         self.deep_index = DeepMemoryIndex(
+            sidecar_path=sidecar_path_for(deep_store_path),
             embed_model=embed_model_name,
             embed_dim=embed_dim,
             embed_base=embed_base,
