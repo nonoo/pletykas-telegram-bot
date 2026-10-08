@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
+BACKUP_KEEP = 3  # daily backup snapshots retained per store
+
 
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -179,34 +181,44 @@ class MemoryManager:
                         pass
                 raise
     def create_backup(self) -> str:
+        """Creates at most one backup per UTC day and prunes to the newest BACKUP_KEEP snapshots.
+
+        Returns the new backup path, or "" when today's snapshot already exists (or on failure).
+        """
         with self._lock:
             if not os.path.exists(self.file_path):
                 return ""
 
             dir_name = os.path.dirname(os.path.abspath(self.file_path)) or "."
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            backup_path = os.path.join(dir_name, f"{base_name}-{timestamp}.json.bak")
-            try:
-                shutil.copy2(self.file_path, backup_path)
-                logger.info("Created memory backup: %s", backup_path)
+            pattern = os.path.join(dir_name, f"{base_name}-*.json.bak")
+            now = datetime.now(timezone.utc)
+            day_stamp = now.strftime("%Y%m%d")
 
-                # Rotate backups: retain up to 20
-                pattern = os.path.join(dir_name, f"{base_name}-*.json.bak")
-                existing = sorted(glob.glob(pattern))
-                if len(existing) > 20:
-                    to_delete = existing[:-20]
-                    for old_bak in to_delete:
-                        try:
-                            os.remove(old_bak)
-                            logger.debug("Pruned old memory backup: %s", old_bak)
-                        except OSError as e:
-                            logger.warning("Failed to remove old backup %s: %s", old_bak, e)
+            backup_path = ""
+            already_today = any(
+                os.path.basename(p).startswith(f"{base_name}-{day_stamp}") for p in glob.glob(pattern)
+            )
+            if not already_today:
+                backup_path = os.path.join(dir_name, f"{base_name}-{now.strftime('%Y%m%d%H%M%S')}.json.bak")
+                try:
+                    shutil.copy2(self.file_path, backup_path)
+                    logger.info("Created memory backup: %s", backup_path)
+                except Exception as e:
+                    logger.error("Failed to create memory backup: %s", e)
+                    return ""
 
-                return backup_path
-            except Exception as e:
-                logger.error("Failed to create memory backup: %s", e)
-                return ""
+            # Prune on every call so a legacy backlog shrinks even on skip days.
+            existing = sorted(glob.glob(pattern))
+            if len(existing) > BACKUP_KEEP:
+                for old_bak in existing[:-BACKUP_KEEP]:
+                    try:
+                        os.remove(old_bak)
+                        logger.debug("Pruned old memory backup: %s", old_bak)
+                    except OSError as e:
+                        logger.warning("Failed to remove old backup %s: %s", old_bak, e)
+
+            return backup_path
 
     # Facts / Memories
     def add_memory(self, topic: str, content: str) -> None:

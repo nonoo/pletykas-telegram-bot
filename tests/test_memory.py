@@ -1,7 +1,9 @@
 import glob
 import json
 import os
+import shutil
 import tempfile
+from datetime import datetime, timezone
 from unittest.mock import patch
 import pytest
 from memory import MemoryManager, validate_memory_dict
@@ -301,19 +303,37 @@ def test_validate_memory_dict():
     assert "content" in err.lower()
 
 
-def test_memory_backup_and_pruning():
+def test_memory_backup_daily_and_pruning():
     with tempfile.TemporaryDirectory() as td:
         mf = os.path.join(td, "mem.json")
         mm = MemoryManager(mf)
         mm.load()
         mm.add_memory("Topic", "Content")
 
-        for _ in range(25):
-            mm.create_backup()
+        # First backup of the UTC day is created; same-day repeats are skipped
+        first = mm.create_backup()
+        assert first.endswith(".json.bak")
+        assert mm.create_backup() == ""
+        assert len(glob.glob(os.path.join(td, "mem-*.json.bak"))) == 1
 
-        pattern = os.path.join(td, "mem-*.json.bak")
-        backups = glob.glob(pattern)
-        assert len(backups) <= 20
+        # A multi-day backlog is pruned to the newest 3, even on a skip-day call
+        for stamp in ("20260101010101", "20260102010101", "20260103010101", "20260104010101", "20260105010101"):
+            shutil.copy2(mf, os.path.join(td, f"mem-{stamp}.json.bak"))
+        assert mm.create_backup() == ""
+        names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(td, "mem-*.json.bak")))
+        assert len(names) == 3
+        assert names[0] == "mem-20260104010101.json.bak"
+        assert names[1] == "mem-20260105010101.json.bak"
+
+        # A later UTC day creates a fresh snapshot and prunes the oldest of the three
+        with patch("memory.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+            new_path = mm.create_backup()
+        assert os.path.basename(new_path) == "mem-20300101120000.json.bak"
+        names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(td, "mem-*.json.bak")))
+        assert len(names) == 3
+        assert names[0] == "mem-20260105010101.json.bak"
+        assert names[2] == "mem-20300101120000.json.bak"
 
 
 def test_memory_clear():

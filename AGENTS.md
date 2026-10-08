@@ -143,10 +143,10 @@ Managed by `MemoryManager` via atomic replacement:
 - ID-Free Schema: Memory entries are organized cleanly without artificial identifier tokens (`mem_1`, etc.).
 - Archive-Age Clock: Facts carry `updated_at` (refreshed whenever their content changes), which resets the age-based demotion clock; dynamics and jokes have no age clock.
 - File Upload Administration: `/memories` uploads the JSON file as-is; `/memories load` validates and applies user-uploaded JSON files. Similarly, `/prompt` uploads the system prompt text file as-is; `/prompt load` validates and applies user-uploaded text files.
-- Backups: Rotated automatically before commits, keeping the 20 most recent `.bak` files.
+- Backups: At most one snapshot per UTC day before commits (daily cadence), pruned to the 3 most recent `.bak` files (`BACKUP_KEEP`).
 
 ### Deep Memory (`pletykas-deepmemory.json` + `pletykas-deepmemory-embeddings.json`)
-Managed by `MemoryManager` (same schema, validation, and 20-file backup rotation as the hot store) plus `DeepMemoryIndex` for the vector sidecar:
+Managed by `MemoryManager` (same schema, validation, and daily 3-file backup rotation as the hot store) plus `DeepMemoryIndex` for the vector sidecar:
 - `pletykas-deepmemory.json`: identical schema to `pletykas-memory.json`. Populated by age-based demotion and LLM-driven moves in both directions; `/deepmemories` downloads it as-is, `/deepmemories load` validates and applies an uploaded file (then re-embeds in a background thread).
 - `pletykas-deepmemory-embeddings.json`: `{"model": "<embed model>", "vectors": {"<sha256 of section+text+created_at>": [floats]}}`. Purely a regenerable cache: no backup rotation, discarded wholesale on model mismatch or malformed JSON, synced after tier moves and via an idempotent startup backfill.
 - Retrieval: cosine top-k (`DEEPMEM_TOP_K = 3`) above `DEEPMEM_MIN_SCORE` (0.62, calibrated for `gemini-embedding-2`); hits are injected as a `[Recalled Deep Memory]` block. Any failure (HTTP error, count/dimension mismatch, empty vectors) logs a warning and injects nothing.
