@@ -18,6 +18,7 @@ class Params:
         self.sysprompt_file: str = "pletykas-sysprompt.txt"
         self.sched_file: str = "pletykas-sched.json"
         self.memory_file: str = "pletykas-memory.json"
+        self.deepmemory_file: str = "pletykas-deepmemory.json"
         # Primary conversational model
         self.model_name: str = ""
         self.model_api_key: str = ""
@@ -36,6 +37,12 @@ class Params:
         self.model_image_api_base: str = ""
         self.model_image_size: str = "1K"
         self.model_image_thinking_level: str = ""
+
+        # Embedding model for deep-memory retrieval (OpenAI-compatible /embeddings route)
+        self.model_embed_name: str = "google/gemini-embedding-2"
+        self.model_embed_api_key: str = ""
+        self.model_embed_api_base: str = ""
+        self.model_embed_dim: int = 0
 
     @property
     def effective_large_api_key(self) -> str:
@@ -67,6 +74,20 @@ class Params:
     @property
     def effective_image_thinking_level(self) -> str:
         return self.model_image_thinking_level or self.model_thinking_level
+
+
+    # Embeddings fall back to the PRIMARY key/base when unset. For a future
+    # OpenRouter switch, set MODEL_EMBED_API_BASE=https://openrouter.ai/api/v1 +
+    # MODEL_EMBED_API_KEY=<key>; the model slug stays as-is. Native genai-SDK
+    # embedding is out of scope: the embed route is transport-first
+    # (OpenAI-compatible /embeddings), not provider-first.
+    @property
+    def effective_embed_api_key(self) -> str:
+        return self.model_embed_api_key or self.model_api_key
+
+    @property
+    def effective_embed_api_base(self) -> str:
+        return self.model_embed_api_base or self.model_api_base
 
 
     def parse(self, args: Optional[List[str]] = None) -> None:
@@ -125,6 +146,12 @@ class Params:
             dest="memory_file",
             default=os.environ.get("MEMORY_FILE", "pletykas-memory.json"),
             help="Path to dynamic memory JSON file",
+        )
+        parser.add_argument(
+            "--deepmemory-file",
+            dest="deepmemory_file",
+            default=os.environ.get("DEEPMEMORY_FILE", "pletykas-deepmemory.json"),
+            help="Path to deep memory JSON file (cold tier)",
         )
 
         # Primary model
@@ -211,6 +238,32 @@ class Params:
             help="Thinking level for image model (e.g. minimal, low, medium, high, 0; empty disables)",
         )
 
+        # Embedding model (deep-memory retrieval)
+        parser.add_argument(
+            "--model-embed-name",
+            dest="model_embed_name",
+            default=os.environ.get("MODEL_EMBED_NAME", "google/gemini-embedding-2"),
+            help="Embedding model name for deep-memory retrieval",
+        )
+        parser.add_argument(
+            "--model-embed-api-key",
+            dest="model_embed_api_key",
+            default=os.environ.get("MODEL_EMBED_API_KEY", ""),
+            help="API key for embedding model (falls back to primary API key)",
+        )
+        parser.add_argument(
+            "--model-embed-api-base",
+            dest="model_embed_api_base",
+            default=os.environ.get("MODEL_EMBED_API_BASE", ""),
+            help="Base URL for embedding model API (falls back to primary API base)",
+        )
+        parser.add_argument(
+            "--model-embed-dim",
+            dest="model_embed_dim",
+            default=os.environ.get("MODEL_EMBED_DIM", "0"),
+            help="Requested embedding dimension (0 = provider default; only sent when positive)",
+        )
+
         parsed_args = parser.parse_args(args)
 
         self.bot_token = parsed_args.bot_token.strip()
@@ -242,6 +295,7 @@ class Params:
         self.sysprompt_file = parsed_args.sysprompt_file.strip()
         self.sched_file = parsed_args.sched_file.strip()
         self.memory_file = parsed_args.memory_file.strip()
+        self.deepmemory_file = parsed_args.deepmemory_file.strip()
         self.model_name = parsed_args.model_name.strip()
         self.model_api_key = parsed_args.model_api_key.strip()
         if not self.model_api_key:
@@ -258,6 +312,13 @@ class Params:
         self.model_image_api_base = parsed_args.model_image_api_base.strip()
         self.model_image_size = parsed_args.model_image_size.strip()
         self.model_image_thinking_level = parsed_args.model_image_thinking_level.strip()
+        self.model_embed_name = parsed_args.model_embed_name.strip()
+        self.model_embed_api_key = parsed_args.model_embed_api_key.strip()
+        self.model_embed_api_base = parsed_args.model_embed_api_base.strip()
+        try:
+            self.model_embed_dim = max(0, int(parsed_args.model_embed_dim))
+        except (ValueError, TypeError):
+            self.model_embed_dim = 0
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admin_user_ids

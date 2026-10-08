@@ -36,10 +36,15 @@ def validate_memory_dict(data: Any) -> tuple[bool, str, Optional[Dict[str, Any]]
         if not content or not isinstance(content, str) or not content.strip():
             return False, f"Memory entry #{idx + 1} missing required string field \"content\"", None
         now_str = _utc_iso_now()
+        created_at = item.get("created_at") or now_str
+        updated_at = item.get("updated_at")
+        if not isinstance(updated_at, str) or not updated_at.strip():
+            updated_at = created_at
         cleaned_memories.append({
             "topic": topic.strip(),
             "content": content.strip(),
-            "created_at": item.get("created_at") or now_str,
+            "created_at": created_at,
+            "updated_at": updated_at,
         })
 
     cleaned_dynamics = []
@@ -125,11 +130,12 @@ class MemoryManager:
                             loaded["dynamics"] = []
                         if not isinstance(loaded.get("inside_jokes"), list):
                             loaded["inside_jokes"] = []
-                        # Strip any legacy "id" and "updated_at" fields from loaded entries
+                        # Strip legacy "id" fields; keep "updated_at" (resets the archive-age clock)
                         for m in loaded["memories"]:
                             if isinstance(m, dict):
                                 m.pop("id", None)
-                                m.pop("updated_at", None)
+                                if not m.get("updated_at"):
+                                    m["updated_at"] = m.get("created_at", "")
                         for d in loaded["dynamics"]:
                             if isinstance(d, dict):
                                 d.pop("id", None)
@@ -211,6 +217,7 @@ class MemoryManager:
                 "topic": topic.strip(),
                 "content": content.strip(),
                 "created_at": now_str,
+                "updated_at": now_str,
             }
             memories.append(entry)
             self.save()
@@ -221,6 +228,7 @@ class MemoryManager:
             for entry in self.data.get("memories", []):
                 if entry.get("topic", "").strip().lower() == topic_clean:
                     entry["content"] = content.strip()
+                    entry["updated_at"] = _utc_iso_now()
                     self.save()
                     return True
             return False

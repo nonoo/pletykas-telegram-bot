@@ -83,6 +83,7 @@ class StateManager:
             "timezone": "UTC",
             "talkativeness": 5,
             "cooldown_sec": 3,
+            "deep_archive_days": 7,
             "search_grounding": True,
             "search_small_model": False,
             "image_interpretation_large_model": True,
@@ -493,6 +494,20 @@ class StateManager:
     def set_cooldown_sec(self, sec: int) -> None:
         clamped = max(0, int(sec))
         self.data["cooldown_sec"] = clamped
+        self.save()
+
+    # Deep Memory Archive Age
+    def get_deep_archive_days(self) -> int:
+        """Hot-memory archive age threshold in days. 0 disables age-based candidacy."""
+        try:
+            return max(0, int(self.data.get("deep_archive_days", 7)))
+        except (ValueError, TypeError):
+            return 7
+
+    def set_deep_archive_days(self, days: int) -> None:
+        """Sets the hot-memory archive age threshold in days. 0 disables age-based candidacy."""
+        clamped = max(0, int(days))
+        self.data["deep_archive_days"] = clamped
         self.save()
 
     # Search Grounding

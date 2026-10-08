@@ -12,6 +12,7 @@ def test_params_default_values():
     assert p.sysprompt_file == "pletykas-sysprompt.txt"
     assert p.sched_file == "pletykas-sched.json"
     assert p.memory_file == "pletykas-memory.json"
+    assert p.deepmemory_file == "pletykas-deepmemory.json"
     assert p.model_name == ""
     assert p.model_large_name == ""
     assert p.model_image_name == ""
@@ -19,6 +20,10 @@ def test_params_default_values():
     assert p.model_thinking_level == ""
     assert p.effective_large_thinking_level == ""
     assert p.effective_image_thinking_level == ""
+    assert p.model_embed_name == "google/gemini-embedding-2"
+    assert p.model_embed_api_key == ""
+    assert p.model_embed_api_base == ""
+    assert p.model_embed_dim == 0
 
 
 def test_params_cli_parsing():
@@ -38,6 +43,7 @@ def test_params_cli_parsing():
         "--memhistory-file", "custom-mem.json",
         "--sysprompt-file", "custom-prompt.txt",
         "--sched-file", "custom-sched.json",
+        "--deepmemory-file", "custom-deep.json",
     ])
     assert p.bot_token == "test-token-123"
     assert p.group_chat_id == -100987654321
@@ -59,6 +65,7 @@ def test_params_cli_parsing():
     assert p.memhistory_file == "custom-mem.json"
     assert p.sysprompt_file == "custom-prompt.txt"
     assert p.sched_file == "custom-sched.json"
+    assert p.deepmemory_file == "custom-deep.json"
 
 
 def test_params_env_parsing(monkeypatch):
@@ -72,6 +79,7 @@ def test_params_env_parsing(monkeypatch):
     monkeypatch.setenv("MEMHISTORY_FILE", "env-mem.json")
     monkeypatch.setenv("SYSPROMPT_FILE", "env-prompt.txt")
     monkeypatch.setenv("SCHED_FILE", "env-sched.json")
+    monkeypatch.setenv("DEEPMEMORY_FILE", "env-deep.json")
     p = Params()
     p.parse([])
     assert p.bot_token == "env-token"
@@ -87,6 +95,7 @@ def test_params_env_parsing(monkeypatch):
     assert p.memhistory_file == "env-mem.json"
     assert p.sysprompt_file == "env-prompt.txt"
     assert p.sched_file == "env-sched.json"
+    assert p.deepmemory_file == "env-deep.json"
 
 def test_params_llm_api_key_fallback(monkeypatch):
     monkeypatch.delenv("MODEL_API_KEY", raising=False)
@@ -131,6 +140,71 @@ def test_params_model_fallback_properties():
     assert p.effective_large_api_base == "https://api.large.com"
     assert p.effective_image_api_key == "img-key"
     assert p.effective_image_api_base == "https://api.img.com"
+
+
+def test_params_embed_options(monkeypatch):
+    # CLI overrides
+    p = Params()
+    p.parse([
+        "--bot-token", "t",
+        "--group-chat-id", "-100",
+        "--admin-user-ids", "1",
+        "--model-api-key", "k",
+        "--model-embed-name", "custom/embed-model",
+        "--model-embed-api-key", "embed-key",
+        "--model-embed-api-base", "https://embed.api",
+        "--model-embed-dim", "768",
+    ])
+    assert p.model_embed_name == "custom/embed-model"
+    assert p.model_embed_api_key == "embed-key"
+    assert p.model_embed_api_base == "https://embed.api"
+    assert p.model_embed_dim == 768
+
+    # Env overrides
+    monkeypatch.setenv("MODEL_EMBED_NAME", "env/embed")
+    monkeypatch.setenv("MODEL_EMBED_API_KEY", "env-embed-key")
+    monkeypatch.setenv("MODEL_EMBED_API_BASE", "https://env.embed")
+    monkeypatch.setenv("MODEL_EMBED_DIM", "256")
+    p2 = Params()
+    p2.parse(["--bot-token", "t", "--group-chat-id", "-100", "--admin-user-ids", "1", "--model-api-key", "k"])
+    assert p2.model_embed_name == "env/embed"
+    assert p2.model_embed_api_key == "env-embed-key"
+    assert p2.model_embed_api_base == "https://env.embed"
+    assert p2.model_embed_dim == 256
+
+    # Garbage or negative dim falls back to 0
+    for bad in ("abc", "-5"):
+        p3 = Params()
+        p3.parse(["--bot-token", "t", "--group-chat-id", "-100", "--admin-user-ids", "1",
+                  "--model-api-key", "k", "--model-embed-dim", bad])
+        assert p3.model_embed_dim == 0
+
+
+def test_params_embed_fallback_properties():
+    # Unset embed key/base => primary fallback
+    p = Params()
+    p.parse([
+        "--bot-token", "token",
+        "--group-chat-id", "-100",
+        "--admin-user-ids", "1",
+        "--model-api-key", "main-key",
+        "--model-api-base", "https://api.main.com",
+    ])
+    assert p.effective_embed_api_key == "main-key"
+    assert p.effective_embed_api_base == "https://api.main.com"
+
+    # Explicit embed key/base win
+    p.parse([
+        "--bot-token", "token",
+        "--group-chat-id", "-100",
+        "--admin-user-ids", "1",
+        "--model-api-key", "main-key",
+        "--model-api-base", "https://api.main.com",
+        "--model-embed-api-key", "embed-key",
+        "--model-embed-api-base", "https://embed.api",
+    ])
+    assert p.effective_embed_api_key == "embed-key"
+    assert p.effective_embed_api_base == "https://embed.api"
 
 
 def test_params_validation_errors():

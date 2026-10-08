@@ -163,6 +163,42 @@ def test_state_talkativeness_and_cooldown_clamping():
         sm.set_cooldown_sec(10)
         assert sm.get_cooldown_sec() == 10
 
+
+def test_state_deep_archive_days():
+    import json
+    with tempfile.TemporaryDirectory() as td:
+        sf = os.path.join(td, "state.json")
+        sm = StateManager(sf)
+        sm.load()
+
+        # Default is 7 on fresh state
+        assert sm.get_deep_archive_days() == 7
+
+        # Setter clamps negatives to 0 (0 disables age-based archiving)
+        sm.set_deep_archive_days(-5)
+        assert sm.get_deep_archive_days() == 0
+        sm.set_deep_archive_days(3)
+        assert sm.get_deep_archive_days() == 3
+
+        # Persists across reload
+        sm2 = StateManager(sf)
+        sm2.load()
+        assert sm2.get_deep_archive_days() == 3
+
+        # Legacy state without the key falls back to 7
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "language": "English"}, f)
+        sm3 = StateManager(sf)
+        sm3.load()
+        assert sm3.get_deep_archive_days() == 7
+
+        # Garbage value falls back to 7
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "deep_archive_days": "abc"}, f)
+        sm4 = StateManager(sf)
+        sm4.load()
+        assert sm4.get_deep_archive_days() == 7
+
 def test_state_history_sliding_window():
     with tempfile.TemporaryDirectory() as td:
         sf = os.path.join(td, "state.json")

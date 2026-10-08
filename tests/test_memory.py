@@ -1,6 +1,8 @@
 import glob
+import json
 import os
 import tempfile
+from unittest.mock import patch
 import pytest
 from memory import MemoryManager, validate_memory_dict
 
@@ -28,8 +30,8 @@ def test_memory_add_and_retention_no_ids():
         assert all_m[0]["topic"] == "Alice"
         assert all_m[0]["content"] == "Lives in Berlin"
         assert "id" not in all_m[1]
-        assert "updated_at" not in all_m[0]
-        assert "updated_at" not in all_m[1]
+        assert all_m[0]["updated_at"] == all_m[0]["created_at"]
+        assert all_m[1]["updated_at"] == all_m[1]["created_at"]
 
         # Dynamics without IDs
         mm.add_dynamic(["Alice", "Bob"], "Old friends")
@@ -53,15 +55,42 @@ def test_memory_updates_by_topic():
         mm = MemoryManager(mf)
         mm.load()
 
-        mm.add_memory("Alice", "Lives in Berlin")
-        assert mm.update_memory("Alice", "Moved to Munich") is True
+        with patch("memory._utc_iso_now", return_value="2026-01-01T00:00:00Z"):
+            mm.add_memory("Alice", "Lives in Berlin")
+        with patch("memory._utc_iso_now", return_value="2026-01-02T00:00:00Z"):
+            assert mm.update_memory("Alice", "Moved to Munich") is True
         assert mm.update_memory("Nonexistent", "Does not matter") is False
 
         all_m = mm.get_all_memories()["memories"]
         assert len(all_m) == 1
         assert all_m[0]["topic"] == "Alice"
         assert all_m[0]["content"] == "Moved to Munich"
-        assert "updated_at" not in all_m[0]
+        # update resets updated_at but keeps the original created_at
+        assert all_m[0]["created_at"] == "2026-01-01T00:00:00Z"
+        assert all_m[0]["updated_at"] == "2026-01-02T00:00:00Z"
+
+
+def test_memory_load_backfills_updated_at_from_created_at():
+    with tempfile.TemporaryDirectory() as td:
+        mf = os.path.join(td, "mem.json")
+        # Legacy file: one fact with created_at but no updated_at, one with neither
+        with open(mf, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": 1,
+                "memories": [
+                    {"id": "mem_legacy", "topic": "Alice", "content": "Lives in Berlin",
+                     "created_at": "2026-01-01T00:00:00Z"},
+                    {"topic": "Bob", "content": "Cyclist"},
+                ],
+                "dynamics": [],
+                "inside_jokes": [],
+            }, f)
+        mm = MemoryManager(mf)
+        mm.load()
+        all_m = mm.get_all_memories()["memories"]
+        assert "id" not in all_m[0]
+        assert all_m[0]["updated_at"] == "2026-01-01T00:00:00Z"
+        assert all_m[1]["updated_at"] == ""
 
 
 def test_memory_discard_by_content_or_topic():
@@ -154,9 +183,21 @@ def test_validate_memory_dict():
     assert cleaned is not None
     assert "id" not in cleaned["memories"][0]
     assert cleaned["memories"][0]["topic"] == "Alice"
-    assert "updated_at" not in cleaned["memories"][0]
+    assert cleaned["memories"][0]["updated_at"] == cleaned["memories"][0]["created_at"]
     assert "id" not in cleaned["dynamics"][0]
     assert "id" not in cleaned["inside_jokes"][0]
+
+    # Explicit updated_at is preserved
+    is_valid, err, cleaned2 = validate_memory_dict({
+        "memories": [
+            {"topic": "Bob", "content": "Cyclist",
+             "created_at": "2026-01-01T00:00:00Z",
+             "updated_at": "2026-02-02T00:00:00Z"}
+        ]
+    })
+    assert is_valid is True
+    assert cleaned2["memories"][0]["created_at"] == "2026-01-01T00:00:00Z"
+    assert cleaned2["memories"][0]["updated_at"] == "2026-02-02T00:00:00Z"
 
     # Non-dict
     is_valid, err, _ = validate_memory_dict(["not", "a", "dict"])

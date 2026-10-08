@@ -129,8 +129,11 @@ def main():
     memory = MemoryManager(params.memory_file)
     memory.load()
 
+    deep_memory = MemoryManager(params.deepmemory_file)
+    deep_memory.load()
+
     llm = LLMClient(params, state)
-    handlers = BotHandlers(params, state, memory, llm)
+    handlers = BotHandlers(params, state, memory, llm, deep_memory)
 
     async def post_init(application: Application) -> None:
         await notify_admins_startup(application, params)
@@ -151,6 +154,7 @@ def main():
         try:
             state.save()
             memory.save()
+            deep_memory.save()
             await llm.close()
             logger.info("Persisted state and memory files.")
         except Exception as e:

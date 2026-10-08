@@ -268,10 +268,21 @@ def parse_schedule_time(time_str: str, tz: Any, now: datetime) -> Optional[datet
 
 
 class BotHandlers:
-    def __init__(self, params: Params, state: StateManager, memory: MemoryManager, llm: LLMClient):
+    def __init__(self, params: Params, state: StateManager, memory: MemoryManager, llm: LLMClient,
+                 deep_memory: Optional[MemoryManager] = None):
         self.params = params
         self.state = state
         self.memory = memory
+        # Deep (cold-tier) memory. When not provided (legacy callers, unit
+        # tests), fall back to an EMPTY in-memory manager bound to the
+        # configured deep-memory path — never the hot file, and not loaded
+        # from disk (it only persists if code explicitly saves it).
+        if deep_memory is None:
+            deep_path = getattr(params, "deepmemory_file", "")
+            if not isinstance(deep_path, str) or not deep_path.strip():
+                deep_path = "pletykas-deepmemory.json"
+            deep_memory = MemoryManager(deep_path)
+        self.deep_memory = deep_memory
         self.llm = llm
         self._debounce_jobs: Dict[int, Any] = {}
         self._active_evaluations: set[int] = set()
