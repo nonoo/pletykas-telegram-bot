@@ -15,10 +15,18 @@ from PIL import Image
 
 from params import Params
 from state import StateManager
+from webtools import (
+    WEB_MAX_FETCHES_PER_TURN,
+    WEB_MAX_SEARCHES_PER_TURN,
+    fetch_url,
+    web_search,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOKENS = 200_000
+
+_WEB_TOOL_TAG_RE = re.compile(r"<(?:WEB_SEARCH|FETCH_URL):\s*[^>]*>", re.IGNORECASE)
 
 # Per-request timeouts that override the shared 120s session default.
 CHAT_TIMEOUT_SEC = 10          # conversational chat/vision: fail fast on the interactive path
@@ -538,21 +546,15 @@ class LLMClient:
         model_name: str,
         contents: Any,
         system_instruction: Optional[str] = None,
-        use_search_grounding: bool = False,
         thinking_level: str = "",
         max_output_tokens: Optional[int] = None,
     ) -> Tuple[str, int, int]:
         """Calls Google GenAI SDK asynchronously."""
         client = self._get_genai_client(api_key)
 
-        tools = None
-        if use_search_grounding and not model_name.lower().startswith("gemma"):
-            tools = [types.Tool(google_search=types.GoogleSearch())]
-
         thinking_config = self._build_thinking_config(thinking_level)
         config_kwargs: Dict[str, Any] = {
             "system_instruction": system_instruction,
-            "tools": tools,
             "thinking_config": thinking_config,
         }
         if max_output_tokens is not None:
@@ -564,8 +566,6 @@ class LLMClient:
                 "contents": str(contents),
                 "system_instruction": system_instruction,
                 "thinking_level": thinking_level,
-                "search_grounding": use_search_grounding and not model_name.lower().startswith("gemma"),
-                "tools": ["google_search"] if (use_search_grounding and not model_name.lower().startswith("gemma")) else None,
                 "max_output_tokens": max_output_tokens,
             }
             self._log_debug_payload(f"GENAI SDK REQUEST ({model_name})", json.dumps(sdk_dbg, indent=2, default=str))
@@ -577,17 +577,7 @@ class LLMClient:
                 config=config,
             )
         except Exception as e:
-            # If search grounding failed or unsupported, disable in state and retry without tools
-            if tools is not None and "search" in str(e).lower():
-                logger.warning("Search grounding failed for model %s: %s. Disabling and retrying...", model_name, e)
-                self.state.set_search_grounding_active(False)
-                config.tools = None
-                response = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
-                )
-            elif config.thinking_config is not None and ("thinking" in str(e).lower() or "budget" in str(e).lower()):
+            if config.thinking_config is not None and ("thinking" in str(e).lower() or "budget" in str(e).lower()):
                 logger.warning("Thinking config not supported for model %s: %s. Retrying without thinking_config...", model_name, e)
                 config.thinking_config = None
                 response = await client.aio.models.generate_content(
@@ -606,16 +596,7 @@ class LLMClient:
             except Exception:
                 raw_resp = str(response)
             raw_clean = raw_resp.rstrip("\r\n")
-            search_queries_str = ""
-            try:
-                if response.candidates:
-                    grounding = getattr(response.candidates[0], "grounding_metadata", None)
-                    queries = getattr(grounding, "web_search_queries", None)
-                    if isinstance(queries, list) and queries:
-                        search_queries_str = f"\n[Google Search Queries: {queries}]"
-            except Exception:
-                pass
-            dbg_text = f"{raw_clean}{search_queries_str}\n{content}" if content else f"{raw_clean}{search_queries_str}"
+            dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
             self._log_debug_payload(f"GENAI SDK RESPONSE ({model_name})", dbg_text)
 
         p_tokens = 0
@@ -759,36 +740,52 @@ class LLMClient:
     def extract_forget(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Public helper to extract <FORGET>...</FORGET> block and strip it from text."""
         return extract_forget(text)
+
+    def _extract_web_tools(self, text: str) -> Tuple[str, List[str], List[str]]:
+        """Extracts <WEB_SEARCH:query> / <FETCH_URL:url> tags and strips them from text."""
+        if not text:
+            return text, [], []
+        queries = [q.strip() for q in re.findall(r"<WEB_SEARCH:\s*([^>]+)>", text, re.IGNORECASE)]
+        urls = [u.strip() for u in re.findall(r"<FETCH_URL:\s*([^>\s]+)>", text, re.IGNORECASE)]
+        cleaned = _WEB_TOOL_TAG_RE.sub("", text)
+        return cleaned.strip(), [q for q in queries if q], [u for u in urls if u]
+
+    async def _run_web_tools(self, queries: List[str], urls: List[str]) -> str:
+        """Executes web searches and page fetches, returning a formatted results block."""
+        session = await self._get_session()
+        sections: List[str] = []
+        for query in queries[:WEB_MAX_SEARCHES_PER_TURN]:
+            results = await web_search(session, query)
+            if not results:
+                sections.append(f'No results found for "{query}".')
+                continue
+            lines = [f'Search results for "{query}":']
+            for index, item in enumerate(results, 1):
+                lines.append(f"{index}. {item.get('title', '')}")
+                lines.append(f"   {item.get('url', '')}")
+                lines.append(f"   {item.get('snippet', '')}")
+            sections.append("\n".join(lines))
+        for url in urls[:WEB_MAX_FETCHES_PER_TURN]:
+            content = await fetch_url(session, url)
+            sections.append(f"Content of {url}:\n{content}" if content else f"Could not fetch {url}.")
+        block = "\n\n".join(sections)
+        self._log_debug_payload("WEB TOOL RESULTS", block)
+        return block
+
     def _check_incapable_retry(self, response_text: str) -> Tuple[bool, str]:
-        """Detects if model indicated it cannot fulfill the request (e.g. needs web search / large model)."""
+        """Detects explicit <RETRY_WITH_LARGE_MODEL> escalation requests."""
         if not response_text:
             return False, ""
 
-        # 1. Explicit tag: <RETRY_WITH_LARGE_MODEL> or <NEED_LARGE_MODEL>
         m = re.search(r"<(?:RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*([^>]*))?>", response_text, re.IGNORECASE)
         if m:
             reason = m.group(1).strip() if m.group(1) else "tag requested large model"
             return True, reason
 
-        # 2. Natural language capability refusals (e.g. web search / real-time data inability)
-        if self.state.is_search_grounding_active():
-            lower = response_text.lower()
-            refusal_patterns = [
-                r"nem tudok (?:rá)?keresni (?:az )?(?:interneten|neten|weben|google)",
-                r"nincs (?:internet-?hozzáférésem|hozzáférésem (?:az )?(?:internethez|nethez|weben|google|valós idejű))",
-                r"nem rendelkezem (?:internetes|valós idejű|internet-?hozzáféréssel)",
-                r"i (?:cannot|can't|am unable to) (?:search|browse|access) (?:the )?(?:web|internet|google)",
-                r"i do(?:n't| not) have (?:access to (?:the )?(?:internet|web|real-time)|internet access)",
-                r"i do(?:n't| not) have real-?time (?:information|data|access)",
-            ]
-            for pat in refusal_patterns:
-                if re.search(pat, lower):
-                    return True, "detected inability to search web / real-time data"
-
         return False, ""
 
 
-    def _build_evaluation_instructions(self, is_direct_trigger: bool, talkativeness: int, can_search: bool = False) -> str:
+    def _build_evaluation_instructions(self, is_direct_trigger: bool, talkativeness: int) -> str:
         if is_direct_trigger:
             trigger_instruction = "You are directly addressed or replied to in the chat. Provide your in-character response to the group now."
         else:
@@ -891,27 +888,27 @@ Options:
 You may include both your in-character text message and the <POLL> block in the same response.
 CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Question:' and 'Options:' and tag names '<POLL>' and '</POLL>' verbatim. NEVER translate these keywords into Hungarian or any other language (e.g. NEVER write 'Kérdés:' or 'Opciók:'), even though the question text and options themselves are in the chat language."""
 
-        if can_search:
-            search_section = """[Real-Time Web Search & Grounding]
-You are equipped with Google Search grounding and have direct access to live, real-time web search.
-When a user asks about current weather, recent events, latest news, live information, or facts beyond your initial knowledge, use your Google Search grounding tool to find the accurate, up-to-date information and incorporate it into your witty, in-character response.
-Do NOT output <RETRY_WITH_LARGE_MODEL> or say you cannot search the internet, because you HAVE real-time search capability."""
-            escalation_rule = ""
-        else:
-            search_section = """[Capability Escalation & Delegation]
-If a user asks for something you are incapable of doing (such as real-time web search or Google Search for up-to-date facts, current news, live sports, weather, recent events, or information beyond your knowledge cutoff), you MUST output:
+        tools_section = """[Web Search & Page Fetch Tools]
+When you need current or external information (weather, news, sports, facts beyond your knowledge), use these tools instead of guessing:
+- To search the web: output `<WEB_SEARCH:your search query>` (e.g. `<WEB_SEARCH:weather Budapest today>`). You may output up to 3 search tags per turn.
+- To read a page: output `<FETCH_URL:https://example.com/page>` to fetch a website's readable text content (e.g. a weather page or article found via search). You may output up to 2 fetch tags per turn.
+Rules: output tool tags WITHOUT any other text in that turn; the tool results will be fed back to you and you then write your normal in-character reply incorporating them. If results are missing or useless, say so in character instead of inventing facts.
+CRITICAL PROTOCOL RULE: You MUST always keep the exact tag names '<WEB_SEARCH:...>' and '<FETCH_URL:...>' verbatim. NEVER translate them."""
+
+        escalation_section = """[Capability Escalation]
+If you cannot fulfill the request because of your own model limits (for example you cannot interpret an attached image), output:
 <RETRY_WITH_LARGE_MODEL>
 or
 <RETRY_WITH_LARGE_MODEL:reason>
-Do not guess, hallucinate, or state that you cannot search the internet or lack tools. Output `<RETRY_WITH_LARGE_MODEL>` so the request is automatically delegated to a capable model with Google Search grounding."""
-            escalation_rule = "\n- If you lack external capabilities or tools to answer (e.g. real-time web/Google search needed), output '<RETRY_WITH_LARGE_MODEL>'."
+Do NOT use this tag for web information needs — use the <WEB_SEARCH:...> / <FETCH_URL:...> tools above instead."""
+        escalation_rule = "\n- If you lack capabilities to answer (e.g. you cannot interpret an attached image), output '<RETRY_WITH_LARGE_MODEL>'."
 
         output_rules = f"""[Output Rules]
 - You MUST select EXACTLY ONE primary action per turn: Output '<NO_REPLY>', OR output a single '<REACTION:emoji>', OR write a short text reply. DO NOT combine a text reply and an emoji reaction in the same response.
 - When scheduling or canceling a reminder via `<SCHEDULE:...>`, you MUST provide an in-character text confirmation in addition to the `<SCHEDULE:...>` block.
 - When clearing or updating memory via `<FORGET>`, you MUST provide an in-character text confirmation in addition to the `<FORGET>` block.
 - When creating a poll via `<POLL>`, you may include an introductory in-character text message in addition to the `<POLL>` block.
-- PROTOCOL KEYWORDS RULE: When using special protocol tags (<GENERATE_IMAGE>, <SCHEDULE:...>, <POLL>, <FORGET>), all tag names and field labels ('Prompt:', 'Caption:', 'Source:', 'Mode:', 'Time:', 'Interval:', 'Start:', 'Description:', 'Question:', 'Options:', 'Facts to Discard:', 'Facts to Update:', 'Dynamics to Discard:', 'Jokes to Discard:', 'Topic:', 'Content:') MUST strictly remain in English verbatim. NEVER translate protocol tags or field labels into the conversation language.
+- PROTOCOL KEYWORDS RULE: When using special protocol tags (<GENERATE_IMAGE>, <SCHEDULE:...>, <POLL>, <FORGET>, <WEB_SEARCH:...>, <FETCH_URL:...>), all tag names and field labels ('Prompt:', 'Caption:', 'Source:', 'Mode:', 'Time:', 'Interval:', 'Start:', 'Description:', 'Question:', 'Options:', 'Facts to Discard:', 'Facts to Update:', 'Dynamics to Discard:', 'Jokes to Discard:', 'Topic:', 'Content:') MUST strictly remain in English verbatim. NEVER translate protocol tags or field labels into the conversation language.
 - STRICT REACTION RULE: Do NOT use <REACTION:emoji> as a passive default. When talkativeness is low, '<NO_REPLY>' MUST be heavily preferred over reacting in 95% of cases. Only react if a message genuinely warrants a strong reaction.
 - To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.
@@ -927,7 +924,9 @@ Do not guess, hallucinate, or state that you cannot search the internet or lack 
 {forget_section}
 
 {poll_section}
-{search_section}
+{tools_section}
+
+{escalation_section}
 
 {output_rules}"""
 
@@ -1000,12 +999,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         image_bytes: Optional[bytes] = None,
     ) -> Tuple[Optional[str], Optional[Tuple[str, Optional[int]]], Optional[Dict[str, str]], Optional[Dict[str, Any]]]:
         """Evaluates conversation and produces in-character text, emoji reaction, and/or image generation spec."""
-        primary_can_search = (
-            self.state.is_search_small_model()
-            and self._is_genai_model(self.params.model_name, self.params.model_api_base)
-            and self.state.is_search_grounding_active()
-        )
-        primary_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=primary_can_search)
+        primary_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
         primary_prompt = self._build_user_content_prompt(memory_context, transcript, primary_instructions)
 
         model_name = self.params.model_name
@@ -1022,7 +1016,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             m_base: str,
             m_tl: str,
             prompt_text: str,
-            can_search: bool,
             img_bytes: Optional[bytes] = None,
         ) -> Tuple[str, int, int]:
             if img_bytes:
@@ -1035,7 +1028,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                         image_bytes=img_bytes,
                         system_prompt=system_prompt,
                         user_content_prompt=prompt_text,
-                        use_search_grounding=can_search,
                     )
                 except Exception as e:
                     logger.warning("Vision call failed on model %s, falling back to text: %s", m_name, e)
@@ -1046,7 +1038,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     model_name=m_name,
                     contents=[prompt_text],
                     system_instruction=f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(m_tl)}",
-                    use_search_grounding=can_search,
                     thinking_level=m_tl,
                 )
             else:
@@ -1065,10 +1056,15 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
 
         # 1. Primary (small) model invocation
         raw_response, prompt_tokens, completion_tokens = await _invoke_model(
-            model_name, api_key, api_base, self.params.model_thinking_level, primary_prompt, primary_can_search, image_bytes
+            model_name, api_key, api_base, self.params.model_thinking_level, primary_prompt, image_bytes
         )
 
-        # 2. Check if primary model indicated incapability (e.g. needs web search / large model)
+        # Tracks the model/prompt that produced the latest response (for the web tool follow-up round)
+        active_model = (model_name, api_key, api_base, self.params.model_thinking_level)
+        active_prompt = primary_prompt
+        active_img_bytes = image_bytes
+
+        # 2. Check if primary model indicated incapability (e.g. cannot interpret image / needs large model)
         needs_retry, retry_reason = self._check_incapable_retry(raw_response)
         if needs_retry:
             large_name = self.params.model_large_name or model_name
@@ -1095,14 +1091,30 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                             except Exception as e:
                                 logger.warning("Failed to decode photo bytes from chat history: %s", e)
 
-            large_can_search = self._is_genai_model(large_name, large_base) and self.state.is_search_grounding_active()
-            large_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=large_can_search)
+            large_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
             large_prompt = self._build_user_content_prompt(memory_context, transcript, large_instructions)
 
             raw_response, prompt_tokens, completion_tokens = await _invoke_model(
-                large_name, large_key, large_base, large_tl, large_prompt, large_can_search, retry_img_bytes
+                large_name, large_key, large_base, large_tl, large_prompt, retry_img_bytes
             )
+            active_model = (large_name, large_key, large_base, large_tl)
+            active_prompt = large_prompt
+            active_img_bytes = retry_img_bytes
 
+        # 3. Web tool round: execute <WEB_SEARCH:...> / <FETCH_URL:...> tags if the model requested tools
+        _, tool_queries, tool_urls = self._extract_web_tools(raw_response)
+        if tool_queries or tool_urls:
+            tool_results = await self._run_web_tools(tool_queries, tool_urls)
+            followup_prompt = (
+                f"{active_prompt}\n\n[Web Tool Results]\n{tool_results}\n\n"
+                "[Instruction]\nThe tool results above answer your tool request. "
+                "Now write your normal in-character reply to the group incorporating them. "
+                "Do NOT output any further <WEB_SEARCH:...> or <FETCH_URL:...> tags in this turn."
+            )
+            raw_response, prompt_tokens, completion_tokens = await _invoke_model(
+                *active_model, followup_prompt, active_img_bytes
+            )
+            raw_response = _WEB_TOOL_TAG_RE.sub("", raw_response)
 
         raw_trimmed = raw_response.strip()
         if raw_trimmed == "<NO_REPLY>":
@@ -1142,7 +1154,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         image_bytes: bytes,
         system_prompt: str,
         user_content_prompt: str,
-        use_search_grounding: bool,
     ) -> Tuple[str, int, int]:
         """Dispatches an image and prompt to either Google GenAI or OpenAI-compatible vision endpoint."""
         thinking_inst = self._get_thinking_instruction(thinking_level)
@@ -1154,7 +1165,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 model_name=model_name,
                 contents=[part, user_content_prompt],
                 system_instruction=system_instruction,
-                use_search_grounding=use_search_grounding,
                 thinking_level=thinking_level,
             )
         else:
@@ -1193,6 +1203,10 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         """Dispatches photo to Large Multimodal Model to generate a reply, reaction, image spec, visual description, and schedule spec."""
         use_large = self.state.is_image_interpretation_large_model()
         raw_response = ""
+        # Tracks the model/prompt/image that produced the latest response (for the web tool follow-up round)
+        active_model: Optional[Tuple[str, str, str, str]] = None
+        active_prompt = ""
+        active_img_bytes = image_bytes
 
         if not use_large:
             # Setting disabled: try interpreting with the primary (small) model first
@@ -1203,12 +1217,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             # Resize image to a smaller dimension to optimize bandwidth/tokens for the small model
             small_image_bytes = compress_image(image_bytes, max_dim=800, quality=80)
 
-            small_can_search = (
-                self.state.is_search_small_model()
-                and self._is_genai_model(small_name, small_base)
-                and self.state.is_search_grounding_active()
-            )
-            small_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=small_can_search)
+            small_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
             small_prompt = self._build_image_evaluation_prompt(memory_context, transcript, caption, small_instructions)
 
             try:
@@ -1221,7 +1230,6 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     image_bytes=small_image_bytes,
                     system_prompt=system_prompt,
                     user_content_prompt=small_prompt,
-                    use_search_grounding=small_can_search,
                 )
                 trimmed = resp_text.strip()
                 needs_retry, retry_reason = self._check_incapable_retry(trimmed)
@@ -1229,6 +1237,9 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     logger.info("Small model requested large model escalation for image interpretation: %s (%s)", trimmed[:80], retry_reason)
                 elif trimmed:
                     raw_response = trimmed
+                    active_model = (small_name, small_key, small_base, small_thinking)
+                    active_prompt = small_prompt
+                    active_img_bytes = small_image_bytes
                     logger.info("Small model successfully interpreted image.")
             except Exception as e:
                 logger.warning("Small model image interpretation failed (%s). Falling back to large model...", e)
@@ -1239,8 +1250,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             large_key = self.params.effective_large_api_key
             large_base = self.params.effective_large_api_base
             large_thinking = self.params.effective_large_thinking_level
-            large_can_search = self._is_genai_model(large_name, large_base) and self.state.is_search_grounding_active()
-            large_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness, can_search=large_can_search)
+            large_instructions = self._build_evaluation_instructions(is_direct_trigger, talkativeness)
             large_prompt = self._build_image_evaluation_prompt(memory_context, transcript, caption, large_instructions)
 
             logger.info("Interpreting image using large model '%s'...", large_name)
@@ -1252,9 +1262,32 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 image_bytes=image_bytes,
                 system_prompt=system_prompt,
                 user_content_prompt=large_prompt,
-                use_search_grounding=large_can_search,
             )
             raw_response = resp_text.strip()
+            active_model = (large_name, large_key, large_base, large_thinking)
+            active_prompt = large_prompt
+            active_img_bytes = image_bytes
+
+        # Web tool round: execute <WEB_SEARCH:...> / <FETCH_URL:...> tags if the model requested tools
+        _, tool_queries, tool_urls = self._extract_web_tools(raw_response)
+        if active_model and (tool_queries or tool_urls):
+            tool_results = await self._run_web_tools(tool_queries, tool_urls)
+            followup_prompt = (
+                f"{active_prompt}\n\n[Web Tool Results]\n{tool_results}\n\n"
+                "[Instruction]\nThe tool results above answer your tool request. "
+                "Now write your normal in-character reply to the group incorporating them. "
+                "Do NOT output any further <WEB_SEARCH:...> or <FETCH_URL:...> tags in this turn."
+            )
+            raw_response, _, _ = await self._call_vision_model(
+                model_name=active_model[0],
+                api_key=active_model[1],
+                api_base=active_model[2],
+                thinking_level=active_model[3],
+                image_bytes=active_img_bytes,
+                system_prompt=system_prompt,
+                user_content_prompt=followup_prompt,
+            )
+            raw_response = _WEB_TOOL_TAG_RE.sub("", raw_response).strip()
 
         raw_trimmed = raw_response.strip()
         cleaned_text, image_description = self._extract_image_description(raw_trimmed)
@@ -1569,7 +1602,6 @@ Rules: Do not refer to yourself as an AI or mention that this is automated. Spea
                     model_name=model_name,
                     contents=[prompt],
                     system_instruction=f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(self.params.model_thinking_level)}",
-                    use_search_grounding=self.state.is_search_grounding_active(),
                     thinking_level=self.params.model_thinking_level,
                 )
             else:
@@ -1637,33 +1669,48 @@ Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak direc
         model_name = self.params.model_name
         api_key = self.params.model_api_key
         api_base = self.params.model_api_base
+        system_instruction = f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(self.params.model_thinking_level)}"
+
+        async def _dispatch(user_prompt: str) -> Tuple[str, int, int]:
+            if self._is_genai_model(model_name, api_base):
+                return await self._call_genai(
+                    api_key=api_key,
+                    model_name=model_name,
+                    contents=[user_prompt],
+                    system_instruction=system_instruction,
+                    thinking_level=self.params.model_thinking_level,
+                )
+            messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_prompt},
+            ]
+            return await self._call_openai_compatible(
+                api_base=api_base,
+                api_key=api_key,
+                model_name=model_name,
+                messages=messages,
+                thinking_level=self.params.model_thinking_level,
+                timeout_sec=CHAT_TIMEOUT_SEC,
+            )
 
         try:
-            if self._is_genai_model(model_name, api_base):
-                raw_response, p_tokens, c_tokens = await self._call_genai(
-                    api_key=api_key,
-                    model_name=model_name,
-                    contents=[prompt],
-                    system_instruction=f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(self.params.model_thinking_level)}",
-                    use_search_grounding=self.state.is_search_grounding_active(),
-                    thinking_level=self.params.model_thinking_level,
+            raw_response, p_tokens, c_tokens = await _dispatch(prompt)
+
+            # Web tool round: execute <WEB_SEARCH:...> / <FETCH_URL:...> tags if the model requested tools
+            _, tool_queries, tool_urls = self._extract_web_tools(raw_response)
+            if tool_queries or tool_urls:
+                tool_results = await self._run_web_tools(tool_queries, tool_urls)
+                followup_prompt = (
+                    f"{prompt}\n\n[Web Tool Results]\n{tool_results}\n\n"
+                    "[Instruction]\nThe tool results above answer your tool request. "
+                    "Now write your normal in-character reply to the group incorporating them. "
+                    "Do NOT output any further <WEB_SEARCH:...> or <FETCH_URL:...> tags in this turn."
                 )
-            else:
-                messages = [
-                    {"role": "system", "content": f"{system_prompt}\n\n[Thinking Instruction]\n{self._get_thinking_instruction(self.params.model_thinking_level)}"},
-                    {"role": "user", "content": prompt},
-                ]
-                raw_response, p_tokens, c_tokens = await self._call_openai_compatible(
-                    api_base=api_base,
-                    api_key=api_key,
-                    model_name=model_name,
-                    messages=messages,
-                    thinking_level=self.params.model_thinking_level,
-                    timeout_sec=CHAT_TIMEOUT_SEC,
-                )
+                raw_response, p_tokens, c_tokens = await _dispatch(followup_prompt)
 
             res = raw_response.strip()
             res = re.sub(r"<(?:NO_REPLY|RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*[^>]*?)?>", "", res, flags=re.IGNORECASE).strip()
+            res = _WEB_TOOL_TAG_RE.sub("", res).strip()
             return res if res else None
         except Exception as e:
             logger.error("Error generating scheduled reply: %s", e)

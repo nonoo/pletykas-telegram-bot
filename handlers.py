@@ -53,12 +53,10 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 /spontaneous_interval [min] [max] - Adjust random timer interval in hours (e.g. /spontaneous_interval 2 4)
 /spontaneous_now - Instantly trigger a spontaneous message or poll to the group
 /scheduled [list|cancel <id>] - View or cancel active scheduled replies and reminders
-<b>Prompt, Grounding & Vision</b>
+<b>Prompt & Vision</b>
 /prompt - Upload system prompt text file as-is
 /prompt load - Expect a system prompt text file upload to validate and load
 /prompt reset - Reset to default persona prompt
-/grounding [on|off] - Toggle Google Search grounding for real-time web info
-/search_small [on|off] - Toggle small model direct web search (ON: small searches directly if capable, OFF: delegates to large model)
 /image_large [on|off] - Toggle instant large model for image interpretation (ON: large instant, OFF: small model first)
 
 <b>Memory Management</b>
@@ -343,13 +341,23 @@ class BotHandlers:
         self.deep_memory = deep_memory
         # Deep-memory retrieval index (sidecar vectors, fixed default filename).
         # Coerce defensively because unit tests may pass Mock params: a Mock
-        # attribute is not a str, and a real non-blank configured model name
-        # must reach the index so model swaps invalidate stale vectors via the
-        # model-mismatch rule.
+        # attribute is not a str/int, and the real configured model name, output
+        # dimension, and endpoint base must all reach the index so config swaps
+        # invalidate stale vectors via the identity check in load().
         embed_model_name = getattr(self.params, "model_embed_name", "")
         if not isinstance(embed_model_name, str) or not embed_model_name.strip():
             embed_model_name = "google/gemini-embedding-2"
-        self.deep_index = DeepMemoryIndex(embed_model=embed_model_name)
+        embed_dim = getattr(self.params, "model_embed_dim", 0)
+        if not isinstance(embed_dim, int) or embed_dim < 0:
+            embed_dim = 0
+        embed_base = getattr(self.params, "effective_embed_api_base", "")
+        if not isinstance(embed_base, str):
+            embed_base = ""
+        self.deep_index = DeepMemoryIndex(
+            embed_model=embed_model_name,
+            embed_dim=embed_dim,
+            embed_base=embed_base,
+        )
         try:
             self.deep_index.load()
         except Exception as e:
@@ -2137,7 +2145,6 @@ class BotHandlers:
         next_spont_dt = self.get_next_spontaneous_time(context)
         next_spont_str = self.state.format_time(next_spont_dt) if next_spont_dt else "None"
         spont_status = f"{'ON' if spont.get('enabled') else 'OFF'} (every {min_h:g}-{max_h:g}h, random) (Next: {next_spont_str})"
-        grounding_status = "ON" if self.state.is_search_grounding_active() else "OFF"
         debug_status = "ON" if self.state.is_debug_mode() else "OFF"
         nicks = self.state.get_nicknames()
         nicks_str = ", ".join(nicks) if nicks else "None"
@@ -2182,8 +2189,6 @@ class BotHandlers:
             f"• Talkativeness: <code>{self.state.get_talkativeness()}/10</code>\n"
             f"• Cooldown: <code>{self.state.get_cooldown_sec()}s</code>\n"
             f"• Nicknames: <code>{html.escape(nicks_str)}</code>\n"
-            f"• Search Grounding: <code>{grounding_status}</code>\n"
-            f"• Small Model Search: <code>{'ON (Direct Search)' if self.state.is_search_small_model() else 'OFF (Delegates to Large Model)'}</code>\n"
             f"• Image Vision Model: <code>{'Large Model (Instant)' if self.state.is_image_interpretation_large_model() else 'Small Model First'}</code>\n"
             f"• Debug Mode: <code>{debug_status}</code>\n"
             f"• Sleep Schedule: <code>{sleep_status}</code>\n"
@@ -2668,28 +2673,6 @@ class BotHandlers:
             ),
             parse_mode=ParseMode.HTML,
         )
-    async def cmd_grounding(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_admin(update.effective_user.id if update.effective_user else None):
-            return
-        if update.effective_chat and update.effective_chat.type != "private":
-            return
-
-        args = context.args or []
-        if not args:
-            cur = "ON" if self.state.is_search_grounding_active() else "OFF"
-            await update.effective_message.reply_text(f"🔍 Google Search Grounding is currently: <b>{cur}</b>", parse_mode=ParseMode.HTML)
-            return
-
-        mode = args[0].lower()
-        if mode == "on":
-            self.state.set_search_grounding_active(True)
-            await update.effective_message.reply_text("✅ Google Search Grounding turned <b>ON</b>.", parse_mode=ParseMode.HTML)
-        elif mode == "off":
-            self.state.set_search_grounding_active(False)
-            await update.effective_message.reply_text("✅ Google Search Grounding turned <b>OFF</b>.", parse_mode=ParseMode.HTML)
-        else:
-            await update.effective_message.reply_text("❌ Usage: <code>/grounding [on|off]</code>", parse_mode=ParseMode.HTML)
-
     async def cmd_debug(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_admin(update.effective_user.id if update.effective_user else None):
             return
@@ -2747,42 +2730,6 @@ class BotHandlers:
                 "❌ Usage: <code>/image_large [on|off]</code>",
                 parse_mode=ParseMode.HTML,
             )
-
-    async def cmd_search_small(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_admin(update.effective_user.id if update.effective_user else None):
-            return
-        if update.effective_chat and update.effective_chat.type != "private":
-            return
-
-        args = context.args or []
-        if not args:
-            cur = "ON" if self.state.is_search_small_model() else "OFF"
-            desc = "Small model searches directly when search grounding is active." if cur == "ON" else "Small model delegates web searches to the large model (with automatic escalation)."
-            await update.effective_message.reply_text(
-                f"🔍 Small Model Web Search is currently: <b>{cur}</b>\n<i>({desc})</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        mode = args[0].lower()
-        if mode == "on":
-            self.state.set_search_small_model(True)
-            await update.effective_message.reply_text(
-                "✅ Small model web search turned <b>ON</b>. Small model will search directly if supported.",
-                parse_mode=ParseMode.HTML,
-            )
-        elif mode == "off":
-            self.state.set_search_small_model(False)
-            await update.effective_message.reply_text(
-                "✅ Small model web search turned <b>OFF</b>. Small model will delegate web searches to the large model.",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await update.effective_message.reply_text(
-                "❌ Usage: <code>/search_small [on|off]</code>",
-                parse_mode=ParseMode.HTML,
-            )
-
 
     async def _process_memory_upload_to_store(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any,
                                               store: MemoryManager, waiting_set: set, label: str) -> bool:
@@ -3015,12 +2962,10 @@ class BotHandlers:
         application.add_handler(CommandHandler(["spontaneous_now", "spontaneousnow"], self.cmd_spontaneous_now))
         application.add_handler(CommandHandler(["spontaneous_interval", "spontaneousinterval"], self.cmd_spontaneous_interval))
         application.add_handler(CommandHandler("prompt", self.cmd_prompt))
-        application.add_handler(CommandHandler("grounding", self.cmd_grounding))
         application.add_handler(CommandHandler("debug", self.cmd_debug))
         application.add_handler(CommandHandler(["image_large", "image_large_model", "imagelarge"], self.cmd_image_large_model))
         application.add_handler(CommandHandler("memories", self.cmd_memories))
         application.add_handler(CommandHandler("deepmemories", self.cmd_deepmemories))
-        application.add_handler(CommandHandler(["search_small", "search_small_model", "searchsmall", "grounding_small"], self.cmd_search_small))
         application.add_handler(CommandHandler("cancel", self.cmd_cancel))
         application.add_handler(CommandHandler("curate", self.cmd_curate))
 

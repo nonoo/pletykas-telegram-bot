@@ -299,11 +299,6 @@ async def test_admin_commands_private_chat(test_setup):
         assert call_kwargs["question"] == "Best programming language?"
         assert len(call_kwargs["options"]) == 3
 
-    # /grounding
-    mock_context.args = ["on"]
-    await handlers.cmd_grounding(mock_update, mock_context)
-    assert s.is_search_grounding_active() is True
-
     # /debug
     mock_context.args = []
     await handlers.cmd_debug(mock_update, mock_context)
@@ -331,18 +326,6 @@ async def test_admin_commands_private_chat(test_setup):
     assert s.is_image_interpretation_large_model() is True
 
 
-    # /search_small
-    mock_context.args = []
-    await handlers.cmd_search_small(mock_update, mock_context)
-    assert "Small Model Web Search is currently" in mock_msg.reply_text.call_args[0][0]
-
-    mock_context.args = ["on"]
-    await handlers.cmd_search_small(mock_update, mock_context)
-    assert s.is_search_small_model() is True
-
-    mock_context.args = ["off"]
-    await handlers.cmd_search_small(mock_update, mock_context)
-    assert s.is_search_small_model() is False
     # /prompt view (downloads prompt document)
     mock_msg.document = None
     mock_msg.reply_document = AsyncMock()
@@ -675,7 +658,6 @@ async def test_status_cmd_shows_next_spontaneous_firing_timestamp(test_setup):
     await handlers.cmd_status(mock_update, mock_context)
     status_reply = mock_msg.reply_text.call_args[0][0]
     assert "• Spontaneous Messages: <code>ON (every 2-4h, random) (Next: 20" in status_reply
-    assert "• Small Model Search: <code>" in status_reply
     assert "  - Larger: <code>" in status_reply
 
     # 3. /spontaneous with no args shows Next Firing timestamp

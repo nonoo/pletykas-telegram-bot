@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import time
@@ -17,7 +18,6 @@ def test_state_load_defaults():
         assert sm.get_timezone() == "UTC"
         assert sm.get_talkativeness() == 5
         assert sm.get_cooldown_sec() == 3
-        assert sm.is_search_grounding_active() is True
         assert sm.is_debug_mode() is False
         assert sm.get_nicknames() == ["pletyi", "pletyo"]
         assert os.path.exists(sf)
@@ -31,7 +31,6 @@ def test_state_atomic_save_reload():
         sm.set_language("English")
         sm.set_talkativeness(9)
         sm.set_cooldown_sec(8)
-        sm.set_search_grounding_active(True)
         sm.set_debug_mode(True)
         sm.set_nicknames(["pletyka", "@pleti", "pletyka"])
 
@@ -40,7 +39,6 @@ def test_state_atomic_save_reload():
         assert sm2.get_language() == "English"
         assert sm2.get_talkativeness() == 9
         assert sm2.get_cooldown_sec() == 8
-        assert sm2.is_search_grounding_active() is True
         assert sm2.is_debug_mode() is True
         assert sm2.get_nicknames() == ["pletyka", "pleti"]
 
@@ -259,26 +257,17 @@ def test_state_image_interpretation_large_model():
         assert sm2.is_image_interpretation_large_model() is True
 
 
-def test_state_search_small_model():
+def test_state_drops_legacy_search_keys():
     with tempfile.TemporaryDirectory() as td:
         sf = os.path.join(td, "state.json")
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "search_grounding": True, "search_small_model": True, "debug": True}, f)
+
         sm = StateManager(sf)
         sm.load()
-        # Disabled by default
-        assert sm.is_search_small_model() is False
-
-        # Toggle on
-        sm.set_search_small_model(True)
-        assert sm.is_search_small_model() is True
-
-        # Reload from disk
-        sm2 = StateManager(sf)
-        sm2.load()
-        assert sm2.is_search_small_model() is True
-
-        # Toggle back off
-        sm2.set_search_small_model(False)
-        assert sm2.is_search_small_model() is False
+        assert "search_grounding" not in sm.data
+        assert "search_small_model" not in sm.data
+        assert sm.is_debug_mode() is True
 
 def test_state_spontaneous_settings():
     with tempfile.TemporaryDirectory() as td:

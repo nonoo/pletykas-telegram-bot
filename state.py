@@ -84,8 +84,6 @@ class StateManager:
             "talkativeness": 5,
             "cooldown_sec": 3,
             "deep_archive_days": 7,
-            "search_grounding": True,
-            "search_small_model": False,
             "image_interpretation_large_model": True,
             "debug": False,
             "nicknames": ["pletyi", "pletyo"],
@@ -296,6 +294,8 @@ class StateManager:
                         loaded[k] = v
                 loaded.pop("llm_usage", None)
                 loaded.pop("stats", None)
+                loaded.pop("search_grounding", None)
+                loaded.pop("search_small_model", None)
                 spont = loaded.get("spontaneous_messages")
                 if not isinstance(spont, dict):
                     loaded["spontaneous_messages"] = {
@@ -508,22 +508,6 @@ class StateManager:
         """Sets the hot-memory archive age threshold in days. 0 disables age-based candidacy."""
         clamped = max(0, int(days))
         self.data["deep_archive_days"] = clamped
-        self.save()
-
-    # Search Grounding
-    def is_search_grounding_active(self) -> bool:
-        return bool(self.data.get("search_grounding", False))
-
-    def set_search_grounding_active(self, active: bool) -> None:
-        self.data["search_grounding"] = bool(active)
-        self.save()
-
-    # Small Model Search Selection
-    def is_search_small_model(self) -> bool:
-        return bool(self.data.get("search_small_model", False))
-
-    def set_search_small_model(self, active: bool) -> None:
-        self.data["search_small_model"] = bool(active)
         self.save()
 
     # Image Interpretation Model Selection

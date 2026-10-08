@@ -14,11 +14,11 @@ This document outlines the architecture, design principles, invariants, and impl
 3. **Pure LLM Autonomy**: The model decides when to speak, when to react with an emoji, when to request image generation, and when to remain completely silent using `<NO_REPLY>`.
 4. **Debounced Cooldown Batching**: When messages arrive in the group, a debounce timer (`cooldown_sec`, default: 3s) is started or reset. Only when the conversation pauses for `cooldown_sec` seconds does background LLM evaluation execute. Direct triggers (`@mention`, bot name, username, nicknames, or replies to the bot) bypass debounce and evaluate immediately.
 5. **No Indicator Leaks**: `ChatAction.TYPING` is never sent. `ChatAction.UPLOAD_PHOTO` is sent strictly during image generation/editing when the model outputs `<GENERATE_IMAGE>`.
-6. **Capability Escalation & Retry**: When the primary (small) model lacks capabilities to fulfill a request (e.g. real-time Google Search), it outputs `<RETRY_WITH_LARGE_MODEL>`. The LLM client intercepts this signal and automatically retries using the large model with Google Search grounding active.
+6. **Capability Escalation & Retry**: When the primary (small) model lacks a capability of its own (e.g. vision), it outputs `<RETRY_WITH_LARGE_MODEL>`. The LLM client intercepts this signal and automatically retries the request with the large model. Web information needs are handled by the web tools (invariant 10), never by escalation.
 7. **Telegram HTML Markdown**: The effective system prompt enforces Telegram HTML markdown restricted strictly to `b`, `i`, `u`, `s`, `a`, `code`, and `blockquote`, while prohibiting other tags and LaTeX. It also instructs the model never to send the same or nearly identical message twice in a row. This is enforced in code as well: every text dispatch (conversational replies, scheduled replies, spontaneous messages, error fallbacks) is checked against the bot's own previous group message, and a reply whose normalized text is identical or at least 90% similar is suppressed instead of sent. Message dispatches render with `ParseMode.HTML` with automatic fallback to plain text if malformed tags occur.
 8. **Image Interpretation Model Selection**: Controlled by the `image_interpretation_large_model` state setting (default: `True`). When `True`, the large vision model is used directly and immediately without attempting the small model. When toggled to `False` (via `/image_large off`), the small model is tried first with resized/compressed images, with automatic fallback to the large model if it fails or signals `<RETRY_WITH_LARGE_MODEL>`.
 9. **Debug Mode Streaming**: Controlled by the `debug` state setting (toggled via `/debug [on|off]`). When active, raw LLM request/response payloads, all incoming Telegram group messages (with sender, IDs, media type, and content), and all outgoing Telegram group dispatches (replies, photos, polls, reactions) are printed directly to stdout with structured banners.
-10. **Small Model Direct Web Search Selection**: Controlled by the `search_small_model` state setting (default: `False`, toggled via `/search_small [on|off]`). When `False`, the small model delegates web searches via `<RETRY_WITH_LARGE_MODEL>` to the large model. When toggled to `True`, the small model is granted search grounding directly (if supported by its provider), searching and replying in one step.
+10. **Provider-Independent Web Tools**: Every model on every transport can search the web and read pages via protocol tags: `<WEB_SEARCH:query>` (executed against DuckDuckGo's HTML endpoint) and `<FETCH_URL:url>` (readable page text). The LLM client executes the tags in exactly one follow-up tool round (capped at 3 searches and 2 fetches per turn), feeds a `[Web Tool Results]` block back, and strips any leftover tool tags from the final reply. Failures degrade to "No results found" / "Could not fetch" inside the follow-up — never an exception or user-visible error. No search-related state settings or admin commands exist.
 11. **Two-Tier Memory**: Permanent knowledge lives in a hot store (`pletykas-memory.json`) and a cold deep store (`pletykas-deepmemory.json`, identical schema). Curation demotes hot facts older than `deep_archive_days` (state key, default `7`, adjustable via `/archive_age`; `0` disables age-based archiving) and moves entries between tiers on LLM request. Deep entries are auto-retrieved by embedding similarity over an OpenAI-compatible `/embeddings` route (default model `google/gemini-embedding-2`, OpenRouter-ready via `MODEL_EMBED_*`), backed by a hash-keyed sidecar vector cache; any embedding failure degrades to no injection (never blocks evaluation). Vision is excluded: incoming photos bypass deep recall in v1.
 
 ---
@@ -33,6 +33,7 @@ pletykas-telegram-bot/
 ├── memory.py                   # MemoryManager: atomic persistence of pletykas-memory.json, schema validation, backup rotation
 ├── deepmem.py                  # DeepMemoryIndex: embedding sidecar cache + cosine retrieval for the deep tier
 ├── llm.py                      # Multi-model client: Google GenAI + OpenAI-compatible endpoints, tag parsing
+├── webtools.py                 # DuckDuckGo HTML search parsing + page fetch/text extraction for web tool tags
 ├── handlers.py                 # BotHandlers: message ingestion, debounce, dispatch, admin slash commands, spontaneous revival
 ├── requirements.txt            # Python dependencies
 ├── pytest.ini                  # Pytest configuration
@@ -51,6 +52,7 @@ pletykas-telegram-bot/
     ├── test_deepmem.py         # Unit tests for embedding cache sync/query and sidecar IO
     ├── test_llm.py             # Unit tests for image compression, tag extraction, memory curation
     ├── test_handlers.py        # Unit tests for message handling, debounce, admin commands
+    ├── test_webtools.py        # Unit tests for DuckDuckGo parsing, HTML text extraction, fetch guards
     └── smoke_test.py           # End-to-end integration test
 ```
 
@@ -68,8 +70,6 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
   "timezone": "Europe/Budapest",
   "talkativeness": 5,
   "cooldown_sec": 3,
-  "search_grounding": false,
-  "search_small_model": false,
   "image_interpretation_large_model": true,
   "debug": false,
   "nicknames": [
@@ -172,6 +172,8 @@ Managed by `MemoryManager` (same schema, validation, and daily 3-file backup rot
   </GENERATE_IMAGE>
   ```
 - `<IMAGE_DESCRIPTION>`: Generated by the multimodal large model when processing incoming photos; stored into history to give subsequent text models context.
+- `<WEB_SEARCH:query>`: Requests a web search. Executed by the bot against `html.duckduckgo.com` (never by the model provider); up to 3 per turn, results injected as a `[Web Tool Results]` block in one follow-up round.
+- `<FETCH_URL:url>`: Requests the readable text of an `http(s)` page (e.g. a weather page found via search). Up to 2 per turn; only `text/html` / `text/*` responses under the byte cap are accepted, anything else degrades to "Could not fetch".
 - `<POLL>`: Formats a Telegram poll for spontaneous chat revival, conversational replies, or scheduled messages:
   ```text
   <POLL>

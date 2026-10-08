@@ -218,15 +218,13 @@ async def test_evaluate_and_reply_no_reply_behavior():
 def test_check_incapable_retry():
     p = Params()
     s = StateManager("test.json")
-    s.set_search_grounding_active(True)
     client = LLMClient(p, s)
 
     assert client._check_incapable_retry("<RETRY_WITH_LARGE_MODEL>")[0] is True
-    assert client._check_incapable_retry("<RETRY_WITH_LARGE_MODEL: Google Search needed>")[1] == "Google Search needed"
+    assert client._check_incapable_retry("<RETRY_WITH_LARGE_MODEL: needs vision>")[1] == "needs vision"
     assert client._check_incapable_retry("<NEED_LARGE_MODEL>")[0] is True
-    assert client._check_incapable_retry("Sajnos nem tudok rákeresni az interneten a mai meccsre.")[0] is True
-    assert client._check_incapable_retry("Nincs internet-hozzáférésem ehhez a kéréshez.")[0] is True
-    assert client._check_incapable_retry("I cannot search the web for real-time information.")[0] is True
+    assert client._check_incapable_retry("Sajnos nem tudok rákeresni az interneten a mai meccsre.")[0] is False
+    assert client._check_incapable_retry("I cannot search the web for real-time information.")[0] is False
     assert client._check_incapable_retry("Szia, nagyon szép napunk van ma!")[0] is False
     assert client._check_incapable_retry("<NO_REPLY>")[0] is False
 
@@ -251,11 +249,11 @@ async def test_evaluate_and_reply_retries_with_large_model():
         if call_count == 1:
             assert model_name == "fast-small-model"
             assert api_key == "small-key"
-            return "<RETRY_WITH_LARGE_MODEL: needs google search>", 10, 5
+            return "<RETRY_WITH_LARGE_MODEL: needs vision>", 10, 5
         else:
             assert model_name == "smart-large-model"
             assert api_key == "large-key"
-            return "Here is the live search result from the web!", 50, 20
+            return "Here is the large model answer!", 50, 20
 
     with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)):
         text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
@@ -266,107 +264,120 @@ async def test_evaluate_and_reply_retries_with_large_model():
             is_direct_trigger=True,
         )
         assert call_count == 2
-        assert text == "Here is the live search result from the web!"
+        assert text == "Here is the large model answer!"
 
-@pytest.mark.asyncio
-async def test_evaluate_and_reply_retries_with_genai_search_grounding():
+def test_extract_web_tools():
     p = Params()
-    p.model_name = "deepseek-flash"
-    p.model_api_base = "https://api.deepseek.com"
-    p.model_api_key = "deepseek-key"
-    p.model_large_name = "gemini-3.5-flash-lite"
-    p.model_large_api_base = ""
-    p.model_large_api_key = "google-key"
     s = StateManager("test.json")
-    s.set_search_grounding_active(True)
     client = LLMClient(p, s)
 
-    # 1. Primary model (deepseek-flash, openai-compatible) receives prompt with Capability Escalation
+    cleaned, queries, urls = client._extract_web_tools(
+        "Nézzük meg! <WEB_SEARCH:weather Budapest today> <fetch_url:https://example.com/page>"
+    )
+    assert cleaned == "Nézzük meg!"
+    assert queries == ["weather Budapest today"]
+    assert urls == ["https://example.com/page"]
+
+    cleaned2, queries2, urls2 = client._extract_web_tools("<WEB_SEARCH:   > <WEB_SEARCH:a> <WEB_SEARCH:b>")
+    assert cleaned2 == ""
+    assert queries2 == ["a", "b"]
+    assert urls2 == []
+
+    assert client._extract_web_tools("plain reply") == ("plain reply", [], [])
+    assert client._extract_web_tools("") == ("", [], [])
+
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_runs_one_web_tool_round():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_api_base = "https://small.api.com"
+    p.model_api_key = "small-key"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    prompts = []
+
     async def mock_call_openai(api_base, api_key, model_name, messages, **kwargs):
-        user_msg = messages[-1]["content"]
-        assert "[Capability Escalation & Delegation]" in user_msg
-        assert "<RETRY_WITH_LARGE_MODEL>" in user_msg
-        return "<RETRY_WITH_LARGE_MODEL: Élő időjárás-lekérdezés Budakeszire>", 10, 5
+        prompts.append(messages[-1]["content"])
+        if len(prompts) == 1:
+            return "Fogalmam sincs. <WEB_SEARCH:weather Budapest today>", 10, 5
+        return "Budapesten 17 fok van! ☀️", 20, 10
 
-    # 2. Large model (gemini-3.5-flash-lite, genai) receives prompt with Real-Time Web Search & Grounding
-    async def mock_call_genai(api_key, model_name, contents, system_instruction, use_search_grounding, **kwargs):
-        assert model_name == "gemini-3.5-flash-lite"
-        assert use_search_grounding is True
-        prompt = contents[0]
-        assert "[Real-Time Web Search & Grounding]" in prompt
-        assert "Do NOT output <RETRY_WITH_LARGE_MODEL>" in prompt
-        assert "[Capability Escalation & Delegation]" not in prompt
-        return "Budakeszin most 17 fok van!", 20, 10
-
+    tool_block = 'Search results for "weather Budapest today":\n1. Időkép\n   https://www.idokep.hu/\n   17°C'
     with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)), \
-         patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
+         patch.object(client, "_run_web_tools", AsyncMock(return_value=tool_block)) as mock_tools:
         text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
-            transcript="pletyi, keress ra a neten, milyen most az idojaras budakeszin",
+            transcript="milyen idő van Budapesten?",
             bot_username="pletykas_bot",
             is_direct_trigger=True,
         )
-        assert text == "Budakeszin most 17 fok van!"
+
+    mock_tools.assert_awaited_once_with(["weather Budapest today"], [])
+    assert len(prompts) == 2
+    assert "[Web Tool Results]" in prompts[1]
+    assert "https://www.idokep.hu/" in prompts[1]
+    assert text == "Budapesten 17 fok van! ☀️"
+
 
 @pytest.mark.asyncio
-async def test_evaluate_and_reply_small_model_search_toggle():
+async def test_evaluate_and_reply_without_tool_tags_skips_tool_round():
     p = Params()
-    p.model_name = "gemini-3.5-flash-lite"
-    p.model_api_base = ""
-    p.model_api_key = "google-key"
-    p.model_large_name = "gemini-1.5-pro"
-    p.model_large_api_base = ""
-    p.model_large_api_key = "google-key"
+    p.model_name = "small-model"
+    p.model_api_base = "https://small.api.com"
+    p.model_api_key = "small-key"
     s = StateManager("test.json")
-    s.set_search_grounding_active(True)
     client = LLMClient(p, s)
 
-    # 1. search_small_model is False by default: primary model receives can_search=False
-    call_records = []
-    async def mock_call_genai(api_key, model_name, contents, system_instruction, use_search_grounding, **kwargs):
-        call_records.append((model_name, use_search_grounding, contents[0]))
-        if model_name == "gemini-3.5-flash-lite":
-            assert use_search_grounding is False
-            assert "[Capability Escalation & Delegation]" in contents[0]
-            return "<RETRY_WITH_LARGE_MODEL: Live search>", 10, 5
-        else:
-            assert model_name == "gemini-1.5-pro"
-            assert use_search_grounding is True
-            assert "[Real-Time Web Search & Grounding]" in contents[0]
-            return "Large model search result", 20, 10
+    async def mock_call_openai(api_base, api_key, model_name, messages, **kwargs):
+        return "Szia! Milyen szép nap van ma!", 10, 5
 
-    with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai)):
+    with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)), \
+         patch.object(client, "_run_web_tools", AsyncMock()) as mock_tools:
         text, _, _, _ = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
-            transcript="search weather",
+            transcript="szia",
             bot_username="pletykas_bot",
             is_direct_trigger=True,
         )
-        assert text == "Large model search result"
-        assert len(call_records) == 2
 
-    # 2. search_small_model turned ON: primary model searches directly in 1 step
-    s.set_search_small_model(True)
-    call_records.clear()
-    async def mock_call_genai_direct(api_key, model_name, contents, system_instruction, use_search_grounding, **kwargs):
-        call_records.append((model_name, use_search_grounding, contents[0]))
-        assert model_name == "gemini-3.5-flash-lite"
-        assert use_search_grounding is True
-        assert "[Real-Time Web Search & Grounding]" in contents[0]
-        return "Direct small model search result", 15, 8
+    mock_tools.assert_not_awaited()
+    assert text == "Szia! Milyen szép nap van ma!"
 
-    with patch.object(client, "_call_genai", AsyncMock(side_effect=mock_call_genai_direct)):
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_strips_tool_tags_from_followup():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_api_base = "https://small.api.com"
+    p.model_api_key = "small-key"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    prompts = []
+
+    async def mock_call_openai(api_base, api_key, model_name, messages, **kwargs):
+        prompts.append(messages[-1]["content"])
+        if len(prompts) == 1:
+            return "<FETCH_URL:https://example.com/page>", 10, 5
+        return "Itt a tartalom! <WEB_SEARCH:more> <FETCH_URL:https://example.com/other>", 20, 10
+
+    with patch.object(client, "_call_openai_compatible", AsyncMock(side_effect=mock_call_openai)), \
+         patch.object(client, "_run_web_tools", AsyncMock(return_value="Content of https://example.com/page:\nHello")):
         text, _, _, _ = await client.evaluate_and_reply(
             system_prompt="sys",
             memory_context="mem",
-            transcript="search weather",
+            transcript="olvasd el",
             bot_username="pletykas_bot",
             is_direct_trigger=True,
         )
-        assert text == "Direct small model search result"
-        assert len(call_records) == 1
+
+    # Exactly one tool round: the follow-up's own tool tags are stripped, never executed
+    assert len(prompts) == 2
+    assert text == "Itt a tartalom!"
 @pytest.mark.asyncio
 async def test_evaluate_and_reply_retries_with_large_model_and_chat_history_image():
     import base64
@@ -796,34 +807,6 @@ async def test_generate_image_gemini_interactions_sdk():
         assert mock_debug_log.call_count >= 2
         req_call = mock_debug_log.call_args_list[0]
         assert "Google Interactions SDK: models/gemini-3.1-flash-lite-image" in req_call[0][0]
-
-@pytest.mark.asyncio
-async def test_debug_mode_genai_response_with_search_queries(capsys):
-    p = Params()
-    s = StateManager("test.json")
-    s.set_debug_mode(True)
-    client = LLMClient(p, s)
-
-    mock_candidate = MagicMock()
-    mock_candidate.grounding_metadata.web_search_queries = ["weather in Budakeszi"]
-    mock_resp = MagicMock()
-    mock_resp.text = "17 degrees in Budakeszi!"
-    mock_resp.candidates = [mock_candidate]
-    mock_resp.model_dump_json.return_value = '{"candidates": [{"content": "raw"}]}'
-    mock_resp.usage_metadata.prompt_token_count = 15
-    mock_resp.usage_metadata.candidates_token_count = 8
-
-    mock_genai_client = AsyncMock()
-    mock_genai_client.aio.models.generate_content = AsyncMock(return_value=mock_resp)
-
-    with patch.object(client, "_get_genai_client", return_value=mock_genai_client):
-        content, p_tok, c_tok = await client._call_genai(
-            "api-key", "gemini-3.5-flash-lite", [{"role": "user", "parts": ["hi"]}], use_search_grounding=True
-        )
-        assert content == "17 degrees in Budakeszi!"
-        captured = capsys.readouterr()
-        assert "[Google Search Queries: ['weather in Budakeszi']]" in captured.out
-
 
 def test_extract_schedule():
     p = Params()

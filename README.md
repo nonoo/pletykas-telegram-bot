@@ -17,7 +17,8 @@ An autonomous, multi-modal Telegram group chatbot designed to seamlessly integra
 - **Dynamic Memory Management**: Automatically distills facts, group dynamics, and inside jokes every 20 messages into `pletykas-memory.json` with rolling `.bak` backups.
 - **Two-Tier Memory**: Aging facts are demoted to a deep store (`pletykas-deepmemory.json`); relevant deep entries are recalled automatically by embedding similarity and injected into the prompt only when they clear the relevance threshold.
 - **Quiet Hours & Chat Revival**: Optional sleep schedule (`/sleep`) and unprompted conversational revival with polls or banter (`/spontaneous`).
-- **Capability Escalation & Retry**: The fast primary model automatically escalates to the large model (`<RETRY_WITH_LARGE_MODEL>`) when real-time web search or capabilities beyond its reach are needed.
+- **Web Search & Page Fetch Tools**: Any model can search the web (`<WEB_SEARCH:query>`, executed against DuckDuckGo) and read pages (`<FETCH_URL:url>`); the bot runs the tags and feeds the results back in one follow-up round — provider-independent, with no search settings.
+- **Capability Escalation & Retry**: The fast primary model automatically escalates to the large model (`<RETRY_WITH_LARGE_MODEL>`) when a capability beyond its own reach is needed (e.g. image interpretation).
 - **Autonomous Scheduled Replies & Reminders**: The LLM can autonomously schedule one-shot or periodic reminders/checks (`<SCHEDULE:oneshot>`, `<SCHEDULE:periodic>`). Timers persist across restarts in `pletykas-sched.json` and are viewable/cancellable via `/scheduled`.
 
 ---
@@ -103,8 +104,6 @@ podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-tel
 | `/spontaneous_now` | — | Instantly generates and dispatches a spontaneous message or poll to the group |
 | `/scheduled` | `[list\|cancel <id>]` | Views active scheduled reminders or cancels a specific timer by ID |
 | `/prompt` | `[load\|reset]` | Uploads system prompt file as-is, expects a text file upload to replace prompt, or resets to default |
-| `/grounding` | `[on\|off]` | Toggles Google Search grounding tool |
-| `/search_small` | `[on\|off]` | Toggles whether small model uses search grounding directly (default: `OFF` delegates to large model) |
 | `/image_large` | `[on\|off]` | Toggles large model for image interpretation (default: `ON` instant large model; `OFF` tries small model first) |
 | `/debug` | `[on\|off]` | Toggles debug streaming to stdout (raw LLM payloads and Telegram group messages) |
 | `/memories` | `[load]` | Uploads memories JSON file as-is, or enters waiting mode to validate and load an uploaded JSON file |
