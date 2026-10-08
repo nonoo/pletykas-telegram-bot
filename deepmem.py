@@ -14,9 +14,14 @@ from typing import Any, Callable, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Cosine threshold, calibrated 2026-10-08 against the live store with gemini-embedding-2:
-# unrelated queries scored <=0.596, relevant ones >=0.688 (n=10). Re-tune if the embed model changes.
-DEEPMEM_MIN_SCORE = 0.62
+# Cosine threshold, calibrated 2026-10-08 against the live deep store (155 entries).
+# perplexity/pplx-embed-v1-0.6b (OpenRouter): an unrelated probe tops out at 0.19,
+# topic-relevant facts score 0.16-0.58, real group-message queries 0.18-0.55; 0.40
+# fires on the confident half of real queries. The model's scale sits ~0.3 below the
+# gemini family, where the same probes scored 0.62-0.89 (gemini-embedding-001) and the
+# prior gemini-embedding-2 calibration used 0.62 (unrelated <=0.596, relevant >=0.688).
+# Re-tune whenever the embed model changes.
+DEEPMEM_MIN_SCORE = 0.40
 DEEPMEM_TOP_K = 3
 
 

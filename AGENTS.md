@@ -149,7 +149,7 @@ Managed by `MemoryManager` via atomic replacement:
 Managed by `MemoryManager` (same schema, validation, and daily 3-file backup rotation as the hot store) plus `DeepMemoryIndex` for the vector sidecar:
 - `pletykas-deepmemory.json`: identical schema to `pletykas-memory.json`. Populated by age-based demotion and LLM-driven moves in both directions; `/deepmemories` downloads it as-is, `/deepmemories load` validates and applies an uploaded file (then re-embeds in a background thread).
 - `pletykas-deepmemory-embeddings.json`: `{"model": "<embed model>", "dim": <output dim, 0 = provider default>, "base": "<effective /embeddings base>", "vectors": {"<sha256 of section+text+created_at>": [floats]}}`. Purely a regenerable cache: no backup rotation, discarded wholesale when the embedding identity (model, dim, or base) changes or on malformed JSON, synced after tier moves and via an idempotent startup backfill. Dimension is part of the identity because old-width vectors are silently skipped at query time and `sync()` never re-embeds hashes that are already present.
-- Retrieval: cosine top-k (`DEEPMEM_TOP_K = 3`) above `DEEPMEM_MIN_SCORE` (0.62, calibrated for `gemini-embedding-2`); hits are injected as a `[Recalled Deep Memory]` block. Any failure (HTTP error, count/dimension mismatch, empty vectors) logs a warning and injects nothing.
+- Retrieval: cosine top-k (`DEEPMEM_TOP_K = 3`) above `DEEPMEM_MIN_SCORE` (0.40, calibrated 2026-10-08 for `perplexity/pplx-embed-v1-0.6b` on OpenRouter; the gemini family's scale needs ~0.62); hits are injected as a `[Recalled Deep Memory]` block. Any failure (HTTP error, count/dimension mismatch, empty vectors) logs a warning and injects nothing.
 
 ---
 
