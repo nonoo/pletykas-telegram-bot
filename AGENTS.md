@@ -19,6 +19,7 @@ This document outlines the architecture, design principles, invariants, and impl
 8. **Image Interpretation Model Selection**: Controlled by the `image_interpretation_large_model` state setting (default: `True`). When `True`, the large vision model is used directly and immediately without attempting the small model. When toggled to `False` (via `/image_large off`), the small model is tried first with resized/compressed images, with automatic fallback to the large model if it fails or signals `<RETRY_WITH_LARGE_MODEL>`.
 9. **Debug Mode Streaming**: Controlled by the `debug` state setting (toggled via `/debug [on|off]`). When active, raw LLM request/response payloads, all incoming Telegram group messages (with sender, IDs, media type, and content), and all outgoing Telegram group dispatches (replies, photos, polls, reactions) are printed directly to stdout with structured banners.
 10. **Small Model Direct Web Search Selection**: Controlled by the `search_small_model` state setting (default: `False`, toggled via `/search_small [on|off]`). When `False`, the small model delegates web searches via `<RETRY_WITH_LARGE_MODEL>` to the large model. When toggled to `True`, the small model is granted search grounding directly (if supported by its provider), searching and replying in one step.
+11. **Two-Tier Memory**: Permanent knowledge lives in a hot store (`pletykas-memory.json`) and a cold deep store (`pletykas-deepmemory.json`, identical schema). Curation demotes hot facts older than `deep_archive_days` (state key, default `7`, adjustable via `/archive_age`; `0` disables age-based archiving) and moves entries between tiers on LLM request. Deep entries are auto-retrieved by embedding similarity over an OpenAI-compatible `/embeddings` route (default model `google/gemini-embedding-2`, OpenRouter-ready via `MODEL_EMBED_*`), backed by a hash-keyed sidecar vector cache; any embedding failure degrades to no injection (never blocks evaluation). Vision is excluded: incoming photos bypass deep recall in v1.
 
 ---
 
@@ -86,10 +87,12 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
     "max_hours": 4.0,
     "next_fire_time": null
   },
-  "messages_since_last_curation": 0
+  "messages_since_last_curation": 0,
+  "deep_archive_days": 7
 }
 ```
 - `spontaneous_messages`: Periodic revival timer (`min_hours` to `max_hours`). Whenever a Telegram message arrives in the group, a new random timestamp is rolled and rescheduled to reset the revival window. The scheduled timestamp (`next_fire_time`) is persisted in state and resumes on restart.
+- `deep_archive_days`: Age in days after which hot **facts** are demoted to the deep store during curation (`0` disables; adjusted via `/archive_age`). The age basis is `updated_at` (falling back to `created_at`); dynamics and jokes are never age-archived.
 
 ### Chat History (`pletykas-chathistory.json`)
 Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
@@ -117,7 +120,8 @@ Managed by `MemoryManager` via atomic replacement:
     {
       "topic": "Alice",
       "content": "Lives in Berlin and works with Rust.",
-      "created_at": "2026-09-25T12:00:00Z"
+      "created_at": "2026-09-25T12:00:00Z",
+      "updated_at": "2026-09-25T12:00:00Z"
     }
   ],
   "dynamics": [
@@ -137,8 +141,15 @@ Managed by `MemoryManager` via atomic replacement:
 }
 ```
 - ID-Free Schema: Memory entries are organized cleanly without artificial identifier tokens (`mem_1`, etc.).
+- Archive-Age Clock: Facts carry `updated_at` (refreshed whenever their content changes), which resets the age-based demotion clock; dynamics and jokes have no age clock.
 - File Upload Administration: `/memories` uploads the JSON file as-is; `/memories load` validates and applies user-uploaded JSON files. Similarly, `/prompt` uploads the system prompt text file as-is; `/prompt load` validates and applies user-uploaded text files.
 - Backups: Rotated automatically before commits, keeping the 20 most recent `.bak` files.
+
+### Deep Memory (`pletykas-deepmemory.json` + `pletykas-deepmemory-embeddings.json`)
+Managed by `MemoryManager` (same schema, validation, and 20-file backup rotation as the hot store) plus `DeepMemoryIndex` for the vector sidecar:
+- `pletykas-deepmemory.json`: identical schema to `pletykas-memory.json`. Populated by age-based demotion and LLM-driven moves in both directions; `/deepmemories` downloads it as-is, `/deepmemories load` validates and applies an uploaded file (then re-embeds in a background thread).
+- `pletykas-deepmemory-embeddings.json`: `{"model": "<embed model>", "vectors": {"<sha256 of section+text+created_at>": [floats]}}`. Purely a regenerable cache: no backup rotation, discarded wholesale on model mismatch or malformed JSON, synced after tier moves and via an idempotent startup backfill.
+- Retrieval: cosine top-k (`DEEPMEM_TOP_K = 3`) above `DEEPMEM_MIN_SCORE` (0.62, calibrated for `gemini-embedding-2`); hits are injected as a `[Recalled Deep Memory]` block. Any failure (HTTP error, count/dimension mismatch, empty vectors) logs a warning and injects nothing.
 
 ---
 
