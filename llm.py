@@ -1439,6 +1439,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     resp_text = await resp.text()
                     if self.state.is_debug_mode():
                         self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
+                    if resp.status != 200:
                         raise RuntimeError(f"Google Interactions API error {resp.status}: {resp_text}")
                     res_json = json.loads(resp_text)
                 img_bytes = self._extract_image_from_interaction(res_json)
@@ -1500,6 +1501,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     resp_text = await resp.text()
                     if self.state.is_debug_mode():
                         self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
+                    if resp.status != 200:
                         raise RuntimeError(f"OpenAI image generation error {resp.status}: {resp_text}")
                     res = json.loads(resp_text)
 

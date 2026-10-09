@@ -882,6 +882,66 @@ async def test_generate_image_gemini_interactions_sdk():
         req_call = mock_debug_log.call_args_list[0]
         assert "Google Interactions SDK: models/gemini-3.1-flash-lite-image" in req_call[0][0]
 
+
+@pytest.mark.asyncio
+async def test_generate_image_gemini_interactions_rest_debug_mode():
+    p = Params()
+    p.model_image_name = "gemini-3.1-flash-lite-image"
+    p.model_image_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    p.model_image_api_key = "img-key"
+    s = StateManager("test.json")
+    s.set_debug_mode(True)
+    client = LLMClient(p, s)
+
+    # HTTP 200 must succeed while debug logging is active
+    body = json.dumps({"steps": [{"type": "model_output", "content": [
+        {"type": "image", "data": base64.b64encode(b"rest-img-bytes").decode("utf-8")},
+    ]}]})
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)), patch.object(client, "_log_debug_payload"):
+        assert await client.generate_image("A futuristic city") == b"rest-img-bytes"
+    assert session.post.call_args.args[0].startswith("https://generativelanguage.googleapis.com/v1beta/interactions?key=")
+
+    # Provider errors still raise in debug mode
+    session = _fake_session(lambda url, **kw: _embedding_resp(500, "boom"))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)), patch.object(client, "_log_debug_payload"):
+        with pytest.raises(RuntimeError, match="Google Interactions API error 500"):
+            await client.generate_image("A futuristic city")
+
+
+@pytest.mark.asyncio
+async def test_generate_image_openai_route_debug_mode():
+    p = Params()
+    p.model_image_name = "openai/gpt-image-1"
+    p.model_image_api_base = "https://api.test/v1"
+    p.model_image_api_key = "img-key"
+    s = StateManager("test.json")
+    s.set_debug_mode(True)
+    client = LLMClient(p, s)
+
+    # HTTP 200 must succeed while debug logging is active (both generation and edit)
+    gen_body = json.dumps({"data": [{"b64_json": base64.b64encode(b"gen-bytes").decode()}]})
+    session = _fake_session(lambda url, **kw: _embedding_resp(200, gen_body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)), patch.object(client, "_log_debug_payload"):
+        assert await client.generate_image("a cat") == b"gen-bytes"
+    assert session.post.call_args.args[0] == "https://api.test/v1/images/generations"
+
+    edit_resp = MagicMock(
+        status=200,
+        json=AsyncMock(return_value={"data": [{"b64_json": base64.b64encode(b"edited-bytes").decode()}]}),
+    )
+    session = _fake_session(lambda url, **kw: edit_resp)
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)), patch.object(client, "_log_debug_payload"):
+        assert await client.generate_image("a cat", base_image_bytes=b"src") == b"edited-bytes"
+    assert session.post.call_args.args[0] == "https://api.test/v1/images/edits"
+
+    # Provider errors still raise in debug mode
+    session = _fake_session(lambda url, **kw: _embedding_resp(502, "provider down"))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)), patch.object(client, "_log_debug_payload"):
+        with pytest.raises(RuntimeError, match="OpenAI image generation error 502"):
+            await client.generate_image("a cat")
+
+
 def test_extract_schedule():
     p = Params()
     s = StateManager("test.json")
@@ -1247,7 +1307,8 @@ def _fake_session(post_impl):
 
     def post(url, **kwargs):
         resp = post_impl(url, **kwargs)
-        return AsyncMock(__aenter__=AsyncMock(return_value=resp), __aexit__=AsyncMock())
+        # __aexit__ must return falsy (like aiohttp) so exceptions raised inside the block propagate.
+        return AsyncMock(__aenter__=AsyncMock(return_value=resp), __aexit__=AsyncMock(return_value=False))
 
     session.post = MagicMock(side_effect=post)
     return session
