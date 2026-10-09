@@ -32,6 +32,18 @@ OPENROUTER_APP_TITLE = "Pletykas"
 
 _WEB_TOOL_TAG_RE = re.compile(r"<(?:WEB_SEARCH|FETCH_URL):\s*[^>]*>", re.IGNORECASE)
 
+# Provider-side content-policy blocks: Google phrases them as "safety violations" / "Prohibited Use policy",
+# OpenAI-style providers as "safety system" / "content policy".
+_IMAGE_SAFETY_BLOCK_RE = re.compile(
+    r"safety violations|prohibited use policy|safety system|content policy",
+    re.IGNORECASE,
+)
+
+
+class ImageSafetyBlockedError(RuntimeError):
+    """Raised when the image provider refuses a generation/edition for content-policy reasons."""
+
+
 # Per-request timeouts that override the shared 120s session default.
 CHAT_TIMEOUT_SEC = 10          # conversational chat/vision: fail fast on the interactive path
 DEEPMEM_EMBED_TIMEOUT_SEC = 5  # deep-memory embeddings: tiny payloads, no retry
@@ -1343,7 +1355,23 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         return None
 
     async def generate_image(self, prompt: str, base_image_bytes: Optional[bytes] = None) -> bytes:
-        """Generates a fresh image or modifies an existing image."""
+        """Generates a fresh image or modifies an existing image.
+
+        Provider content-policy blocks are normalized to ImageSafetyBlockedError so callers can
+        distinguish "the model refused this content" from transport/API failures.
+        """
+        try:
+            return await self._generate_image_request(prompt, base_image_bytes)
+        except ImageSafetyBlockedError:
+            raise
+        except Exception as e:
+            if _IMAGE_SAFETY_BLOCK_RE.search(str(e)):
+                logger.warning("Image provider blocked generation for content policy: %s", e)
+                raise ImageSafetyBlockedError(str(e)) from e
+            raise
+
+    async def _generate_image_request(self, prompt: str, base_image_bytes: Optional[bytes] = None) -> bytes:
+        """Issues the provider request for generate_image()."""
         img_name = self.params.model_image_name
         img_key = self.params.effective_image_api_key
         img_base = self.params.effective_image_api_base

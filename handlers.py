@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 from deepmem import DeepMemoryIndex, sidecar_path_for
-from llm import LLMClient, compress_image
+from llm import LLMClient, ImageSafetyBlockedError, compress_image
 from memory import MemoryManager, validate_memory_dict
 from params import Params
 from state import CHAT_HISTORY_SIZE, StateManager
@@ -1703,6 +1703,10 @@ class BotHandlers:
 
                     # Caption already accompanied photo; avoid duplicate text message
                     reply_text = None
+                except ImageSafetyBlockedError as e:
+                    logger.warning("Image generation blocked by the provider's safety filter: %s", e)
+                    if is_direct_trigger:
+                        reply_text = "Ezt a képet a szűrő elkaszálta, mert sérti a szabályzatot — próbáld finomabban megfogalmazni, és újra megpróbálom. 🚫🎨"
                 except Exception as e:
                     logger.error("Failed to generate or send image: %s", e)
                     if is_direct_trigger:

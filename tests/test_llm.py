@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 import pytest
 
-from llm import LLMClient, compress_image
+from llm import LLMClient, ImageSafetyBlockedError, compress_image
 from params import Params
 from state import StateManager
 
@@ -940,6 +940,48 @@ async def test_generate_image_openai_route_debug_mode():
     with patch.object(client, "_get_session", AsyncMock(return_value=session)), patch.object(client, "_log_debug_payload"):
         with pytest.raises(RuntimeError, match="OpenAI image generation error 502"):
             await client.generate_image("a cat")
+
+
+@pytest.mark.asyncio
+async def test_generate_image_safety_block_normalized():
+    p = Params()
+    p.model_image_name = "gemini-3.1-flash-lite-image"
+    p.model_image_api_base = ""
+    p.model_image_api_key = "img-key"
+    client = LLMClient(p, StateManager("test.json"))
+
+    google_block = RuntimeError(
+        "Error code: 400 - {'error': {'message': 'Image generation blocked due to safety violations. "
+        "Please modify your input and retry.', 'code': \"Unable to show the generated image. The image was "
+        "filtered out because it violated Google's [Generative AI Prohibited Use policy]\"}}"
+    )
+    mock_genai_client = AsyncMock()
+    mock_genai_client.aio.interactions.create = AsyncMock(side_effect=google_block)
+    with patch.object(client, "_get_genai_client", return_value=mock_genai_client):
+        with pytest.raises(ImageSafetyBlockedError):
+            await client.generate_image("evil portrait", base_image_bytes=b"src")
+
+    # Non-policy failures keep their original exception type
+    mock_genai_client.aio.interactions.create = AsyncMock(side_effect=RuntimeError("Error code: 500 - internal"))
+    with patch.object(client, "_get_genai_client", return_value=mock_genai_client):
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.generate_image("a cat")
+    assert not isinstance(exc_info.value, ImageSafetyBlockedError)
+
+
+@pytest.mark.asyncio
+async def test_generate_image_rest_safety_block_normalized():
+    p = Params()
+    p.model_image_name = "gemini-3.1-flash-lite-image"
+    p.model_image_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    p.model_image_api_key = "img-key"
+    client = LLMClient(p, StateManager("test.json"))
+
+    body = json.dumps({"error": {"message": "Image generation blocked due to safety violations."}})
+    session = _fake_session(lambda url, **kw: _embedding_resp(400, body))
+    with patch.object(client, "_get_session", AsyncMock(return_value=session)):
+        with pytest.raises(ImageSafetyBlockedError):
+            await client.generate_image("evil portrait")
 
 
 def test_extract_schedule():

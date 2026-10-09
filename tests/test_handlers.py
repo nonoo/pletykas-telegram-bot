@@ -10,7 +10,7 @@ import pytest
 
 from deepmem import DeepMemoryIndex
 from handlers import BotHandlers, _compute_archive_candidates, is_repeated_message, normalize_message_text
-from llm import LLMClient
+from llm import LLMClient, ImageSafetyBlockedError
 from memory import MemoryManager
 from params import Params
 from state import StateManager
@@ -901,6 +901,65 @@ async def test_image_modify_via_multimodal_vision(test_setup):
         photo_kwargs = mock_bot.send_photo.call_args.kwargs
         assert photo_kwargs["chat_id"] == p.group_chat_id
         assert photo_kwargs["caption"] == "Itt a vigyorgó robocop!"
+
+
+@pytest.mark.asyncio
+async def test_image_safety_block_replies_in_character(test_setup):
+    import base64
+    from PIL import Image
+    import io
+    p, s, m, llm, handlers = test_setup
+
+    img = Image.new("RGB", (100, 100), color="red")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    fake_img_bytes = buf.getvalue()
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.set_message_reaction = AsyncMock()
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=63614))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=63615))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message({
+        "id": 63612,
+        "from_user_id": 133687316,
+        "from_user_name": "Norbert",
+        "text": "[Photo: two guys on a plane]",
+        "media_type": "photo",
+        "media_b64": base64.b64encode(fake_img_bytes).decode("utf-8"),
+    })
+    s.append_chat_message({
+        "id": 63613,
+        "from_user_id": 133687316,
+        "from_user_name": "Norbert",
+        "text": "pletyi, alakitsd a kepet gonosz orvos portreva",
+        "media_type": "none",
+    })
+
+    vision_eval = (
+        None,
+        None,
+        {"prompt": "Evil doctor portrait", "caption": "", "source": "reply", "mode": "modify"},
+        "two guys on a plane",
+        None,
+    )
+
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)), \
+         patch.object(llm, "generate_image", AsyncMock(side_effect=ImageSafetyBlockedError("blocked due to safety violations"))):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=63613)
+
+    # No photo dispatched; the group gets the in-character policy notice instead of the generic failure
+    mock_bot.send_photo.assert_not_awaited()
+    mock_bot.send_message.assert_awaited()
+    sent_text = mock_bot.send_message.call_args.kwargs["text"]
+    assert "szűrő" in sent_text
+    assert "couldn't generate" not in sent_text
+
+
 @pytest.mark.asyncio
 async def test_debug_mode_logs_group_messages(test_setup):
     p, s, m, llm, handlers = test_setup
