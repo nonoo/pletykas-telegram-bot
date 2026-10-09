@@ -19,7 +19,7 @@ This document outlines the architecture, design principles, invariants, and impl
 8. **Image Interpretation Model Selection**: Controlled by the `image_interpretation_large_model` state setting (default: `True`). When `True`, the large vision model is used directly and immediately without attempting the small model. When toggled to `False` (via `/image_large off`), the small model is tried first with resized/compressed images, with automatic fallback to the large model if it fails or signals `<RETRY_WITH_LARGE_MODEL>`.
 9. **Debug Mode Streaming**: Controlled by the `debug` state setting (toggled via `/debug [on|off]`). When active, raw LLM request/response payloads, all incoming Telegram group messages (with sender, IDs, media type, and content), and all outgoing Telegram group dispatches (replies, photos, polls, reactions) are printed directly to stdout with structured banners.
 10. **Provider-Independent Web Tools**: Every model on every transport can search the web and read pages via protocol tags: `<WEB_SEARCH:query>` (executed against DuckDuckGo's HTML endpoint) and `<FETCH_URL:url>` (readable page text). The LLM client executes the tags in exactly one follow-up tool round (capped at 3 searches and 2 fetches per turn), feeds a `[Web Tool Results]` block back, and strips any leftover tool tags from the final reply. Failures degrade to "No results found" / "Could not fetch" inside the follow-up — never an exception or user-visible error. No search-related state settings or admin commands exist.
-11. **Two-Tier Memory**: Permanent knowledge lives in a hot store (`pletykas-memory.json`) and a cold deep store (`pletykas-deepmemory.json`, identical schema). Curation demotes hot facts older than `deep_archive_days` (state key, default `7`, adjustable via `/archive_age`; `0` disables age-based archiving) and moves entries between tiers on LLM request. Deep entries are auto-retrieved by embedding similarity over an OpenAI-compatible `/embeddings` route (default model `google/gemini-embedding-2`, OpenRouter-ready via `MODEL_EMBED_*`), backed by a hash-keyed sidecar vector cache; any embedding failure degrades to no injection (never blocks evaluation). Vision is excluded: incoming photos bypass deep recall in v1.
+11. **Two-Tier Memory**: Permanent knowledge lives in a hot store (`pletykas-memory.json`) and a cold deep store (`pletykas-deepmemory.json`, identical schema). Curation demotes hot facts older than `deep_archive_days` (state key, default `3`, adjustable via `/archive_age`; `0` disables age-based archiving) and moves entries between tiers on LLM request. Deep entries are auto-retrieved by embedding similarity over an OpenAI-compatible `/embeddings` route (default model `google/gemini-embedding-2`, OpenRouter-ready via `MODEL_EMBED_*`), backed by a hash-keyed sidecar vector cache; any embedding failure degrades to no injection (never blocks evaluation). Vision is excluded: incoming photos bypass deep recall in v1.
 
 ---
 
@@ -88,7 +88,7 @@ Managed by `StateManager` via atomic temporary file replacement (`os.replace`):
     "next_fire_time": null
   },
   "messages_since_last_curation": 0,
-  "deep_archive_days": 7
+  "deep_archive_days": 3
 }
 ```
 - `spontaneous_messages`: Periodic revival timer (`min_hours` to `max_hours`). Whenever a Telegram message arrives in the group, a new random timestamp is rolled and rescheduled to reset the revival window. The scheduled timestamp (`next_fire_time`) is persisted in state and resumes on restart.

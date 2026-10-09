@@ -1738,7 +1738,7 @@ Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak direc
         recent_transcript: str,
         deep_memories: Optional[Dict[str, Any]] = None,
         archive_candidates: Optional[Dict[str, Any]] = None,
-        archive_age_days: int = 7,
+        archive_age_days: int = 3,
     ) -> Dict[str, Any]:
         """Analyzes recent conversation history to extract long-term facts, group dynamics, and inside jokes.
 

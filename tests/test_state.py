@@ -169,8 +169,8 @@ def test_state_deep_archive_days():
         sm = StateManager(sf)
         sm.load()
 
-        # Default is 7 on fresh state
-        assert sm.get_deep_archive_days() == 7
+        # Default is 3 on fresh state
+        assert sm.get_deep_archive_days() == 3
 
         # Setter clamps negatives to 0 (0 disables age-based archiving)
         sm.set_deep_archive_days(-5)
@@ -183,19 +183,19 @@ def test_state_deep_archive_days():
         sm2.load()
         assert sm2.get_deep_archive_days() == 3
 
-        # Legacy state without the key falls back to 7
+        # Legacy state without the key falls back to 3
         with open(sf, "w", encoding="utf-8") as f:
             json.dump({"version": 1, "language": "English"}, f)
         sm3 = StateManager(sf)
         sm3.load()
-        assert sm3.get_deep_archive_days() == 7
+        assert sm3.get_deep_archive_days() == 3
 
-        # Garbage value falls back to 7
+        # Garbage value falls back to 3
         with open(sf, "w", encoding="utf-8") as f:
             json.dump({"version": 1, "deep_archive_days": "abc"}, f)
         sm4 = StateManager(sf)
         sm4.load()
-        assert sm4.get_deep_archive_days() == 7
+        assert sm4.get_deep_archive_days() == 3
 
 def test_state_history_sliding_window():
     with tempfile.TemporaryDirectory() as td:

@@ -109,7 +109,7 @@ podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-tel
 | `/debug` | `[on\|off]` | Toggles debug streaming to stdout (raw LLM payloads and Telegram group messages) |
 | `/memories` | `[load]` | Uploads memories JSON file as-is, or enters waiting mode to validate and load an uploaded JSON file |
 | `/deepmemories` | `[load]` | Uploads deep memories JSON file as-is, or enters waiting mode to validate and load an uploaded JSON file |
-| `/archive_age` | `[days]` | Views or adjusts the age in days after which hot facts are archived to deep memory (0 disables) |
+| `/archive_age` | `[days]` | Views or adjusts the age in days after which hot facts are archived to deep memory (default: `3`; `0` disables) |
 | `/cancel` | — | Aborts a pending memories, deep memories, or prompt file upload |
 | `/curate` | — | Manually triggers immediate LLM reflection and consolidation |
 

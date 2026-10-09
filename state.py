@@ -83,7 +83,7 @@ class StateManager:
             "timezone": "UTC",
             "talkativeness": 5,
             "cooldown_sec": 3,
-            "deep_archive_days": 7,
+            "deep_archive_days": 3,
             "image_interpretation_large_model": True,
             "debug": False,
             "nicknames": ["pletyi", "pletyo"],
@@ -500,9 +500,9 @@ class StateManager:
     def get_deep_archive_days(self) -> int:
         """Hot-memory archive age threshold in days. 0 disables age-based candidacy."""
         try:
-            return max(0, int(self.data.get("deep_archive_days", 7)))
+            return max(0, int(self.data.get("deep_archive_days", 3)))
         except (ValueError, TypeError):
-            return 7
+            return 3
 
     def set_deep_archive_days(self, days: int) -> None:
         """Sets the hot-memory archive age threshold in days. 0 disables age-based candidacy."""

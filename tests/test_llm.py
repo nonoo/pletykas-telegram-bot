@@ -745,11 +745,11 @@ async def test_curate_memory_backward_compat_missing_keys():
     assert len(res["facts_to_add"]) == 1
 
     # No deep store passed and no candidates => sections omitted, but the default
-    # age rule (7 days) is still rendered
+    # age rule (3 days) is still rendered
     prompt = mock_call.call_args[1]["contents"][0]
     assert "[Deep Memory Entries" not in prompt
     assert "[Archive Candidates" not in prompt
-    assert "Entries older than 7 days SHOULD be moved to the archive" in prompt
+    assert "Entries older than 3 days SHOULD be moved to the archive" in prompt
 
     # 0 days disables the age rule entirely
     with patch.object(client, "_call_genai", AsyncMock(return_value=(mock_output, 10, 10))) as mock_call0:

@@ -1535,7 +1535,7 @@ async def test_curate_worker_archive_candidates(test_setup):
 
     with tempfile.TemporaryDirectory() as td:
         old_ts = _days_ago_iso(8)
-        mid_ts = _days_ago_iso(3)
+        mid_ts = _days_ago_iso(2)
         fresh_ts = _days_ago_iso(0)
         handlers.memory = _seed_memory_file(
             os.path.join(td, "hot.json"),
@@ -1552,22 +1552,22 @@ async def test_curate_worker_archive_candidates(test_setup):
         captured = {}
 
         async def fake_curate(current_memories, recent_transcript, deep_memories=None,
-                              archive_candidates=None, archive_age_days=7):
+                              archive_candidates=None, archive_age_days=3):
             captured["deep_memories"] = deep_memories
             captured["archive_candidates"] = archive_candidates
             captured["archive_age_days"] = archive_age_days
             return {}
 
         with patch.object(llm, "curate_memory", AsyncMock(side_effect=fake_curate)):
-            # Case A: default age (7 days) => only the 8-day-old entries are candidates
+            # Case A: default age (3 days) => only the 8-day-old entries are candidates
             await handlers.trigger_curation(blocking=True)
-            assert captured["archive_age_days"] == 7
+            assert captured["archive_age_days"] == 3
             assert captured["archive_candidates"] == {
                 "facts": ["Old topic"], "dynamics": ["Alice & Bob"], "jokes": ["Old joke"],
             }
             assert captured["deep_memories"] == {"memories": [], "dynamics": [], "inside_jokes": []}
 
-            # Case B: 2-day age => the 8-day and 3-day facts are both candidates
+            # Case B: 2-day age => the 8-day and 2-day facts are both candidates
             s.set_deep_archive_days(2)
             await handlers.trigger_curation(blocking=True)
             assert captured["archive_age_days"] == 2
@@ -2551,7 +2551,7 @@ async def test_cmd_archive_age_workflow(test_setup):
     # No args -> reports the default
     mock_context.args = []
     await handlers.cmd_archive_age(mock_update, mock_context)
-    assert "7 days" in mock_msg.reply_text.call_args[0][0]
+    assert "3 days" in mock_msg.reply_text.call_args[0][0]
 
     # Set to 3 -> persists through the real state getter
     mock_context.args = ["3"]
