@@ -281,9 +281,76 @@ def test_sanitize_reply_text_strips_leftover_protocol_markup():
     assert sanitize_reply_text("<WEB_SEARCH:weather budapest>") == ""
     assert sanitize_reply_text("<GENERATE_IMAGE>\nPrompt: x\nCaption: y\n</GENERATE_IMAGE>") == ""
     assert sanitize_reply_text("Szia! <SCHEDULE:cancel:sched_1>") == "Szia!"
+    # Transcript annotations keep their text but lose the marker
+    assert sanitize_reply_text("[Generated Image: A portrait of a couple] Szia!") == "Szia!"
+    assert sanitize_reply_text("[Photo: two guys on a plane] De jó kép!") == "De jó kép!"
     # <POLL> and <FORGET> blocks are dispatched as actions, so they must survive sanitization
     poll = "<POLL>\nQuestion: Kávé vagy tea?\nOptions:\n- Kávé\n- Tea\n</POLL>"
     assert "<POLL>" in sanitize_reply_text(poll)
+
+
+def test_extract_generate_image_annotation_dialect():
+    """The bot's own history note was imitated as a reply; it must become a real image request."""
+    p = Params()
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    caption = "Tessék, Nonoo, itt vannak a szüleim. 😏 Ennél többet nem adok ki."
+    reply = (
+        "[Generated Image: A portrait of a middle-aged couple, warmly lit living room, "
+        f"candid family portrait style.] {caption}"
+    )
+    cleaned, spec = client._extract_generate_image(reply)
+    assert cleaned == ""
+    assert spec is not None
+    assert spec["prompt"] == (
+        "A portrait of a middle-aged couple, warmly lit living room, candid family portrait style."
+    )
+    assert spec["caption"] == caption
+    assert spec["source"] == "new"
+    assert spec["mode"] == "generate"
+
+    # Case drift and no caption
+    cleaned, spec = client._extract_generate_image("[generated image: a red bicycle]")
+    assert cleaned == ""
+    assert spec is not None
+    assert spec["prompt"] == "a red bicycle"
+    assert spec["caption"] == ""
+
+    # A <GENERATE_IMAGE> block wins over the annotation, which is still stripped from the text
+    reply = (
+        "<GENERATE_IMAGE>\nPrompt: block prompt\nCaption: block caption\nSource: new\nMode: generate\n"
+        "</GENERATE_IMAGE>\n[Generated Image: annotation prompt] Szia!"
+    )
+    cleaned, spec = client._extract_generate_image(reply)
+    assert spec is not None and spec["prompt"] == "block prompt"
+    assert "Generated Image" not in cleaned
+
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_annotation_dialect_becomes_image_request():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_api_base = "https://example.com/api/v1"
+    p.model_api_key = "k"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    raw = "[Generated Image: a portrait of a couple in a cozy living room] Tessék, itt vannak a szüleim! 😏"
+    with patch.object(client, "_call_openai_compatible", AsyncMock(return_value=(raw, 10, 5))):
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=False,
+            talkativeness=5,
+        )
+    assert text is None
+    assert img_spec is not None
+    assert img_spec["prompt"] == "a portrait of a couple in a cozy living room"
+    assert img_spec["caption"] == "Tessék, itt vannak a szüleim! 😏"
+    assert img_spec["mode"] == "generate"
 
 
 @pytest.mark.asyncio

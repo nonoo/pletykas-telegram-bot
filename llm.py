@@ -42,6 +42,14 @@ _IMAGE_DESCRIPTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Transcript annotation dialect: the bot's own history notes its past generations as
+# "[Generated Image: <prompt>] <caption>", and models sometimes imitate that note as their reply
+# instead of emitting a <GENERATE_IMAGE> block. Such a note is read as "send this image".
+_IMAGE_ANNOTATION_RE = re.compile(
+    r"[\[(]\s*generated image\s*[:：\-–—]?\s*([^\])\n]+?)\s*[\])]",
+    re.IGNORECASE,
+)
+
 # Multi-line protocol blocks whose extractors run before dispatch: a parse miss must never leak them.
 # <POLL> and <FORGET> are excluded on purpose - their blocks are extracted later, in the dispatch pipeline.
 _LEFTOVER_BLOCK_RE = re.compile(
@@ -67,13 +75,17 @@ def sanitize_reply_text(text: str) -> str:
     """Strips leftover protocol tags/blocks from an outgoing reply before it is dispatched.
 
     Backstop for model formatting drift: a parse failure upstream must never leak raw protocol
-    markup (e.g. "<NO_REPLY>" + "<IMAGE_DESCRIPTION>") into the group as visible text.
+    markup (e.g. "<NO_REPLY>" + "<IMAGE_DESCRIPTION>") into the group as visible text. Transcript
+    annotations ("[Generated Image: ...]", "[Photo: ...]", "[Poll: ...]") keep their text but lose
+    the marker: they are notes about media already sent, not message content.
     """
     if not text:
         return text
     cleaned = _IMAGE_DESCRIPTION_RE.sub("", text)
     cleaned = _WEB_TOOL_TAG_RE.sub("", cleaned)
     cleaned = _LEFTOVER_BLOCK_RE.sub("", cleaned)
+    cleaned = _IMAGE_ANNOTATION_RE.sub("", cleaned)
+    cleaned = re.sub(r"\[(?:Photo|Poll|Voice message)[^\]]*\]", "", cleaned)
     cleaned, _ = strip_decision_tags(cleaned)
     return cleaned.strip()
 
@@ -691,7 +703,11 @@ class LLMClient:
         return text.strip(), reaction
 
     def _extract_generate_image(self, text: str) -> Tuple[str, Optional[Dict[str, str]]]:
-        """Extracts <GENERATE_IMAGE>...</GENERATE_IMAGE> block and strips it from text."""
+        """Extracts <GENERATE_IMAGE>...</GENERATE_IMAGE> block and strips it from text.
+
+        Falls back to the transcript annotation dialect ("[Generated Image: <prompt>] <caption>")
+        when no block is present, so a model imitating its own history note still gets an image sent.
+        """
         pattern = r"<GENERATE_IMAGE>([\s\S]*?)</GENERATE_IMAGE>"
         match = re.search(pattern, text)
         spec = None
@@ -721,7 +737,29 @@ class LLMClient:
                     "mode": mode,
                 }
             text = re.sub(pattern, "", text)
+
+        text, annotation_spec = self._extract_image_annotation(text)
+        if spec is None:
+            spec = annotation_spec
         return text.strip(), spec
+
+    def _extract_image_annotation(self, text: str) -> Tuple[str, Optional[Dict[str, str]]]:
+        """Reads a "[Generated Image: <prompt>] <caption>" annotation as an image request.
+
+        That annotation is the bot's own transcript note for a generated image; when a model
+        imitates it as a reply, the intended action is still "post this generated image". The text
+        around the annotation becomes the photo caption, so it is not repeated as a separate message.
+        """
+        match = _IMAGE_ANNOTATION_RE.search(text)
+        if not match:
+            return text, None
+        prompt = match.group(1).strip()
+        caption = (text[:match.start()] + " " + text[match.end():]).strip()
+        if not prompt:
+            return caption, None
+        caption, _ = self._extract_reaction(caption)
+        caption, _ = strip_decision_tags(caption)
+        return "", {"prompt": prompt, "caption": caption, "source": "new", "mode": "generate"}
 
     def _extract_image_description(self, text: str) -> Tuple[str, str]:
         """Extracts <IMAGE_DESCRIPTION>...</IMAGE_DESCRIPTION> and strips it from text.
@@ -983,6 +1021,7 @@ Do NOT use this tag for web information needs — use the <WEB_SEARCH:...> / <FE
 - When clearing or updating memory via `<FORGET>`, you MUST provide an in-character text confirmation in addition to the `<FORGET>` block.
 - When creating a poll via `<POLL>`, you may include an introductory in-character text message in addition to the `<POLL>` block.
 - PROTOCOL KEYWORDS RULE: When using special protocol tags (<GENERATE_IMAGE>, <SCHEDULE:...>, <POLL>, <FORGET>, <WEB_SEARCH:...>, <FETCH_URL:...>), all tag names and field labels ('Prompt:', 'Caption:', 'Source:', 'Mode:', 'Time:', 'Interval:', 'Start:', 'Description:', 'Question:', 'Options:', 'Facts to Discard:', 'Facts to Update:', 'Dynamics to Discard:', 'Jokes to Discard:', 'Topic:', 'Content:') MUST strictly remain in English verbatim. NEVER translate protocol tags or field labels into the conversation language.
+- TRANSCRIPT ANNOTATION RULE: bracketed notes in the transcript such as '[Photo] …', '[Photo: …] …', '[Generated Image: …] …', '[Poll: …] …' or '[Voice message …] …' are system annotations describing media that was ALREADY sent. They are NOT a message format: NEVER write them in your reply. To send an image you MUST use the <GENERATE_IMAGE> block described above.
 - STRICT REACTION RULE: Do NOT use <REACTION:emoji> as a passive default. When talkativeness is low, '<NO_REPLY>' MUST be heavily preferred over reacting in 95% of cases. Only react if a message genuinely warrants a strong reaction.
 - To react with an emoji, include `<REACTION:emoji>` (e.g. `<REACTION:🔥>` or `<REACTION:🤣:1042>`). You MUST only use standard Telegram reaction emojis: 👍, 👎, ❤, 🔥, 🥰, 👏, 😁, 🤔, 🤯, 😱, 🤬, 😢, 🎉, 🤩, 🤮, 💩, 🙏, 👌, 🕊, 🤡, 🥱, 🥴, 😍, 🐳, 💯, 🤣, ⚡, 🏆, 💔, 🤨, 😐, 🍓, 🍾, 💋, 😈, 😴, 😭, 🤓, 👻, 👀, 🎃, 🙈, 😇, 😨, 🤝, 🤗, 🫡, 🤪, 🗿, 🆒, 💘, 🦄, 😘, 😎, 👾, 🤷, 😡. Note: Telegram does not support smirks (😏), winks (😉), or laughs (😂, 😄) as reactions; for cheeky/smug/flirty reactions use 😈, 😎, 💅, or 😘 instead.{escalation_rule}
 - If you do not want to intervene or say anything at all, output EXACTLY '<NO_REPLY>'.

@@ -905,6 +905,59 @@ async def test_image_modify_via_multimodal_vision(test_setup):
 
 
 @pytest.mark.asyncio
+async def test_execute_evaluation_annotation_dialect_posts_image(test_setup):
+    """Regression: a reply imitating the '[Generated Image: ...]' history note must generate and
+    post the image instead of sending the note as a text message."""
+    import base64
+    from PIL import Image
+    import io
+    p, s, m, llm, handlers = test_setup
+
+    img = Image.new("RGB", (100, 100), color="green")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    fake_img_bytes = buf.getvalue()
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.username = "pletykas_bot"
+    mock_bot.set_message_reaction = AsyncMock()
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=63614))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=63615))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message({
+        "id": 63620,
+        "from_user_id": 133687316,
+        "from_user_name": "Norbert",
+        "text": "pletyi, generalj kepet a szuleidrol",
+        "timestamp_str": "15:20",
+        "media_type": "none",
+        "media_b64": None,
+    })
+
+    annotated = (
+        "[Generated Image: A portrait of a middle-aged couple in a cozy, warmly lit living room.]"
+        " Tessék, Nonoo, itt vannak a szüleim! 😏"
+    )
+
+    # Exercise the real parsing chain: only the transport call is mocked.
+    p.model_api_base = "https://example.com/api/v1"
+    with patch.object(llm, "_call_openai_compatible", AsyncMock(return_value=(annotated, 10, 5))), \
+         patch.object(handlers, "_recall_deep_memory", AsyncMock(return_value="")), \
+         patch.object(llm, "generate_image", AsyncMock(return_value=fake_img_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=63620)
+
+    mock_gen.assert_awaited_once()
+    assert mock_gen.call_args.kwargs["prompt"] == "A portrait of a middle-aged couple in a cozy, warmly lit living room."
+    mock_bot.send_photo.assert_awaited_once()
+    assert mock_bot.send_photo.call_args.kwargs["caption"] == "Tessék, Nonoo, itt vannak a szüleim! 😏"
+    mock_bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_image_safety_block_replies_in_character(test_setup):
     import base64
     from PIL import Image
