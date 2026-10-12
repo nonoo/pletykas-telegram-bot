@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from PIL import Image
 import pytest
 
-from llm import LLMClient, ImageSafetyBlockedError, compress_image
+from llm import LLMClient, ImageSafetyBlockedError, compress_image, sanitize_reply_text
 from params import Params
 from state import StateManager
 
@@ -247,6 +247,138 @@ He looks so happy!"""
     assert "He looks so happy!" in cleaned
     assert "<IMAGE_DESCRIPTION>" not in cleaned
     assert desc == "A golden retriever sitting on grass under a sunny blue sky."
+
+
+def test_extract_image_description_tolerates_model_drift():
+    p = Params()
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    # Missing closing tag: everything after the opening tag counts as the description
+    cleaned, desc = client._extract_image_description(
+        "<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\nA vintage Alcatel phone on a white background."
+    )
+    assert cleaned == "<NO_REPLY>"
+    assert desc == "A vintage Alcatel phone on a white background."
+
+    # Lowercase closing tag
+    cleaned, desc = client._extract_image_description("<IMAGE_DESCRIPTION>\nA cat</image_description>\nSzia!")
+    assert cleaned == "Szia!"
+    assert desc == "A cat"
+
+    # Stray whitespace inside the tags
+    cleaned, desc = client._extract_image_description("<IMAGE_DESCRIPTION >\nA dog\n</IMAGE_DESCRIPTION >")
+    assert cleaned == ""
+    assert desc == "A dog"
+
+
+def test_sanitize_reply_text_strips_leftover_protocol_markup():
+    assert sanitize_reply_text("<NO_REPLY>") == ""
+    assert sanitize_reply_text("<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\nA phone\n</IMAGE_DESCRIPTION>") == ""
+    assert sanitize_reply_text("<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\nA phone") == ""
+    assert sanitize_reply_text("<NO_REPLY>\nSzia, mi van?") == "Szia, mi van?"
+    assert sanitize_reply_text("<REACTION:🔥>\nSzia!") == "Szia!"
+    assert sanitize_reply_text("<WEB_SEARCH:weather budapest>") == ""
+    assert sanitize_reply_text("<GENERATE_IMAGE>\nPrompt: x\nCaption: y\n</GENERATE_IMAGE>") == ""
+    assert sanitize_reply_text("Szia! <SCHEDULE:cancel:sched_1>") == "Szia!"
+    # <POLL> and <FORGET> blocks are dispatched as actions, so they must survive sanitization
+    poll = "<POLL>\nQuestion: Kávé vagy tea?\nOptions:\n- Kávé\n- Tea\n</POLL>"
+    assert "<POLL>" in sanitize_reply_text(poll)
+
+
+@pytest.mark.asyncio
+async def test_describe_and_reply_image_no_reply_with_unclosed_description():
+    """Regression: <NO_REPLY> + unclosed <IMAGE_DESCRIPTION> used to be dispatched verbatim."""
+    p = Params()
+    p.model_name = "small-model"
+    p.model_large_name = "large-model"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    raw = (
+        "<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\n"
+        "A studio product photo of a vintage late-1990s Alcatel mobile phone."
+    )
+    with patch.object(client, "_call_vision_model", AsyncMock(return_value=(raw, 50, 10))):
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=False,
+            talkativeness=5,
+            image_bytes=b"fake-image-bytes",
+            caption="",
+        )
+    assert text is None
+    assert desc == "A studio product photo of a vintage late-1990s Alcatel mobile phone."
+
+
+@pytest.mark.asyncio
+async def test_describe_and_reply_image_no_reply_with_description_block():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_large_name = "large-model"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    raw = "<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\nA cute puppy\n</IMAGE_DESCRIPTION>"
+    with patch.object(client, "_call_vision_model", AsyncMock(return_value=(raw, 50, 10))):
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=False,
+            talkativeness=5,
+            image_bytes=b"fake-image-bytes",
+            caption="",
+        )
+    assert text is None
+    assert desc == "A cute puppy"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_strips_stray_no_reply_token():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_api_base = "https://example.com/api/v1"
+    p.model_api_key = "k"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    with patch.object(client, "_call_openai_compatible", AsyncMock(return_value=("Szia, mi van?\n<NO_REPLY>", 10, 5))):
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=False,
+            talkativeness=5,
+        )
+    assert text == "Szia, mi van?"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_and_reply_no_reply_plus_reaction_stays_silent():
+    p = Params()
+    p.model_name = "small-model"
+    p.model_api_base = "https://example.com/api/v1"
+    p.model_api_key = "k"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    with patch.object(client, "_call_openai_compatible", AsyncMock(return_value=("<NO_REPLY>\n<REACTION:🔥>", 10, 5))):
+        text, reaction, img_spec, sched_spec = await client.evaluate_and_reply(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=True,
+            talkativeness=5,
+        )
+    assert text is None
+    assert reaction == ("🔥", None)
 
 
 def test_is_genai_model():

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -1948,6 +1949,66 @@ def test_is_forget_request(test_setup):
     mock_bot_reply.reply_to_message = MagicMock()
     mock_bot_reply.reply_to_message.from_user.is_bot = True
     assert handlers._is_forget_request(mock_bot_reply) is True
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_does_not_dispatch_leftover_protocol_tags(test_setup):
+    """Regression: leftover protocol markup from a parse miss must never reach the group."""
+    p, s, m, llm, handlers = test_setup
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7003))
+
+    s.append_chat_message({
+        "id": 1240,
+        "from_user_id": 42,
+        "from_user_name": "Alice",
+        "text": "szia pletyi",
+        "timestamp_str": "12:10",
+        "media_type": "none",
+        "media_b64": None,
+    })
+
+    leaked = "<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\nA studio product photo of an Alcatel phone."
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(leaked, None, None, None))), \
+         patch.object(handlers, "_recall_deep_memory", AsyncMock(return_value="")):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1240)
+
+    mock_context.bot.send_message.assert_not_awaited()
+    assert not any("<NO_REPLY>" in (e.get("text") or "") for e in s.get_chat_history())
+
+
+@pytest.mark.asyncio
+async def test_execute_evaluation_photo_no_reply_does_not_dispatch_description(test_setup):
+    """Regression: <NO_REPLY> + <IMAGE_DESCRIPTION> for a photo must not be posted to the group."""
+    p, s, m, llm, handlers = test_setup
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=7004))
+
+    s.append_chat_message({
+        "id": 1241,
+        "from_user_id": 42,
+        "from_user_name": "Alice",
+        "text": "[Photo]",
+        "timestamp_str": "12:11",
+        "media_type": "photo",
+        "media_b64": base64.b64encode(b"fake-image").decode(),
+    })
+
+    leaked = "<NO_REPLY>\n\n<IMAGE_DESCRIPTION>\nA vintage Alcatel phone."
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=(
+        leaked, None, None, "A vintage Alcatel phone.", None,
+    ))):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=False, trigger_msg_id=1241)
+
+    mock_context.bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

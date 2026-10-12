@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 from deepmem import DeepMemoryIndex, sidecar_path_for
-from llm import LLMClient, ImageSafetyBlockedError, compress_image
+from llm import LLMClient, ImageSafetyBlockedError, compress_image, sanitize_reply_text
 from memory import MemoryManager, validate_memory_dict
 from params import Params
 from state import CHAT_HISTORY_SIZE, StateManager
@@ -632,7 +632,7 @@ class BotHandlers:
             logger.warning("LLM returned empty spontaneous message")
             return False, "LLM returned empty spontaneous message."
 
-        cleaned_text, poll_spec = self.llm.extract_poll(response)
+        cleaned_text, poll_spec = self.llm.extract_poll(sanitize_reply_text(response))
         suppressed_repeat = bool(cleaned_text) and self._suppress_repeated_reply(cleaned_text, context)
         if suppressed_repeat:
             cleaned_text = None
@@ -806,6 +806,7 @@ class BotHandlers:
                 timezone_str=tz_str,
             )
 
+            reply_text = sanitize_reply_text(reply_text) or None
             if reply_text:
                 reply_text, poll_spec = self.llm.extract_poll(reply_text)
                 if reply_text and self._suppress_repeated_reply(reply_text, context):
@@ -1544,6 +1545,10 @@ class BotHandlers:
                     is_direct_trigger=is_direct_trigger,
                     talkativeness=talkativeness,
                 )
+
+            # Backstop: leftover protocol markup (e.g. a malformed <IMAGE_DESCRIPTION> block or a
+            # stray <NO_REPLY>) must never reach the group as visible text.
+            reply_text = sanitize_reply_text(reply_text) or None
 
             # Handle Schedule Actions (Create or Cancel)
             if schedule_spec:

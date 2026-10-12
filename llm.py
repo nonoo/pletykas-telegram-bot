@@ -32,6 +32,51 @@ OPENROUTER_APP_TITLE = "Pletykas"
 
 _WEB_TOOL_TAG_RE = re.compile(r"<(?:WEB_SEARCH|FETCH_URL):\s*[^>]*>", re.IGNORECASE)
 
+# Decision tokens the model may emit next to other protocol blocks (e.g. <NO_REPLY> + <IMAGE_DESCRIPTION>).
+_DECISION_TAG_RE = re.compile(r"<(?:NO_REPLY|RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*[^>]*?)?>", re.IGNORECASE)
+
+# Visual description block. Tolerant of tag case/whitespace drift and of a missing closing tag
+# (then everything after the opening tag is the description), because models routinely drop it.
+_IMAGE_DESCRIPTION_RE = re.compile(
+    r"<IMAGE_DESCRIPTION\s*>([\s\S]*?)(?:</IMAGE_DESCRIPTION\s*>|\Z)",
+    re.IGNORECASE,
+)
+
+# Multi-line protocol blocks whose extractors run before dispatch: a parse miss must never leak them.
+# <POLL> and <FORGET> are excluded on purpose - their blocks are extracted later, in the dispatch pipeline.
+_LEFTOVER_BLOCK_RE = re.compile(
+    r"<GENERATE_IMAGE\s*>[\s\S]*?(?:</GENERATE_IMAGE\s*>|\Z)"
+    r"|<REACTION:\s*[^:>]+(?::\d+)?\s*>"
+    r"|<SCHEDULE:[^>]*>"
+    r"|</SCHEDULE(?::[^>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def strip_decision_tags(text: str) -> Tuple[str, bool]:
+    """Removes decision tokens (<NO_REPLY>, retry tags) from text.
+
+    Returns the cleaned text and whether a <NO_REPLY> token was present, so callers can tell
+    "the model asked for silence" apart from "the model produced nothing".
+    """
+    saw_no_reply = bool(re.search(r"<NO_REPLY(?::\s*[^>]*?)?>", text, re.IGNORECASE))
+    return _DECISION_TAG_RE.sub("", text).strip(), saw_no_reply
+
+
+def sanitize_reply_text(text: str) -> str:
+    """Strips leftover protocol tags/blocks from an outgoing reply before it is dispatched.
+
+    Backstop for model formatting drift: a parse failure upstream must never leak raw protocol
+    markup (e.g. "<NO_REPLY>" + "<IMAGE_DESCRIPTION>") into the group as visible text.
+    """
+    if not text:
+        return text
+    cleaned = _IMAGE_DESCRIPTION_RE.sub("", text)
+    cleaned = _WEB_TOOL_TAG_RE.sub("", cleaned)
+    cleaned = _LEFTOVER_BLOCK_RE.sub("", cleaned)
+    cleaned, _ = strip_decision_tags(cleaned)
+    return cleaned.strip()
+
 # Provider-side content-policy blocks: Google phrases them as "safety violations" / "Prohibited Use policy",
 # OpenAI-style providers as "safety system" / "content policy".
 _IMAGE_SAFETY_BLOCK_RE = re.compile(
@@ -679,14 +724,16 @@ class LLMClient:
         return text.strip(), spec
 
     def _extract_image_description(self, text: str) -> Tuple[str, str]:
-        """Extracts <IMAGE_DESCRIPTION>...</IMAGE_DESCRIPTION> and strips it from text."""
-        pattern = r"<IMAGE_DESCRIPTION>([\s\S]*?)</IMAGE_DESCRIPTION>"
-        match = re.search(pattern, text)
-        desc = ""
-        if match:
-            desc = match.group(1).strip()
-            text = re.sub(pattern, "", text)
-        return text.strip(), desc
+        """Extracts <IMAGE_DESCRIPTION>...</IMAGE_DESCRIPTION> and strips it from text.
+
+        Tolerant of model formatting drift (tag case, stray whitespace, missing closing tag),
+        so a malformed block can never survive into the dispatched reply text.
+        """
+        match = _IMAGE_DESCRIPTION_RE.search(text)
+        if not match:
+            return text.strip(), ""
+        desc, _ = strip_decision_tags(match.group(1))
+        return _IMAGE_DESCRIPTION_RE.sub("", text).strip(), desc
 
     def _extract_schedule(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Extracts <SCHEDULE:oneshot>...</SCHEDULE:oneshot>, <SCHEDULE:periodic>...</SCHEDULE:periodic>,
@@ -1150,18 +1197,17 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         cleaned_text, schedule_spec = self._extract_schedule(raw_trimmed)
         cleaned_text, image_spec = self._extract_generate_image(cleaned_text)
         cleaned_text, reaction = self._extract_reaction(cleaned_text)
-        # Clean any remaining retry tag in case large model returned one
-        cleaned_text = re.sub(r"<(?:RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*[^>]*?)?>", "", cleaned_text, flags=re.IGNORECASE).strip()
+        # Strip decision/retry tokens left over next to other content: a stray "<NO_REPLY>" appended
+        # to a real reply, or one emitted by the large model during an escalation retry.
+        cleaned_text, saw_no_reply = strip_decision_tags(cleaned_text)
 
-        if cleaned_text == "<NO_REPLY>":
-            text = None
-        elif not cleaned_text:
+        if not cleaned_text:
             if schedule_spec:
                 if schedule_spec.get("action") == "cancel":
                     text = "Rendben, töröltem az időzítőt! 👍"
                 else:
                     text = "Rendben, jegyeztem az emlékeztetőt! 😉"
-            elif is_direct_trigger:
+            elif is_direct_trigger and not saw_no_reply:
                 text = "hmm, ezen most kicsit gondolkodnom kell... 🤔"
             else:
                 text = None
@@ -1321,10 +1367,12 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         cleaned_text, schedule_spec = self._extract_schedule(cleaned_text)
         cleaned_text, image_spec = self._extract_generate_image(cleaned_text)
         cleaned_text, reaction = self._extract_reaction(cleaned_text)
+        # The photo prompt demands an <IMAGE_DESCRIPTION> block even on silent turns, so <NO_REPLY>
+        # routinely arrives next to other protocol blocks; strip it and let an empty remainder
+        # mean silence instead of leaking the token into the group.
+        cleaned_text, _ = strip_decision_tags(cleaned_text)
 
-        if cleaned_text == "<NO_REPLY>":
-            text = None
-        elif not cleaned_text:
+        if not cleaned_text:
             if schedule_spec:
                 if schedule_spec.get("action") == "cancel":
                     text = "Rendben, töröltem az időzítőt! 👍"
@@ -1664,8 +1712,8 @@ Rules: Do not refer to yourself as an AI or mention that this is automated. Spea
                     timeout_sec=CHAT_TIMEOUT_SEC,
                 )
 
-            res = raw_response.strip()
-            return res if res and res != "<NO_REPLY>" else None
+            res, _ = strip_decision_tags(raw_response)
+            return res if res else None
         except Exception as e:
             logger.error("Error generating spontaneous message: %s", e)
             return None
@@ -1754,8 +1802,7 @@ Do not mention timers, automation, scheduled jobs, or AI mechanisms. Speak direc
                 )
                 raw_response, p_tokens, c_tokens = await _dispatch(followup_prompt)
 
-            res = raw_response.strip()
-            res = re.sub(r"<(?:NO_REPLY|RETRY_WITH_LARGE_MODEL|NEED_LARGE_MODEL)(?::\s*[^>]*?)?>", "", res, flags=re.IGNORECASE).strip()
+            res, _ = strip_decision_tags(raw_response)
             res = _WEB_TOOL_TAG_RE.sub("", res).strip()
             return res if res else None
         except Exception as e:
