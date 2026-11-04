@@ -145,6 +145,9 @@ def split_into_html_pre_chunks(raw_text: str, header: str = "", max_escaped_len:
 # Consecutive-duplicate protection: the bot must never post the same message twice in a row.
 REPEAT_SIMILARITY_THRESHOLD = 0.9
 REPEAT_FUZZY_MIN_CHARS = 8
+IMAGE_REFERENCE_KEYWORDS = (
+    "kép", "kep", "fotó", "foto", "photo", "image", "picture", "rajz", "ábra", "abra",
+)
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
@@ -1180,7 +1183,15 @@ class BotHandlers:
             return "(No recent messages)"
         lines = []
         for msg in history:
-            reply_part = f" (replying to {msg['reply_to_user_name']})" if msg.get("reply_to_user_name") else ""
+            reply_part = ""
+            target_id = msg.get("reply_to_msg_id")
+            target_name = msg.get("reply_to_user_name")
+            if target_name and target_id:
+                reply_part = f" (replying to {target_name}, message ID: {target_id})"
+            elif target_name:
+                reply_part = f" (replying to {target_name})"
+            elif target_id:
+                reply_part = f" (replying to message ID: {target_id})"
             lines.append(f"[ID: {msg.get('id')}] [{msg.get('timestamp_str')}] [{msg.get('from_user_name')}]{reply_part}: {msg.get('text')}")
         return "\n".join(lines)
 
@@ -1451,6 +1462,158 @@ class BotHandlers:
             trigger_msg_id=trigger_msg_id,
         )
 
+    @staticmethod
+    def _normalize_image_mode(mode: str) -> str:
+        """Normalizes image-action drift ('edit'/'change' → 'modify', 'new'/'create' → 'generate')."""
+        value = (mode or "").strip().lower()
+        if value in ("modify", "edit", "editing", "change", "alter", "modification"):
+            return "modify"
+        if value.startswith(("modif", "edit", "chang", "alter")):
+            return "modify"
+        if value in ("generate", "generation", "new", "create", "creation"):
+            return "generate"
+        if value.startswith(("generat", "creat")):
+            return "generate"
+        return value or "generate"
+
+    def _find_photo_by_id(self, message_id: Any) -> Optional[Dict[str, Any]]:
+        """Returns the stored photo message with this Telegram message ID, if it still has bytes."""
+        target = str(message_id).strip()
+        if not target:
+            return None
+        for item in reversed(self.state.get_chat_history()):
+            if (
+                str(item.get("id")) == target
+                and item.get("media_type") == "photo"
+                and item.get("media_b64")
+            ):
+                return item
+        return None
+
+    def _find_photo_in_reply_chain(self, message_id: Any) -> Optional[Dict[str, Any]]:
+        """Walks up to three reply hops to find the photo a reply chain points at."""
+        history = self.state.get_chat_history()
+        current = message_id
+        seen = set()
+        for _ in range(4):
+            if current is None or current in seen:
+                break
+            seen.add(current)
+            entry = next((item for item in history if item.get("id") == current), None)
+            if entry is None:
+                break
+            if entry.get("media_type") == "photo" and entry.get("media_b64"):
+                return entry
+            current = entry.get("reply_to_msg_id")
+        return None
+
+    @staticmethod
+    def _photo_bytes(entry: Optional[Dict[str, Any]]) -> Optional[bytes]:
+        if not entry or not entry.get("media_b64"):
+            return None
+        try:
+            return base64.b64decode(entry["media_b64"])
+        except (TypeError, ValueError):
+            return None
+
+    def _select_uninterpreted_photo(self, trigger_entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Attaches an un-described photo from the same recent message burst.
+
+        Covers a photo followed by a text instruction in a later message (including a debounce
+        batch) even when the text contains no image keyword. Only a single candidate is attached;
+        several un-described photos are ambiguous and are left to the text model.
+        """
+        if not trigger_entry:
+            return None
+        history = self.state.get_chat_history()
+        trigger_index = None
+        for idx, item in enumerate(history):
+            if item.get("id") == trigger_entry.get("id"):
+                trigger_index = idx
+                break
+        if trigger_index is None:
+            return None
+        candidates = [
+            item for item in history[max(0, trigger_index - 3):trigger_index]
+            if item.get("media_type") == "photo"
+            and item.get("media_b64")
+            and "[Photo: " not in (item.get("text") or "")
+        ]
+        return candidates[-1] if len(candidates) == 1 else None
+
+    def _select_reference_photo(self, trigger_entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Picks a photo for a keyword-based reference only when that choice is unambiguous.
+
+        Replies and photo messages are resolved by the caller. A text-only reference gets the
+        newest photo when it is not described yet (likely just posted) or when it is the only
+        photo. With several described photos the text model resolves the exact message ID from
+        the transcript instead of the bot silently attaching the wrong image.
+        """
+        if not trigger_entry:
+            return None
+        text = (trigger_entry.get("text") or "").lower()
+        if not any(kw in text for kw in IMAGE_REFERENCE_KEYWORDS):
+            return None
+        photos = [
+            item for item in self.state.get_chat_history()
+            if item.get("media_type") == "photo" and item.get("media_b64")
+        ]
+        if not photos:
+            return None
+        newest = photos[-1]
+        if "[Photo: " not in (newest.get("text") or ""):
+            return newest
+        if len(photos) == 1:
+            return newest
+        return None
+
+    def _resolve_image_source(
+        self,
+        source: str,
+        mode: str,
+        photo_entry: Optional[Dict[str, Any]],
+        trigger_entry: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[bytes], str]:
+        """Resolves the base image for a generate/modify action.
+
+        Returns (bytes, "") on success, (None, "") for a fresh generation, and
+        (None, reason) when a modification cannot be fulfilled. An explicit numeric
+        Source ID always wins over the heuristic photo selected for the vision request.
+        """
+        src = str(source or "").strip()
+        src_key = src.lower()
+        mode_key = self._normalize_image_mode(mode)
+
+        if src_key not in ("", "new", "reply"):
+            explicit = self._find_photo_by_id(src)
+            explicit_bytes = self._photo_bytes(explicit)
+            if explicit_bytes is not None:
+                return explicit_bytes, ""
+            logger.warning("Image Source '%s' did not resolve to a stored photo", src)
+            if mode_key != "modify":
+                return None, ""
+            # Fall through to the photo that was actually shown to the model.
+
+        if src_key == "reply":
+            photo_bytes = self._photo_bytes(photo_entry)
+            if photo_bytes is not None:
+                return photo_bytes, ""
+            target_id = trigger_entry.get("reply_to_msg_id") if trigger_entry else None
+            target_bytes = self._photo_bytes(self._find_photo_in_reply_chain(target_id)) if target_id else None
+            if target_bytes is not None:
+                return target_bytes, ""
+            if mode_key == "modify":
+                return None, "the replied-to message is not an available photo"
+            return None, ""
+
+        if mode_key == "modify":
+            photo_bytes = self._photo_bytes(photo_entry)
+            if photo_bytes is not None:
+                return photo_bytes, ""
+            return None, "no source image is available for modification"
+
+        return None, ""
+
     async def _execute_evaluation(
         self,
         context: ContextTypes.DEFAULT_TYPE,
@@ -1489,22 +1652,15 @@ class BotHandlers:
             # 1. The trigger message itself is a photo
             if trigger_entry and trigger_entry.get("media_type") == "photo" and trigger_entry.get("media_b64"):
                 photo_entry = trigger_entry
-            # 2. The trigger message is a reply to an earlier photo
+            # 2. The trigger message replies to an earlier photo (possibly through a text reply)
             elif trigger_entry and trigger_entry.get("reply_to_msg_id"):
-                reply_target_id = trigger_entry.get("reply_to_msg_id")
-                for item in reversed(self.state.get_chat_history()):
-                    if item.get("id") == reply_target_id and item.get("media_type") == "photo" and item.get("media_b64"):
-                        photo_entry = item
-                        break
-            # 3. The trigger message explicitly references an image and there is an undescribed photo in recent history
+                photo_entry = self._find_photo_in_reply_chain(trigger_entry.get("reply_to_msg_id"))
+            # 3. An un-described photo from the same recent burst (e.g. photo then instruction)
             if not photo_entry and trigger_entry:
-                txt = (trigger_entry.get("text") or "").lower()
-                image_keywords = ["kép", "kep", "fotó", "foto", "photo", "image", "picture", "rajz", "ábra", "abra"]
-                if any(kw in txt for kw in image_keywords):
-                    for item in reversed(self.state.get_chat_history()):
-                        if item.get("media_type") == "photo" and item.get("media_b64"):
-                            photo_entry = item
-                            break
+                photo_entry = self._select_uninterpreted_photo(trigger_entry)
+            # 4. The trigger text references an image; attach it only when the choice is unambiguous
+            if not photo_entry and trigger_entry:
+                photo_entry = self._select_reference_photo(trigger_entry)
 
             reply_text: Optional[str] = None
             reaction: Optional[Tuple[str, Optional[int]]] = None
@@ -1632,90 +1788,99 @@ class BotHandlers:
                             logger.warning("Failed to set reaction %s on message %d: %s", resolved_emoji, target, e)
             # 2. Image Generation & Modification Action
             if image_spec:
-                # Suppress typing and send upload_photo action strictly while generating
-                try:
-                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
-                except Exception:
-                    pass
-
                 prompt = image_spec.get("prompt", "")
                 caption = image_spec.get("caption") or reply_text or ""
                 source = image_spec.get("source", "new")
-                mode = image_spec.get("mode", "generate")
+                mode = self._normalize_image_mode(image_spec.get("mode", "generate"))
 
-                base_image_bytes = None
-                if mode == "modify" or source == "reply":
-                    # If a photo_entry was already detected in current context, prioritize it
-                    if photo_entry and photo_entry.get("media_b64"):
-                        base_image_bytes = base64.b64decode(photo_entry["media_b64"])
-                    else:
-                        # Search for source image in recent chat history
-                        for item in reversed(self.state.get_chat_history()):
-                            if (source == "reply" and item.get("media_type") == "photo") or (
-                                str(item.get("id")) == str(source) and item.get("media_type") == "photo"
-                            ):
-                                if item.get("media_b64"):
-                                    base_image_bytes = base64.b64decode(item["media_b64"])
-                                    break
-                try:
-                    logger.info(
-                        "Generating/modifying image with model '%s' (mode=%s, source=%s, prompt=%s)",
-                        self.params.model_image_name,
-                        mode,
-                        source,
-                        prompt[:60],
+                base_image_bytes, source_error = self._resolve_image_source(
+                    source=source,
+                    mode=mode,
+                    photo_entry=photo_entry,
+                    trigger_entry=trigger_entry,
+                )
+                if source_error:
+                    logger.warning(
+                        "Skipping image action: %s (mode=%s, source=%s, prompt=%s)",
+                        source_error, mode, source, prompt[:60],
                     )
-                    gen_bytes = await self.llm.generate_image(prompt=prompt, base_image_bytes=base_image_bytes)
-                    compressed_gen = compress_image(gen_bytes, max_dim=1280, quality=85)
-                    gen_b64 = base64.b64encode(compressed_gen).decode("utf-8")
+                    if is_direct_trigger:
+                        lang = self.state.get_language().lower()
+                        if "hungarian" in lang or "magyar" in lang:
+                            reply_text = (
+                                "Nem találom a szerkesztendő képet — válaszolj rá vagy küldd el újra. 🎨"
+                            )
+                        else:
+                            reply_text = (
+                                "I couldn't find the image you want me to edit — "
+                                "reply to it or send it again. 🎨"
+                            )
+                else:
+                    # Suppress typing and send upload_photo action strictly while generating
+                    try:
+                        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+                    except Exception:
+                        pass
 
                     try:
-                        sent_photo = await context.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=gen_bytes,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
+                        logger.info(
+                            "Generating/modifying image with model '%s' (mode=%s, source=%s, prompt=%s)",
+                            self.params.model_image_name,
+                            mode,
+                            source,
+                            prompt[:60],
                         )
-                    except Exception:
-                        sent_photo = await context.bot.send_photo(
-                            chat_id=chat_id,
-                            photo=gen_bytes,
-                            caption=caption,
-                        )
-                    now_str = self.state.get_current_time_str()
+                        gen_bytes = await self.llm.generate_image(prompt=prompt, base_image_bytes=base_image_bytes)
+                        compressed_gen = compress_image(gen_bytes, max_dim=1280, quality=85)
+                        gen_b64 = base64.b64encode(compressed_gen).decode("utf-8")
 
-                    if self.state.is_debug_mode():
-                        reply_info = f" | Reply to msg ID: {trigger_msg_id}" if is_direct_trigger else ""
-                        self._log_debug_group_msg(
-                            "OUTGOING",
-                            f"Chat ID: {chat_id} | Message ID: {sent_photo.message_id}{reply_info}\nType: Generated Photo\nCaption: {caption}\nPrompt: {prompt}",
-                        )
-                    # Record generated image in history
-                    photo_entry = {
-                        "id": sent_photo.message_id,
-                        "from_user_id": context.bot.id,
-                        "from_user_name": context.bot.first_name or "Pletykas",
-                        "timestamp_epoch": time.time(),
-                        "timestamp_str": now_str,
-                        "reply_to_msg_id": trigger_msg_id if is_direct_trigger else None,
-                        "reply_to_user_name": None,
-                        "text": f"[Generated Image: {prompt}] {caption}".strip(),
-                        "media_type": "photo",
-                        "media_b64": gen_b64,
-                    }
-                    self.state.append_chat_message(photo_entry)
-                    self.state.append_memory_message(photo_entry)
+                        try:
+                            sent_photo = await context.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=gen_bytes,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            sent_photo = await context.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=gen_bytes,
+                                caption=caption,
+                            )
+                        now_str = self.state.get_current_time_str()
 
-                    # Caption already accompanied photo; avoid duplicate text message
-                    reply_text = None
-                except ImageSafetyBlockedError as e:
-                    logger.warning("Image generation blocked by the provider's safety filter: %s", e)
-                    if is_direct_trigger:
-                        reply_text = "Ezt a képet a szűrő elkaszálta, mert sérti a szabályzatot — próbáld finomabban megfogalmazni, és újra megpróbálom. 🚫🎨"
-                except Exception as e:
-                    logger.error("Failed to generate or send image: %s", e)
-                    if is_direct_trigger:
-                        reply_text = "sorry, I couldn't generate the image... 🎨❌"
+                        if self.state.is_debug_mode():
+                            reply_info = f" | Reply to msg ID: {trigger_msg_id}" if is_direct_trigger else ""
+                            self._log_debug_group_msg(
+                                "OUTGOING",
+                                f"Chat ID: {chat_id} | Message ID: {sent_photo.message_id}{reply_info}\nType: Generated Photo\nCaption: {caption}\nPrompt: {prompt}",
+                            )
+                        # Record generated image in history
+                        photo_entry = {
+                            "id": sent_photo.message_id,
+                            "from_user_id": context.bot.id,
+                            "from_user_name": context.bot.first_name or "Pletykas",
+                            "timestamp_epoch": time.time(),
+                            "timestamp_str": now_str,
+                            "reply_to_msg_id": trigger_msg_id if is_direct_trigger else None,
+                            "reply_to_user_name": None,
+                            "text": f"[Generated Image: {prompt}] {caption}".strip(),
+                            "media_type": "photo",
+                            "media_b64": gen_b64,
+                        }
+                        self.state.append_chat_message(photo_entry)
+                        self.state.append_memory_message(photo_entry)
+
+                        # Caption already accompanied photo; avoid duplicate text message
+                        reply_text = None
+                    except ImageSafetyBlockedError as e:
+                        logger.warning("Image generation blocked by the provider's safety filter: %s", e)
+                        if is_direct_trigger:
+                            reply_text = "Ezt a képet a szűrő elkaszálta, mert sérti a szabályzatot — próbáld finomabban megfogalmazni, és újra megpróbálom. 🚫🎨"
+                    except Exception as e:
+                        logger.error("Failed to generate or send image: %s", e)
+                        if is_direct_trigger:
+                            reply_text = "sorry, I couldn't generate the image... 🎨❌"
 
             # 2.5. Memory Clearing & Forgetting Action
             forget_spec = None

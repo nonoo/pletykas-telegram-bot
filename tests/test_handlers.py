@@ -904,6 +904,197 @@ async def test_image_modify_via_multimodal_vision(test_setup):
         assert photo_kwargs["caption"] == "Itt a vigyorgó robocop!"
 
 
+def _tiny_png(color: str = "red") -> bytes:
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), color=color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _photo_history_entry(msg_id: int, color: str, text: str = "[Photo]") -> dict:
+    return {
+        "id": msg_id,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": text,
+        "media_type": "photo",
+        "media_b64": base64.b64encode(_tiny_png(color)).decode("utf-8"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_image_source_id_overrides_vision_photo(test_setup):
+    """An explicit Source ID must win over the heuristic photo attached to the vision request."""
+    p, s, m, llm, handlers = test_setup
+    cat_bytes = _tiny_png("red")
+    dog_bytes = _tiny_png("blue")
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(100, "red", "[Photo: a red cat]"))
+    s.append_chat_message(_photo_history_entry(200, "blue", "[Photo]"))  # newest, undescribed
+    s.append_chat_message({
+        "id": 300,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "please edit the cat picture",
+        "media_type": "none",
+    })
+
+    vision_eval = (
+        None,
+        None,
+        {"prompt": "make the cat green", "caption": "Done", "source": "100", "mode": "modify"},
+        "a red cat",
+        None,
+    )
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)) as mock_vision, \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=300)
+
+    mock_vision.assert_awaited_once()
+    assert mock_vision.call_args.kwargs["image_bytes"] == dog_bytes
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == cat_bytes
+
+
+@pytest.mark.asyncio
+async def test_plain_followup_after_photo_attaches_image(test_setup):
+    """A photo followed immediately by 'make it ...' must attach the image without an image keyword."""
+    p, s, m, llm, handlers = test_setup
+    photo_bytes = _tiny_png("red")
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(150, "red", "[Photo]"))
+    s.append_chat_message({
+        "id": 151,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "make it black and white",
+        "media_type": "none",
+    })
+
+    vision_eval = (
+        None,
+        None,
+        {"prompt": "black and white photo", "caption": "Done", "source": "reply", "mode": "modify"},
+        "a red cat",
+        None,
+    )
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)) as mock_vision, \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=151)
+
+    mock_vision.assert_awaited_once()
+    assert mock_vision.call_args.kwargs["image_bytes"] == photo_bytes
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == photo_bytes
+
+
+@pytest.mark.asyncio
+async def test_reply_chain_to_photo_attaches_image(test_setup):
+    """Replying to a text reply under a photo still resolves the original photo."""
+    p, s, m, llm, handlers = test_setup
+    photo_bytes = _tiny_png("red")
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(600, "red", "[Photo: a red cat]"))
+    s.append_chat_message({
+        "id": 601,
+        "from_user_id": 9999,
+        "from_user_name": "Pletykas",
+        "text": "Nice cat!",
+        "media_type": "none",
+        "reply_to_msg_id": 600,
+        "reply_to_user_name": "User",
+    })
+    s.append_chat_message({
+        "id": 602,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "make it green",
+        "media_type": "none",
+        "reply_to_msg_id": 601,
+        "reply_to_user_name": "Pletykas",
+    })
+
+    vision_eval = (
+        None,
+        None,
+        {"prompt": "make the cat green", "caption": "Done", "source": "reply", "mode": "modify"},
+        "a red cat",
+        None,
+    )
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)) as mock_vision, \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=602)
+
+    mock_vision.assert_awaited_once()
+    assert mock_vision.call_args.kwargs["image_bytes"] == photo_bytes
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == photo_bytes
+
+
+@pytest.mark.asyncio
+async def test_image_source_id_used_when_mode_is_generate(test_setup):
+    """Source: <id> alone (without Mode: modify) still loads the referenced image."""
+    p, s, m, llm, handlers = test_setup
+    cat_bytes = _tiny_png("blue")
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(101, "blue", "[Photo: a blue cat]"))
+    s.append_chat_message({
+        "id": 102,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "generate a variant of message 101",
+        "media_type": "none",
+    })
+
+    reply_eval = (
+        None,
+        None,
+        {"prompt": "a blue cat variant", "caption": "Here it is", "source": "101", "mode": "generate"},
+        None,
+    )
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=reply_eval)), \
+         patch.object(handlers, "_recall_deep_memory", AsyncMock(return_value="")), \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=102)
+
+    mock_gen.assert_awaited_once()
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == cat_bytes
+
+
 @pytest.mark.asyncio
 async def test_execute_evaluation_annotation_dialect_posts_image(test_setup):
     """Regression: a reply imitating the '[Generated Image: ...]' history note must generate and
@@ -955,6 +1146,148 @@ async def test_execute_evaluation_annotation_dialect_posts_image(test_setup):
     mock_bot.send_photo.assert_awaited_once()
     assert mock_bot.send_photo.call_args.kwargs["caption"] == "Tessék, Nonoo, itt vannak a szüleim! 😏"
     mock_bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_image_mode_edit_alias_uses_detected_photo(test_setup):
+    """Mode drift ('edit' instead of 'modify') must still load the photo shown to the model."""
+    p, s, m, llm, handlers = test_setup
+    photo_bytes = _tiny_png("purple")
+    out_bytes = _tiny_png("orange")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(201, "purple", "[Photo: a purple cat]"))
+    s.append_chat_message({
+        "id": 202,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "edit the image",
+        "media_type": "none",
+    })
+
+    vision_eval = (
+        None,
+        None,
+        {"prompt": "make the cat orange", "caption": "Done", "source": "new", "mode": "edit"},
+        "a purple cat",
+        None,
+    )
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)), \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=202)
+
+    mock_gen.assert_awaited_once()
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == photo_bytes
+
+
+@pytest.mark.asyncio
+async def test_image_modify_without_source_skips_generation(test_setup):
+    """A modify request with no resolvable image must not silently generate a fresh image."""
+    p, s, m, llm, handlers = test_setup
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message({
+        "id": 301,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "edit the image",
+        "media_type": "none",
+    })
+    reply_eval = (
+        None,
+        None,
+        {"prompt": "make it green", "caption": "", "source": "999", "mode": "modify"},
+        None,
+    )
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=reply_eval)), \
+         patch.object(handlers, "_recall_deep_memory", AsyncMock(return_value="")), \
+         patch.object(llm, "generate_image", AsyncMock(return_value=_tiny_png("green"))) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=301)
+
+    mock_gen.assert_not_awaited()
+    mock_bot.send_photo.assert_not_awaited()
+    mock_bot.send_message.assert_awaited()
+    assert "couldn't find the image" in mock_bot.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_described_photos_defer_to_text_model(test_setup):
+    """With several described photos, the text model resolves the exact Source ID."""
+    p, s, m, llm, handlers = test_setup
+    cat_bytes = _tiny_png("red")
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(401, "red", "[Photo: a red cat]"))
+    s.append_chat_message(_photo_history_entry(402, "blue", "[Photo: a blue dog]"))
+    s.append_chat_message({
+        "id": 403,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "edit the cat photo",
+        "media_type": "none",
+    })
+
+    reply_eval = (
+        None,
+        None,
+        {"prompt": "make the cat green", "caption": "Done", "source": "401", "mode": "modify"},
+        None,
+    )
+    with patch.object(llm, "describe_and_reply_image", AsyncMock()) as mock_vision, \
+         patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=reply_eval)), \
+         patch.object(handlers, "_recall_deep_memory", AsyncMock(return_value="")), \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=403)
+
+    mock_vision.assert_not_awaited()
+    mock_gen.assert_awaited_once()
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == cat_bytes
+
+
+def test_format_transcript_includes_reply_target_id(test_setup):
+    p, s, m, llm, handlers = test_setup
+    transcript = handlers._format_transcript([
+        {
+            "id": 10,
+            "from_user_name": "Alice",
+            "timestamp_str": "12:00",
+            "reply_to_msg_id": 77,
+            "reply_to_user_name": "Bob",
+            "text": "see this",
+        },
+        {
+            "id": 11,
+            "from_user_name": "Alice",
+            "timestamp_str": "12:01",
+            "reply_to_msg_id": 88,
+            "reply_to_user_name": None,
+            "text": "and this",
+        },
+    ])
+    assert "(replying to Bob, message ID: 77)" in transcript
+    assert "(replying to message ID: 88)" in transcript
 
 
 @pytest.mark.asyncio

@@ -930,14 +930,18 @@ class LLMClient:
             )
 
         image_capability = """[Image Generation & Modification Capability]
-If a user asks you to generate a new image or modify an existing image (either by referring to an image from the conversation or by replying to an image message):
+If a user asks you to generate a new image, or asks you to change an existing image (in natural language — they do NOT need to say "edit"; e.g. "make it black and white", "remove the person on the left", "szerkeszd..."):
 Output a special image block:
 <GENERATE_IMAGE>
 Prompt: <detailed English visual prompt describing the desired image or modifications>
 Caption: <your in-character message or response in the chat language to accompany the image>
-Source: <message ID if referring to an image in transcript, or 'reply' if replying to a photo message, or 'new'>
-Mode: <'modify' if changing an existing image, or 'generate' if creating a fresh image>
+Source: <message ID of the referenced image in the transcript, or 'reply' if the trigger message replies to a photo, or 'new' for a fresh image>
+Mode: <'modify' if changing an existing image, or 'generate' if creating a new image>
 </GENERATE_IMAGE>
+Rules:
+- When modifying an image, set Mode to modify and set Source to the referenced image's message ID (or 'reply' when the trigger is a reply to that photo).
+- Use Source: new only for a completely fresh image with no existing source.
+- When several images exist, use the message ID from the transcript that matches the user's reference; do not blindly use the newest or most recent one.
 CRITICAL PROTOCOL RULE: You MUST always keep the exact English field keywords 'Prompt:', 'Caption:', 'Source:', 'Mode:' and tag names verbatim. NEVER translate these field labels into Hungarian or any other language."""
         schedule_section = """[Scheduled Replies & Reminders]
 If a user asks you to remind them, check something later, or schedule a periodic message/check:
@@ -1092,6 +1096,9 @@ Timezone: {timezone_str}
 
 [Photo Caption from User]
 {caption if caption else "(no caption provided)"}
+
+[Attached Image]
+The attached image is the image the user is talking about in this turn. If the user asks to change it in any way, emit a <GENERATE_IMAGE> block with Mode: modify and Source: reply (or its transcript message ID).
 
 {instructions}
 
