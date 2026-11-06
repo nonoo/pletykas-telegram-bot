@@ -972,6 +972,25 @@ async def test_debug_mode_stdout_logging(capsys):
     assert "--- [DEBUG TEST_REQ] ---" in captured.out
     assert '{"prompt": "hello"}' in captured.out
 
+
+@pytest.mark.asyncio
+async def test_debug_payload_captured_in_memory_when_debug_off(capsys):
+    p = Params()
+    p.model_name = "test-model"
+    p.model_api_base = "https://test.api.com"
+    p.model_api_key = "test-key"
+    s = StateManager("test.json")
+    s.set_debug_mode(False)
+    client = LLMClient(p, s)
+
+    client._log_debug_payload("TEST_REQ", '{"prompt": "hello"}')
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    log_text = s.debug_log.dump()
+    assert log_text.startswith("[")
+    assert "--- [DEBUG TEST_REQ] ---" in log_text
+    assert '{"prompt": "hello"}' in log_text
+
 @pytest.mark.asyncio
 async def test_debug_mode_openai_compatible_response_with_content(capsys):
     p = Params()

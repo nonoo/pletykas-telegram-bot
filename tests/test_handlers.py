@@ -1348,7 +1348,7 @@ async def test_image_safety_block_replies_in_character(test_setup):
 
 
 @pytest.mark.asyncio
-async def test_debug_mode_logs_group_messages(test_setup):
+async def test_debug_mode_logs_group_messages(test_setup, capsys):
     p, s, m, llm, handlers = test_setup
     mock_bot = MagicMock()
     mock_bot.id = 9999
@@ -1378,31 +1378,62 @@ async def test_debug_mode_logs_group_messages(test_setup):
     mock_update.effective_chat = mock_chat
     mock_update.effective_message = mock_msg
 
-    with patch.object(handlers, "_log_debug_group_msg") as mock_log_dbg:
-        # Debug mode OFF: nothing logged
-        s.set_debug_mode(False)
-        await handlers.on_message(mock_update, mock_context)
-        mock_log_dbg.assert_not_called()
+    # Debug mode OFF: nothing on stdout, but the entry is captured in memory
+    s.set_debug_mode(False)
+    capsys.readouterr()
+    await handlers.on_message(mock_update, mock_context)
+    assert capsys.readouterr().out == ""
+    captured = s.debug_log.dump()
+    assert "--- [DEBUG TELEGRAM GROUP INCOMING] ---" in captured
+    assert "Alice" in captured
+    assert "Hello group chat!" in captured
 
-        # Debug mode ON: incoming group message logged
-        s.set_debug_mode(True)
-        mock_msg.message_id = 12346
-        await handlers.on_message(mock_update, mock_context)
-        assert mock_log_dbg.call_count >= 1
-        inc_call = mock_log_dbg.call_args_list[0]
-        assert inc_call[0][0] == "INCOMING"
-        assert "12346" in inc_call[0][1]
-        assert "Alice" in inc_call[0][1]
-        assert "Hello group chat!" in inc_call[0][1]
+    # Debug mode ON: the same entry is additionally streamed to stdout
+    s.set_debug_mode(True)
+    mock_msg.message_id = 12346
+    await handlers.on_message(mock_update, mock_context)
+    out = capsys.readouterr().out
+    assert "--- [DEBUG TELEGRAM GROUP INCOMING] ---" in out
+    assert "12346" in out
+    assert s.debug_log.dump().count("--- [DEBUG TELEGRAM GROUP INCOMING] ---") == 2
 
-        # Outgoing message logged
-        mock_log_dbg.reset_mock()
-        with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("Hi Alice!", None, None, None))):
-            await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=12346)
-            assert mock_log_dbg.call_count >= 1
-            out_call = mock_log_dbg.call_args_list[0]
-            assert out_call[0][0] == "OUTGOING"
-            assert "Hi Alice!" in out_call[0][1]
+    # Outgoing message captured and printed
+    with patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=("Hi Alice!", None, None, None))):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=12346)
+    out = capsys.readouterr().out
+    assert "--- [DEBUG TELEGRAM GROUP OUTGOING] ---" in out
+    assert "Hi Alice!" in out
+    assert "Hi Alice!" in s.debug_log.dump()
+
+
+@pytest.mark.asyncio
+async def test_cmd_debuglog_downloads_memory_log(test_setup):
+    p, s, m, llm, handlers = test_setup
+    mock_update = MagicMock()
+    mock_update.effective_chat = MagicMock(type="private")
+    mock_update.effective_user = MagicMock(id=p.admin_user_ids[0])
+    mock_msg = MagicMock()
+    mock_msg.reply_text = AsyncMock()
+    mock_msg.reply_document = AsyncMock()
+    mock_update.effective_message = mock_msg
+    mock_context = MagicMock()
+    mock_context.args = []
+
+    # Empty log -> informational text, no document
+    s.set_debug_mode(False)
+    await handlers.cmd_debuglog(mock_update, mock_context)
+    mock_msg.reply_document.assert_not_awaited()
+    assert "empty" in mock_msg.reply_text.call_args[0][0]
+
+    # Debug OFF still captures, so the download carries the payload
+    llm._log_debug_payload("TEST_REQ", "hello")
+    await handlers.cmd_debuglog(mock_update, mock_context)
+    mock_msg.reply_document.assert_awaited_once()
+    kwargs = mock_msg.reply_document.call_args[1]
+    assert kwargs["filename"] == "pletykas-debuglog.txt"
+    body = kwargs["document"].getvalue().decode("utf-8")
+    assert "--- [DEBUG TEST_REQ] ---" in body
+    assert "hello" in body
 
 @pytest.mark.asyncio
 async def test_cmd_memories_and_load_workflow(test_setup):
@@ -3093,6 +3124,7 @@ async def test_cmd_archive_age_and_deepmemories_guards(test_setup):
     # Non-admin: silently ignored
     await handlers.cmd_archive_age(mock_update, mock_context)
     await handlers.cmd_deepmemories(mock_update, mock_context)
+    await handlers.cmd_debuglog(mock_update, mock_context)
     mock_msg.reply_text.assert_not_awaited()
     mock_msg.reply_document.assert_not_awaited()
 
@@ -3101,6 +3133,7 @@ async def test_cmd_archive_age_and_deepmemories_guards(test_setup):
     mock_update.effective_chat = MagicMock(type="group")
     await handlers.cmd_archive_age(mock_update, mock_context)
     await handlers.cmd_deepmemories(mock_update, mock_context)
+    await handlers.cmd_debuglog(mock_update, mock_context)
     mock_msg.reply_text.assert_not_awaited()
     mock_msg.reply_document.assert_not_awaited()
 

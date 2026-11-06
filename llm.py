@@ -356,8 +356,10 @@ class LLMClient:
         self._local.session = val
 
     def _log_debug_payload(self, title: str, text: str) -> None:
+        block = f"--- [DEBUG {title}] ---\n{text}\n--- [END DEBUG {title}] ---"
+        self.state.debug_log.append(f"[{self.state.get_current_time_str()}] {block}")
         if self.state.is_debug_mode():
-            sys.stdout.write(f"\n--- [DEBUG {title}] ---\n{text}\n--- [END DEBUG {title}] ---\n")
+            sys.stdout.write(f"\n{block}\n")
             sys.stdout.flush()
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -467,8 +469,7 @@ class LLMClient:
         elif tl.isdigit():
             payload["thinking"] = {"type": "enabled", "budget_tokens": int(tl)}
 
-        if self.state.is_debug_mode():
-            self._log_debug_payload(f"LLM REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
+        self._log_debug_payload(f"LLM REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
 
         is_retry = False
         final_resp_text = ""
@@ -482,8 +483,7 @@ class LLMClient:
         async with session.post(url, **post_kwargs) as resp:
             resp_text = await resp.text()
             if resp.status == 400:
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
+                self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
                 text_err = resp_text
                 retry_needed = False
 
@@ -505,13 +505,11 @@ class LLMClient:
                     retry_needed = True
 
                 if retry_needed:
-                    if self.state.is_debug_mode():
-                        self._log_debug_payload(f"LLM RETRY REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
+                    self._log_debug_payload(f"LLM RETRY REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
                     async with session.post(url, **post_kwargs) as retry_resp:
                         retry_text = await retry_resp.text()
                         if retry_resp.status != 200:
-                            if self.state.is_debug_mode():
-                                self._log_debug_payload(f"LLM RETRY RESPONSE ({retry_resp.status}): {url}", retry_text)
+                            self._log_debug_payload(f"LLM RETRY RESPONSE ({retry_resp.status}): {url}", retry_text)
                             raise RuntimeError(f"OpenAI compatible API error {retry_resp.status}: {retry_text}")
                         data = json.loads(retry_text)
                         final_status = retry_resp.status
@@ -520,8 +518,7 @@ class LLMClient:
                 else:
                     raise RuntimeError(f"OpenAI compatible API error {resp.status}: {text_err}")
             elif resp.status != 200:
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
+                self._log_debug_payload(f"LLM RESPONSE ({resp.status}): {url}", resp_text)
                 raise RuntimeError(f"OpenAI compatible API error {resp.status}: {resp_text}")
             else:
                 data = json.loads(resp_text)
@@ -533,11 +530,10 @@ class LLMClient:
         if choices:
             content = choices[0].get("message", {}).get("content", "") or ""
 
-        if self.state.is_debug_mode():
-            raw_clean = final_resp_text.rstrip("\r\n")
-            dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
-            title = f"LLM RETRY RESPONSE ({final_status}): {url}" if is_retry else f"LLM RESPONSE ({final_status}): {url}"
-            self._log_debug_payload(title, dbg_text)
+        raw_clean = final_resp_text.rstrip("\r\n")
+        dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
+        title = f"LLM RETRY RESPONSE ({final_status}): {url}" if is_retry else f"LLM RESPONSE ({final_status}): {url}"
+        self._log_debug_payload(title, dbg_text)
         usage = data.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", 0) or 0
         completion_tokens = usage.get("completion_tokens", 0) or 0
@@ -587,16 +583,14 @@ class LLMClient:
         payload: Dict[str, Any] = {"model": model_name, "input": texts}
         if dim > 0:
             payload["dimensions"] = dim
-        if self.state.is_debug_mode():
-            previews = ", ".join(f"[{len(t)}ch] {t[:80]}" for t in texts)
-            self._log_debug_payload(f"EMBED REQUEST: {url}", f"model={model_name} texts={len(texts)}\n{previews}")
+        previews = ", ".join(f"[{len(t)}ch] {t[:80]}" for t in texts)
+        self._log_debug_payload(f"EMBED REQUEST: {url}", f"model={model_name} texts={len(texts)}\n{previews}")
 
         req_timeout = aiohttp.ClientTimeout(total=DEEPMEM_EMBED_TIMEOUT_SEC)
         async with session.post(url, headers=headers, json=payload, timeout=req_timeout) as resp:
             resp_text = await resp.text()
             if resp.status != 200:
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"EMBED RESPONSE ({resp.status}): {url}", resp_text)
+                self._log_debug_payload(f"EMBED RESPONSE ({resp.status}): {url}", resp_text)
                 raise RuntimeError(f"Embeddings API error {resp.status}: {resp_text}")
         data = json.loads(resp_text)
         rows = sorted(data.get("data", []), key=lambda row: row.get("index", 0))
@@ -605,8 +599,7 @@ class LLMClient:
             raise RuntimeError(
                 f"embedding count/dimension mismatch: got {len(vectors)} vectors for {len(texts)} texts"
             )
-        if self.state.is_debug_mode():
-            self._log_debug_payload(f"EMBED RESPONSE (200): {url}", f"{len(vectors)} vectors x {len(vectors[0])} dims")
+        self._log_debug_payload(f"EMBED RESPONSE (200): {url}", f"{len(vectors)} vectors x {len(vectors[0])} dims")
         return vectors
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
@@ -644,15 +637,14 @@ class LLMClient:
         if max_output_tokens is not None:
             config_kwargs["max_output_tokens"] = max_output_tokens
         config = types.GenerateContentConfig(**config_kwargs)
-        if self.state.is_debug_mode():
-            sdk_dbg = {
-                "model": model_name,
-                "contents": str(contents),
-                "system_instruction": system_instruction,
-                "thinking_level": thinking_level,
-                "max_output_tokens": max_output_tokens,
-            }
-            self._log_debug_payload(f"GENAI SDK REQUEST ({model_name})", json.dumps(sdk_dbg, indent=2, default=str))
+        sdk_dbg = {
+            "model": model_name,
+            "contents": str(contents),
+            "system_instruction": system_instruction,
+            "thinking_level": thinking_level,
+            "max_output_tokens": max_output_tokens,
+        }
+        self._log_debug_payload(f"GENAI SDK REQUEST ({model_name})", json.dumps(sdk_dbg, indent=2, default=str))
 
         try:
             response = await client.aio.models.generate_content(
@@ -673,15 +665,14 @@ class LLMClient:
                 raise
 
         content = response.text or ""
-        if self.state.is_debug_mode():
-            raw_resp = ""
-            try:
-                raw_resp = response.model_dump_json(exclude_none=True)
-            except Exception:
-                raw_resp = str(response)
-            raw_clean = raw_resp.rstrip("\r\n")
-            dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
-            self._log_debug_payload(f"GENAI SDK RESPONSE ({model_name})", dbg_text)
+        raw_resp = ""
+        try:
+            raw_resp = response.model_dump_json(exclude_none=True)
+        except Exception:
+            raw_resp = str(response)
+        raw_clean = raw_resp.rstrip("\r\n")
+        dbg_text = f"{raw_clean}\n{content}" if content else raw_clean
+        self._log_debug_payload(f"GENAI SDK RESPONSE ({model_name})", dbg_text)
 
         p_tokens = 0
         c_tokens = 0
@@ -1499,31 +1490,29 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             if not img_base or not is_google_host:
                 # Call via native SDK
                 client = self._get_genai_client(img_key)
-                if self.state.is_debug_mode():
-                    dbg_payload = {
-                        "model": model_id,
-                        "generation_config": generation_config,
-                        "response_modalities": ["image", "text"],
-                    }
-                    if isinstance(input_payload, list):
-                        dbg_input = []
-                        for part in input_payload:
-                            if isinstance(part, dict) and part.get("type") == "image":
-                                dbg_input.append({"type": "image", "data": f"<base64 image {len(part.get('data', ''))} chars>", "mime_type": part.get("mime_type")})
-                            else:
-                                dbg_input.append(part)
-                        dbg_payload["input"] = dbg_input
-                    else:
-                        dbg_payload["input"] = input_payload
-                    self._log_debug_payload(f"IMAGE REQUEST (Google Interactions SDK: {model_id})", json.dumps(dbg_payload, indent=2, ensure_ascii=False))
+                dbg_payload = {
+                    "model": model_id,
+                    "generation_config": generation_config,
+                    "response_modalities": ["image", "text"],
+                }
+                if isinstance(input_payload, list):
+                    dbg_input = []
+                    for part in input_payload:
+                        if isinstance(part, dict) and part.get("type") == "image":
+                            dbg_input.append({"type": "image", "data": f"<base64 image {len(part.get('data', ''))} chars>", "mime_type": part.get("mime_type")})
+                        else:
+                            dbg_input.append(part)
+                    dbg_payload["input"] = dbg_input
+                else:
+                    dbg_payload["input"] = input_payload
+                self._log_debug_payload(f"IMAGE REQUEST (Google Interactions SDK: {model_id})", json.dumps(dbg_payload, indent=2, ensure_ascii=False))
                 interaction = await client.aio.interactions.create(
                     model=model_id,
                     input=input_payload,
                     generation_config=generation_config,
                     response_modalities=["image", "text"],
                 )
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"IMAGE RESPONSE (Google Interactions SDK: {model_id})", "<image data received>")
+                self._log_debug_payload(f"IMAGE RESPONSE (Google Interactions SDK: {model_id})", "<image data received>")
                 img_bytes = self._extract_image_from_interaction(interaction)
                 if img_bytes:
                     return img_bytes
@@ -1546,21 +1535,19 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     "generation_config": generation_config,
                     "response_modalities": ["image", "text"],
                 }
-                if self.state.is_debug_mode():
-                    dbg_payload = dict(payload)
-                    if isinstance(payload.get("input"), list):
-                        dbg_input = []
-                        for part in payload["input"]:
-                            if isinstance(part, dict) and part.get("type") == "image":
-                                dbg_input.append({"type": "image", "data": f"<base64 image {len(part.get('data', ''))} chars>", "mime_type": part.get("mime_type")})
-                            else:
-                                dbg_input.append(part)
-                        dbg_payload["input"] = dbg_input
-                    self._log_debug_payload(f"IMAGE REQUEST: {url}", json.dumps(dbg_payload, indent=2, ensure_ascii=False))
+                dbg_payload = dict(payload)
+                if isinstance(payload.get("input"), list):
+                    dbg_input = []
+                    for part in payload["input"]:
+                        if isinstance(part, dict) and part.get("type") == "image":
+                            dbg_input.append({"type": "image", "data": f"<base64 image {len(part.get('data', ''))} chars>", "mime_type": part.get("mime_type")})
+                        else:
+                            dbg_input.append(part)
+                    dbg_payload["input"] = dbg_input
+                self._log_debug_payload(f"IMAGE REQUEST: {url}", json.dumps(dbg_payload, indent=2, ensure_ascii=False))
                 async with session.post(url, json=payload) as resp:
                     resp_text = await resp.text()
-                    if self.state.is_debug_mode():
-                        self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
+                    self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
                     if resp.status != 200:
                         raise RuntimeError(f"Google Interactions API error {resp.status}: {resp_text}")
                     res_json = json.loads(resp_text)
@@ -1586,24 +1573,21 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 if img_size:
                     openai_size = "1024x1024" if img_size.upper() == "1K" else ("1792x1024" if img_size.upper() == "2K" else img_size)
                     data.add_field("size", openai_size)
-                if self.state.is_debug_mode():
-                    dbg_data = {
-                        "model": img_name,
-                        "prompt": prompt,
-                        "image": f"<base64 image {len(base_image_bytes)} bytes>",
-                        "response_format": "b64_json",
-                    }
-                    if img_size:
-                        dbg_data["size"] = openai_size
-                    self._log_debug_payload(f"IMAGE REQUEST: {url}", json.dumps(dbg_data, indent=2, ensure_ascii=False))
+                dbg_data = {
+                    "model": img_name,
+                    "prompt": prompt,
+                    "image": f"<base64 image {len(base_image_bytes)} bytes>",
+                    "response_format": "b64_json",
+                }
+                if img_size:
+                    dbg_data["size"] = openai_size
+                self._log_debug_payload(f"IMAGE REQUEST: {url}", json.dumps(dbg_data, indent=2, ensure_ascii=False))
                 async with session.post(url, headers=headers, data=data) as resp:
                     if resp.status != 200:
                         err_text = await resp.text()
-                        if self.state.is_debug_mode():
-                            self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", err_text)
+                        self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", err_text)
                         raise RuntimeError(f"OpenAI image edit error {resp.status}: {err_text}")
-                    if self.state.is_debug_mode():
-                        self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>")
+                    self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>")
                     res = await resp.json()
             else:
                 # Text to image via /images/generations
@@ -1617,12 +1601,10 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 if img_size:
                     openai_size = "1024x1024" if img_size.upper() == "1K" else ("1792x1024" if img_size.upper() == "2K" else img_size)
                     payload["size"] = openai_size
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"IMAGE REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
+                self._log_debug_payload(f"IMAGE REQUEST: {url}", json.dumps(payload, indent=2, ensure_ascii=False))
                 async with session.post(url, headers=headers, json=payload) as resp:
                     resp_text = await resp.text()
-                    if self.state.is_debug_mode():
-                        self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
+                    self._log_debug_payload(f"IMAGE RESPONSE ({resp.status}): {url}", "<image data received>" if resp.status == 200 else resp_text)
                     if resp.status != 200:
                         raise RuntimeError(f"OpenAI image generation error {resp.status}: {resp_text}")
                     res = json.loads(resp_text)
@@ -1638,8 +1620,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         client = self._get_genai_client(img_key)
 
         if base_image_bytes:
-            if self.state.is_debug_mode():
-                self._log_debug_payload(f"IMAGE REQUEST (GenAI Imagen SDK: {img_name})", json.dumps({"model": img_name, "prompt": prompt, "edit": True}, indent=2))
+            self._log_debug_payload(f"IMAGE REQUEST (GenAI Imagen SDK: {img_name})", json.dumps({"model": img_name, "prompt": prompt, "edit": True}, indent=2))
             try:
                 raw_ref = types.RawReferenceImage(
                     reference_id=1,
@@ -1651,15 +1632,13 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     reference_images=[raw_ref],
                     config=types.EditImageConfig(number_of_images=1),
                 )
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
+                self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
                 return response.generated_images[0].image.image_bytes
             except Exception as e:
                 logger.warning("edit_image failed with model %s (%s). Falling back to generate_images...", img_name, e)
 
         # Fresh generation
-        if self.state.is_debug_mode():
-            self._log_debug_payload(f"IMAGE REQUEST (GenAI Imagen SDK: {img_name})", json.dumps({"model": img_name, "prompt": prompt, "edit": False}, indent=2))
+        self._log_debug_payload(f"IMAGE REQUEST (GenAI Imagen SDK: {img_name})", json.dumps({"model": img_name, "prompt": prompt, "edit": False}, indent=2))
         config_kwargs: Dict[str, Any] = {
             "number_of_images": 1,
             "output_mime_type": "image/jpeg",
@@ -1672,8 +1651,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 prompt=prompt,
                 config=types.GenerateImagesConfig(**config_kwargs),
             )
-            if self.state.is_debug_mode():
-                self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
+            self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
             return response.generated_images[0].image.image_bytes
         except Exception as e:
             if "image_size" in config_kwargs:
@@ -1684,8 +1662,7 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                     prompt=prompt,
                     config=types.GenerateImagesConfig(**config_kwargs),
                 )
-                if self.state.is_debug_mode():
-                    self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
+                self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
                 return response.generated_images[0].image.image_bytes
             raise
     async def generate_spontaneous_message(

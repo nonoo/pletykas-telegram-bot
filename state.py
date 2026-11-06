@@ -10,6 +10,8 @@ from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 import zoneinfo
 
+from debuglog import DebugLog
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -68,6 +70,8 @@ class StateManager:
         self.scheduled_replies: List[Dict[str, Any]] = []
         self._chathistory_lock = threading.RLock()
         self._memhistory_lock = threading.RLock()
+        # Non-persisted in-memory debug capture shared by LLMClient and BotHandlers.
+        self.debug_log = DebugLog()
     @property
     def history_file_path(self) -> str:
         return self.chathistory_file_path

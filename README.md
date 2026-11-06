@@ -20,6 +20,7 @@ An autonomous, multi-modal Telegram group chatbot designed to seamlessly integra
 - **Web Search & Page Fetch Tools**: Any model can search the web (`<WEB_SEARCH:query>`, executed against DuckDuckGo) and read pages (`<FETCH_URL:url>`); the bot runs the tags and feeds the results back in one follow-up round — provider-independent, with no search settings.
 - **Capability Escalation & Retry**: The fast primary model automatically escalates to the large model (`<RETRY_WITH_LARGE_MODEL>`) when a capability beyond its own reach is needed (e.g. image interpretation).
 - **Autonomous Scheduled Replies & Reminders**: The LLM can autonomously schedule one-shot or periodic reminders/checks (`<SCHEDULE:oneshot>`, `<SCHEDULE:periodic>`). Timers persist across restarts in `pletykas-sched.json` and are viewable/cancellable via `/scheduled`.
+- **Always-On Debug Log**: Raw LLM requests/responses and every incoming/outgoing group message are always captured into an in-memory log with timestamped `[DEBUG ...]` banners, capped at 1 MB by dropping the oldest lines. `/debug [on|off]` only adds stdout streaming; `/debuglog` downloads the log as `pletykas-debuglog.txt`.
 
 ---
 
@@ -106,7 +107,8 @@ podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-tel
 | `/scheduled` | `[list\|cancel <id>]` | Views active scheduled reminders or cancels a specific timer by ID |
 | `/prompt` | `[load\|reset]` | Uploads system prompt file as-is, expects a text file upload to replace prompt, or resets to default |
 | `/image_large` | `[on\|off]` | Toggles large model for image interpretation (default: `ON` instant large model; `OFF` tries small model first) |
-| `/debug` | `[on\|off]` | Toggles debug streaming to stdout (raw LLM payloads and Telegram group messages) |
+| `/debug` | `[on\|off]` | Toggles additional debug streaming to stdout (capture into the in-memory debug log is always on) |
+| `/debuglog` | — | Downloads the in-memory debug log as a .txt file (captured always, capped at 1 MB) |
 | `/memories` | `[load]` | Uploads memories JSON file as-is, or enters waiting mode to validate and load an uploaded JSON file |
 | `/deepmemories` | `[load]` | Uploads deep memories JSON file as-is, or enters waiting mode to validate and load an uploaded JSON file |
 | `/archive_age` | `[days]` | Views or adjusts the age in days after which hot facts are archived to deep memory (default: `3`; `0` disables) |

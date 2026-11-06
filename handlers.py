@@ -41,6 +41,7 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 <b>Status & Stats</b>
 /status - Current status, active parameters, observed count, reply count
 /debug [on|off] - Toggle debug logging of raw LLM request and response bodies
+/debuglog - Download the in-memory debug log (raw LLM payloads + group messages) as a .txt file
 
 <b>Behavior & Timing</b>
 /talkativeness [1-10] - View or adjust autonomous conversation entry level
@@ -378,11 +379,13 @@ class BotHandlers:
         self._curation_lock = threading.Lock()
         self._next_spontaneous_time: Optional[datetime] = None
     def _log_debug_group_msg(self, direction: str, text: str) -> None:
+        banner = f"TELEGRAM GROUP {direction.upper()}"
+        block = f"--- [DEBUG {banner}] ---\n{text}\n--- [END DEBUG {banner}] ---"
+        self.state.debug_log.append(f"[{self.state.get_current_time_str()}] {block}")
         if self.state.is_debug_mode():
-            banner = f"TELEGRAM GROUP {direction.upper()}"
-            sys.stdout.write(f"\n--- [DEBUG {banner}] ---\n{text}\n--- [END DEBUG {banner}] ---\n")
+            sys.stdout.write(f"\n{block}\n")
             sys.stdout.flush()
-            logger.debug("%s:\n%s", banner, text)
+        logger.debug("%s:\n%s", banner, text)
 
     @staticmethod
     def resolve_reaction_emoji(raw_emoji: str) -> Optional[str]:
@@ -418,8 +421,7 @@ class BotHandlers:
             return False
         preview = normalize_message_text(text)[:120]
         logger.warning("Suppressed repeated bot message (identical/near-identical to previous group message): %s", preview)
-        if self.state.is_debug_mode():
-            self._log_debug_group_msg("SUPPRESSED", f"Duplicate reply not sent (matches previous bot message): {preview}")
+        self._log_debug_group_msg("SUPPRESSED", f"Duplicate reply not sent (matches previous bot message): {preview}")
         return True
 
 
@@ -534,6 +536,7 @@ class BotHandlers:
             return
 
         await self.trigger_spontaneous_message(context)
+        self.state.debug_log.cap()
         self.state.set_spontaneous_next_fire_time(None)
         self.schedule_spontaneous_job(context)
 
@@ -583,12 +586,11 @@ class BotHandlers:
         raw_bot_id = getattr(context.bot, "id", 0)
         bot_id = int(raw_bot_id) if isinstance(raw_bot_id, (int, float)) else 0
 
-        if self.state.is_debug_mode():
-            reply_info = f" | Reply to msg ID: {reply_to_msg_id}" if reply_to_msg_id else ""
-            self._log_debug_group_msg(
-                "OUTGOING",
-                f"Chat ID: {chat_id} | Message ID: {sent.message_id}{reply_info}\nType: {poll_type_label}\nQuestion: {question}\nOptions: {', '.join(options)}",
-            )
+        reply_info = f" | Reply to msg ID: {reply_to_msg_id}" if reply_to_msg_id else ""
+        self._log_debug_group_msg(
+            "OUTGOING",
+            f"Chat ID: {chat_id} | Message ID: {sent.message_id}{reply_info}\nType: {poll_type_label}\nQuestion: {question}\nOptions: {', '.join(options)}",
+        )
 
         poll_text = f"[Poll: {question}] Options: {', '.join(options)}"
         entry = {
@@ -655,11 +657,10 @@ class BotHandlers:
                 bot_name = str(bot_name) if isinstance(bot_name, str) else "Pletykas"
                 raw_bot_id = getattr(context.bot, "id", 0)
                 bot_id = int(raw_bot_id) if isinstance(raw_bot_id, (int, float)) else 0
-                if self.state.is_debug_mode():
-                    self._log_debug_group_msg(
-                        "OUTGOING",
-                        f"Chat ID: {group_id} | Message ID: {sent.message_id}\nType: Spontaneous Text Message\nText: {cleaned_text}",
-                    )
+                self._log_debug_group_msg(
+                    "OUTGOING",
+                    f"Chat ID: {group_id} | Message ID: {sent.message_id}\nType: Spontaneous Text Message\nText: {cleaned_text}",
+                )
                 entry = {
                     "id": sent.message_id,
                     "from_user_id": bot_id,
@@ -843,12 +844,11 @@ class BotHandlers:
 
                     if sent_msg:
                         now_str = self.state.get_current_time_str()
-                        if self.state.is_debug_mode():
-                            reply_info = f" | Reply to msg ID: {target_msg_id}" if target_msg_id else ""
-                            self._log_debug_group_msg(
-                                "OUTGOING",
-                                f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Scheduled Reply ({sched_type})\nText: {reply_text}",
-                            )
+                        reply_info = f" | Reply to msg ID: {target_msg_id}" if target_msg_id else ""
+                        self._log_debug_group_msg(
+                            "OUTGOING",
+                            f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Scheduled Reply ({sched_type})\nText: {reply_text}",
+                        )
 
                         bot_uid = getattr(context.bot, "id", 0)
                         bot_uname = getattr(context.bot, "first_name", "Pletykas")
@@ -901,6 +901,8 @@ class BotHandlers:
             if updated_entry:
                 self.schedule_reply_job(context, updated_entry)
             logger.info("Periodic scheduled reply '%s' rescheduled for %s", schedule_id, next_dt.isoformat())
+
+        self.state.debug_log.cap()
 
     def load_and_schedule_pending_replies(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Loads and reschedules pending scheduled replies from persistent state upon bot startup."""
@@ -1162,6 +1164,7 @@ class BotHandlers:
             return {}
         finally:
             self._curation_lock.release()
+            self.state.debug_log.cap()
 
     def trigger_curation_background(self) -> None:
         """Spawns history curation in a separate background thread without blocking the event loop."""
@@ -1244,20 +1247,19 @@ class BotHandlers:
             hits = self.deep_index.query(vectors[0], flat)
             if not hits:
                 return ""
-            if self.state.is_debug_mode():
-                labels = []
-                for score, section, entry in hits:
-                    if section == "memories":
-                        label = str(entry.get("topic", ""))
-                    elif section == "dynamics":
-                        label = " & ".join(str(m) for m in entry.get("members", []))
-                    else:
-                        label = str(entry.get("title", ""))
-                    labels.append(f"{score:.2f}:{label}")
-                self._log_debug_group_msg(
-                    "DEEPMEM RECALL",
-                    f"Query: {query_text[:200]}\nHits: " + ", ".join(labels),
-                )
+            labels = []
+            for score, section, entry in hits:
+                if section == "memories":
+                    label = str(entry.get("topic", ""))
+                elif section == "dynamics":
+                    label = " & ".join(str(m) for m in entry.get("members", []))
+                else:
+                    label = str(entry.get("title", ""))
+                labels.append(f"{score:.2f}:{label}")
+            self._log_debug_group_msg(
+                "DEEPMEM RECALL",
+                f"Query: {query_text[:200]}\nHits: " + ", ".join(labels),
+            )
             return self.deep_index.format_hits(hits)
         except Exception as e:
             logger.warning("Deep-memory recall failed: %s", e)
@@ -1282,6 +1284,8 @@ class BotHandlers:
             self.deep_index.sync(flat, lambda texts: asyncio.run(_embed(texts)))
         except Exception as e:
             logger.warning("Deep-memory embedding refresh failed: %s", e)
+        finally:
+            self.state.debug_log.cap()
 
     def _is_direct_trigger(
         self,
@@ -1774,11 +1778,10 @@ class BotHandlers:
                             message_id=target,
                             reaction=[ReactionTypeEmoji(emoji=resolved_emoji)],
                         )
-                        if self.state.is_debug_mode():
-                            self._log_debug_group_msg(
-                                "OUTGOING",
-                                f"Chat ID: {chat_id} | Target Message ID: {target}\nType: Emoji Reaction\nReaction: {resolved_emoji}",
-                            )
+                        self._log_debug_group_msg(
+                            "OUTGOING",
+                            f"Chat ID: {chat_id} | Target Message ID: {target}\nType: Emoji Reaction\nReaction: {resolved_emoji}",
+                        )
                         logger.info("Dispatched reaction %s on message %d", resolved_emoji, target)
                     except Exception as e:
                         err_str = str(e).lower()
@@ -1849,12 +1852,11 @@ class BotHandlers:
                             )
                         now_str = self.state.get_current_time_str()
 
-                        if self.state.is_debug_mode():
-                            reply_info = f" | Reply to msg ID: {trigger_msg_id}" if is_direct_trigger else ""
-                            self._log_debug_group_msg(
-                                "OUTGOING",
-                                f"Chat ID: {chat_id} | Message ID: {sent_photo.message_id}{reply_info}\nType: Generated Photo\nCaption: {caption}\nPrompt: {prompt}",
-                            )
+                        reply_info = f" | Reply to msg ID: {trigger_msg_id}" if is_direct_trigger else ""
+                        self._log_debug_group_msg(
+                            "OUTGOING",
+                            f"Chat ID: {chat_id} | Message ID: {sent_photo.message_id}{reply_info}\nType: Generated Photo\nCaption: {caption}\nPrompt: {prompt}",
+                        )
                         # Record generated image in history
                         photo_entry = {
                             "id": sent_photo.message_id,
@@ -1976,11 +1978,10 @@ class BotHandlers:
                     summary.get("discarded_jokes", 0),
                 )
 
-                if self.state.is_debug_mode():
-                    self._log_debug_group_msg(
-                        "MEMORY_FORGET",
-                        f"Forget Request: {trigger_text}\nApplied Spec: {json.dumps(forget_spec, ensure_ascii=False)}\nSummary: {json.dumps(summary)}",
-                    )
+                self._log_debug_group_msg(
+                    "MEMORY_FORGET",
+                    f"Forget Request: {trigger_text}\nApplied Spec: {json.dumps(forget_spec, ensure_ascii=False)}\nSummary: {json.dumps(summary)}",
+                )
 
                 if not reply_text or reply_text.strip() == "<NO_REPLY>":
                     lang = self.state.get_language().lower()
@@ -2014,12 +2015,11 @@ class BotHandlers:
                         reply_to_message_id=reply_to_id,
                     )
                 now_str = self.state.get_current_time_str()
-                if self.state.is_debug_mode():
-                    reply_info = f" | Reply to msg ID: {reply_to_id}" if reply_to_id else ""
-                    self._log_debug_group_msg(
-                        "OUTGOING",
-                        f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Text Message\nText: {reply_text}",
-                    )
+                reply_info = f" | Reply to msg ID: {reply_to_id}" if reply_to_id else ""
+                self._log_debug_group_msg(
+                    "OUTGOING",
+                    f"Chat ID: {chat_id} | Message ID: {sent_msg.message_id}{reply_info}\nType: Text Message\nText: {reply_text}",
+                )
 
                 entry = {
                     "id": sent_msg.message_id,
@@ -2057,15 +2057,15 @@ class BotHandlers:
                         text=fallback_text,
                         reply_to_message_id=trigger_msg_id,
                     )
-                    if self.state.is_debug_mode():
-                        self._log_debug_group_msg(
-                            "OUTGOING",
-                            f"Chat ID: {chat_id} | Message ID: {sent_err.message_id} | Reply to msg ID: {trigger_msg_id}\nType: Error Fallback Message\nText: {fallback_text}",
-                        )
+                    self._log_debug_group_msg(
+                        "OUTGOING",
+                        f"Chat ID: {chat_id} | Message ID: {sent_err.message_id} | Reply to msg ID: {trigger_msg_id}\nType: Error Fallback Message\nText: {fallback_text}",
+                    )
                 except Exception:
                     pass
         finally:
             self._active_evaluations.discard(chat_id)
+            self.state.debug_log.cap()
 
     # --- Incoming Message Handlers ---
 
@@ -2219,17 +2219,16 @@ class BotHandlers:
         self.state.append_chat_message(msg_entry)
         self.state.append_memory_message(msg_entry)
 
-        if self.state.is_debug_mode():
-            reply_info = f" | Reply to msg ID: {message.reply_to_message.message_id}" if message.reply_to_message else ""
-            media_info = f" [Media: {media_type}]" if media_type != "none" else ""
-            sender_id = message.from_user.id if message.from_user else 0
-            sender_name = from_name
-            dbg_lines = [
-                f"Chat ID: {chat.id} | Message ID: {message.message_id}{reply_info}",
-                f"From: {sender_name} (ID: {sender_id})",
-                f"Content{media_info}: {user_text}",
-            ]
-            self._log_debug_group_msg("INCOMING", "\n".join(dbg_lines))
+        reply_info = f" | Reply to msg ID: {message.reply_to_message.message_id}" if message.reply_to_message else ""
+        media_info = f" [Media: {media_type}]" if media_type != "none" else ""
+        sender_id = message.from_user.id if message.from_user else 0
+        sender_name = from_name
+        dbg_lines = [
+            f"Chat ID: {chat.id} | Message ID: {message.message_id}{reply_info}",
+            f"From: {sender_name} (ID: {sender_id})",
+            f"Content{media_info}: {user_text}",
+        ]
+        self._log_debug_group_msg("INCOMING", "\n".join(dbg_lines))
 
         # Increment curation counter and trigger consolidation if threshold reached
         curation_count = self.state.increment_messages_since_last_curation()
@@ -2688,6 +2687,7 @@ class BotHandlers:
 
         status_msg = await update.effective_message.reply_text("⏳ Generating spontaneous message for the group...")
         success, detail = await self.trigger_spontaneous_message(context)
+        self.state.debug_log.cap()
         if success:
             if self.state.is_spontaneous_enabled():
                 self.state.set_spontaneous_next_fire_time(None)
@@ -2874,6 +2874,24 @@ class BotHandlers:
             await update.effective_message.reply_text("✅ Debug mode turned <b>OFF</b>.", parse_mode=ParseMode.HTML)
         else:
             await update.effective_message.reply_text("❌ Usage: <code>/debug [on|off]</code>", parse_mode=ParseMode.HTML)
+
+    async def cmd_debuglog(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_admin(update.effective_user.id if update.effective_user else None):
+            return
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+
+        log_text = self.state.debug_log.dump()
+        if not log_text.strip():
+            await update.effective_message.reply_text("🧾 Debug log is empty.")
+            return
+        await update.effective_message.reply_document(
+            document=io.BytesIO(log_text.encode("utf-8")),
+            filename="pletykas-debuglog.txt",
+            caption="🧾 <b>Pletykas Debug Log</b>\nCaptured in memory (always on), capped at 1 MB.",
+            parse_mode=ParseMode.HTML,
+        )
+
     async def cmd_image_large_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_admin(update.effective_user.id if update.effective_user else None):
             return
@@ -3141,6 +3159,7 @@ class BotHandlers:
         application.add_handler(CommandHandler(["spontaneous_interval", "spontaneousinterval"], self.cmd_spontaneous_interval))
         application.add_handler(CommandHandler("prompt", self.cmd_prompt))
         application.add_handler(CommandHandler("debug", self.cmd_debug))
+        application.add_handler(CommandHandler("debuglog", self.cmd_debuglog))
         application.add_handler(CommandHandler(["image_large", "image_large_model", "imagelarge"], self.cmd_image_large_model))
         application.add_handler(CommandHandler("memories", self.cmd_memories))
         application.add_handler(CommandHandler("deepmemories", self.cmd_deepmemories))
