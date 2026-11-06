@@ -3160,3 +3160,13 @@ async def test_cmd_status_and_help_include_deep_surfaces(test_setup):
     assert "/deepmemories" in HELP_MESSAGE
     assert "/deepmemories load" in HELP_MESSAGE
     assert "/archive_age" in HELP_MESSAGE
+
+
+def test_help_message_uses_only_supported_html_tags():
+    """Telegram rejects the whole message when HELP_MESSAGE contains an unknown tag (e.g. an
+    unescaped "<id>" placeholder), so only the supported entity tags may appear."""
+    import re
+    from handlers import HELP_MESSAGE
+
+    tags = {tag.lower() for tag in re.findall(r"</?([A-Za-z][A-Za-z0-9-]*)", HELP_MESSAGE)}
+    assert tags <= {"b", "i", "u", "s", "a", "code", "pre", "blockquote"}

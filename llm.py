@@ -399,7 +399,11 @@ class LLMClient:
         key = api_key.strip()
         clients = self._genai_clients
         if key not in clients:
-            clients[key] = genai.Client(api_key=key)
+            # Pin v1beta: google-genai >= 3.0 defaults to v1, which rejects beta-only fields
+            # (interactions `response_modalities`, `thinking_level`).
+            clients[key] = genai.Client(
+                api_key=key, http_options=types.HttpOptions(api_version="v1beta")
+            )
         return clients[key]
     def _is_genai_model(self, model_name: str, api_base: str) -> bool:
         """Determines whether a model should be called via Google GenAI SDK."""

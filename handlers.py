@@ -53,7 +53,7 @@ HELP_MESSAGE = """🤖 <b>Pletykas Admin Commands</b>
 /spontaneous [on|off] - View or toggle periodic spontaneous messages
 /spontaneous_interval [min] [max] - Adjust random timer interval in hours (e.g. /spontaneous_interval 2 4)
 /spontaneous_now - Instantly trigger a spontaneous message or poll to the group
-/scheduled [list|cancel <id>] - View or cancel active scheduled replies and reminders
+/scheduled [list|cancel &lt;id&gt;] - View or cancel active scheduled replies and reminders
 <b>Prompt & Vision</b>
 /prompt - Upload system prompt text file as-is
 /prompt load - Expect a system prompt text file upload to validate and load

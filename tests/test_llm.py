@@ -42,7 +42,11 @@ def test_llm_client_initialization_and_genai_caching():
         # Second call returns cached instance
         c2 = client._get_genai_client("test-api-key")
         assert c2 == mock_instance
-        mock_client_cls.assert_called_once_with(api_key="test-api-key")
+        # google-genai >= 3.0 defaults to v1; beta-only fields (interactions
+        # response_modalities, thinking_level) require v1beta.
+        _, kwargs = mock_client_cls.call_args
+        assert kwargs["api_key"] == "test-api-key"
+        assert kwargs["http_options"].api_version == "v1beta"
 
 def test_thinking_level_instruction_and_config():
     from google.genai import types
