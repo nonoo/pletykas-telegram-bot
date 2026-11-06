@@ -87,6 +87,8 @@ Build and run using Podman or Docker:
 podman run -d --name pletykas-telegram-bot --env-file config.inc.sh pletykas-telegram-bot:latest
 ```
 
+> The container image builds from `python:3.15-slim`.
+
 ---
 
 ## Administrative Commands (Private Chat Only)
