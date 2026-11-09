@@ -1454,6 +1454,9 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         except ImageSafetyBlockedError:
             raise
         except Exception as e:
+            self._log_debug_payload(
+                f"IMAGE ERROR ({self.params.model_image_name})", f"{type(e).__name__}: {e}"
+            )
             if _IMAGE_SAFETY_BLOCK_RE.search(str(e)):
                 logger.warning("Image provider blocked generation for content policy: %s", e)
                 raise ImageSafetyBlockedError(str(e)) from e
@@ -1466,7 +1469,11 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
         img_base = self.params.effective_image_api_base
         img_size = self.params.model_image_size
 
-        is_gemini_image = "gemini" in img_name.lower() and "image" in img_name.lower()
+        # Family detection must not rely on the name containing "image": Gemini image
+        # aliases such as "gemini-nano-banana-2.1" do not, and would otherwise fall
+        # through to the Imagen-only edit_image/generate_images API (which rejects them).
+        img_family = img_name.lower().removeprefix("models/")
+        is_gemini_image = img_family.startswith("gemini")
         is_google_host = "generativelanguage.googleapis.com" in img_base
 
         # 1. Google Interactions API (REST when API base is set to Google, or native SDK when base is empty)
@@ -1639,6 +1646,10 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
                 self._log_debug_payload(f"IMAGE RESPONSE (GenAI Imagen SDK: {img_name})", "<image data received>")
                 return response.generated_images[0].image.image_bytes
             except Exception as e:
+                self._log_debug_payload(
+                    f"IMAGE ERROR (GenAI Imagen SDK: {img_name} edit_image)",
+                    f"{type(e).__name__}: {e}",
+                )
                 logger.warning("edit_image failed with model %s (%s). Falling back to generate_images...", img_name, e)
 
         # Fresh generation
@@ -1659,6 +1670,10 @@ In addition to your response and/or emoji reaction, you MUST include a detailed,
             return response.generated_images[0].image.image_bytes
         except Exception as e:
             if "image_size" in config_kwargs:
+                self._log_debug_payload(
+                    f"IMAGE ERROR (GenAI Imagen SDK: {img_name} generate_images image_size={img_size})",
+                    f"{type(e).__name__}: {e}",
+                )
                 logger.warning("generate_images with image_size=%s failed (%s). Retrying without image_size...", img_size, e)
                 del config_kwargs["image_size"]
                 response = await client.aio.models.generate_images(

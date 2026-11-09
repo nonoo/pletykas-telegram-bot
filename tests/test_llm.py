@@ -1106,6 +1106,57 @@ async def test_generate_image_gemini_interactions_sdk():
 
 
 @pytest.mark.asyncio
+async def test_generate_image_nano_banana_alias_routes_to_interactions():
+    """Gemini image aliases without the literal "image" in their name must not hit the Imagen API."""
+    import base64
+    p = Params()
+    p.model_image_name = "gemini-nano-banana-2.1"
+    p.model_image_api_base = ""
+    p.model_image_api_key = "img-key"
+    p.model_image_size = "1K"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+    mock_part = MagicMock()
+    mock_part.type = "image"
+    mock_part.data = base64.b64encode(b"nano-banana-bytes").decode("utf-8")
+    mock_step = MagicMock()
+    mock_step.type = "model_output"
+    mock_step.content = [mock_part]
+    mock_interaction = MagicMock()
+    mock_interaction.steps = [mock_step]
+
+    mock_genai_client = AsyncMock()
+    mock_genai_client.aio.interactions.create = AsyncMock(return_value=mock_interaction)
+
+    with patch.object(client, "_get_genai_client", return_value=mock_genai_client), patch.object(client, "_log_debug_payload"):
+        assert await client.generate_image("A tavern", base_image_bytes=b"src") == b"nano-banana-bytes"
+
+    mock_genai_client.aio.interactions.create.assert_awaited_once()
+    _, kwargs = mock_genai_client.aio.interactions.create.call_args
+    assert kwargs["model"] == "models/gemini-nano-banana-2.1"
+    assert mock_genai_client.aio.models.generate_images.await_count == 0
+    assert mock_genai_client.aio.models.edit_image.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_image_failure_logged_to_debug_log():
+    p = Params()
+    p.model_image_name = "gemini-nano-banana-2.1"
+    p.model_image_api_base = ""
+    p.model_image_api_key = "img-key"
+    client = LLMClient(p, StateManager("test.json"))
+    mock_genai_client = AsyncMock()
+    mock_genai_client.aio.interactions.create = AsyncMock(side_effect=RuntimeError("provider exploded"))
+
+    with patch.object(client, "_get_genai_client", return_value=mock_genai_client), patch.object(client, "_log_debug_payload") as mock_debug_log:
+        with pytest.raises(RuntimeError, match="provider exploded"):
+            await client.generate_image("a cat")
+
+    banners = [call.args[0] for call in mock_debug_log.call_args_list]
+    assert any("IMAGE ERROR (gemini-nano-banana-2.1)" in banner for banner in banners)
+
+
+@pytest.mark.asyncio
 async def test_generate_image_gemini_interactions_rest_debug_mode():
     p = Params()
     p.model_image_name = "gemini-3.1-flash-lite-image"
