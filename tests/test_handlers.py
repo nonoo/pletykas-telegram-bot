@@ -1057,6 +1057,160 @@ async def test_reply_chain_to_photo_attaches_image(test_setup):
 
 
 @pytest.mark.asyncio
+async def test_on_message_caches_replied_to_photo(test_setup):
+    """A reply must keep the replied-to photo even when it is outside the chat history window."""
+    p, s, m, llm, handlers = test_setup
+    s.set_spontaneous_settings(enabled=False)
+    garage_bytes = _tiny_png("red")
+
+    file_obj = MagicMock()
+
+    async def _download(buf):
+        buf.write(garage_bytes)
+
+    file_obj.download_to_memory = AsyncMock(side_effect=_download)
+
+    reply_target = MagicMock()
+    reply_target.message_id = 66814
+    reply_target.photo = [MagicMock(file_id="garage-file")]
+    reply_target.from_user.full_name = "Norbert \"Nonoo\" Varga"
+    reply_target.text = None
+
+    mock_msg = MagicMock()
+    mock_msg.message_id = 66843
+    mock_msg.from_user.id = 133687316
+    mock_msg.from_user.full_name = "Norbert \"Nonoo\" Varga"
+    mock_msg.text = "pletyi mutasd meg, hogy fog kinezni a garazsajto befalazva"
+    mock_msg.caption = None
+    mock_msg.photo = []
+    mock_msg.voice = None
+    mock_msg.audio = None
+    mock_msg.video = None
+    mock_msg.video_note = None
+    mock_msg.document = None
+    mock_msg.sticker = None
+    mock_msg.animation = None
+    mock_msg.reply_to_message = reply_target
+    mock_msg.entities = []
+    mock_msg.migrate_to_chat_id = None
+    mock_msg.date = None
+
+    mock_chat = MagicMock(id=p.group_chat_id, type="supergroup")
+    mock_update = MagicMock(effective_chat=mock_chat, effective_message=mock_msg, effective_user=mock_msg.from_user)
+
+    mock_context = MagicMock()
+    mock_context.bot.id = 9999
+    mock_context.bot.username = "pletykas_bot"
+    mock_context.bot.first_name = "Pletykas"
+    mock_context.bot.get_file = AsyncMock(return_value=file_obj)
+    mock_context.job_queue = None
+
+    with patch.object(handlers, "_execute_evaluation", AsyncMock()):
+        await handlers.on_message(mock_update, mock_context)
+        await asyncio.sleep(0)
+
+    cached = handlers._cached_photo_entry(66814)
+    assert cached is not None
+    assert cached["media_b64"]
+    # The photo is resolvable for an edit through the reply target ID.
+    assert handlers._find_photo_in_reply_chain(66814) == cached
+
+
+@pytest.mark.asyncio
+async def test_reply_to_evicted_photo_edits_that_photo_not_newest_generated_image(test_setup):
+    """Regression (log 2026-11-10): a reply to an old photo must edit that photo, not the
+    bot's most recent generated image, which used to be attached by the burst heuristic."""
+    p, s, m, llm, handlers = test_setup
+    garage_bytes = _tiny_png("red")
+    chicken_bytes = _tiny_png("blue")
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=66844))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=66845))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    # The bot's freshly generated image is the newest photo in history.
+    s.append_chat_message({
+        "id": 66842,
+        "from_user_id": 9999,
+        "from_user_name": "Pletykas",
+        "text": "[Generated Image: an evil chicken] A gonosz tyuk",
+        "media_type": "photo",
+        "media_b64": base64.b64encode(chicken_bytes).decode("utf-8"),
+        "reply_to_msg_id": 66841,
+    })
+    # The user replies to an older photo that has already been evicted from history.
+    s.append_chat_message({
+        "id": 66843,
+        "from_user_id": 133687316,
+        "from_user_name": "Norbert \"Nonoo\" Varga",
+        "text": "pletyi mutasd meg, hogy fog kinezni a garazsajto befalazva ket ablakkal meg kozepen egy ajtoval",
+        "media_type": "none",
+        "reply_to_msg_id": 66814,
+        "reply_to_user_name": "Norbert \"Nonoo\" Varga",
+    })
+    handlers._cache_reply_photo("66814", base64.b64encode(garage_bytes).decode("utf-8"))
+
+    vision_eval = (
+        None,
+        None,
+        {
+            "prompt": "garage door walled in with two windows and a door",
+            "caption": "Tessek, a garazsajto befalazva",
+            "source": "reply",
+            "mode": "modify",
+        },
+        "a garage door",
+        None,
+    )
+    with patch.object(llm, "describe_and_reply_image", AsyncMock(return_value=vision_eval)) as mock_vision, \
+         patch.object(llm, "generate_image", AsyncMock(return_value=out_bytes)) as mock_gen:
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=66843)
+
+    assert mock_vision.call_args.kwargs["image_bytes"] == garage_bytes
+    assert mock_gen.call_args.kwargs["base_image_bytes"] == garage_bytes
+
+
+@pytest.mark.asyncio
+async def test_unresolved_reply_does_not_attach_unrelated_photo(test_setup):
+    """When a reply target is not a photo, no other image may be guessed for the vision turn."""
+    p, s, m, llm, handlers = test_setup
+    out_bytes = _tiny_png("green")
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_photo = AsyncMock(return_value=MagicMock(message_id=900))
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=901))
+    mock_bot.send_chat_action = AsyncMock()
+    mock_context = MagicMock(bot=mock_bot)
+
+    s.append_chat_message(_photo_history_entry(700, "blue", "[Photo]"))
+    s.append_chat_message({
+        "id": 701,
+        "from_user_id": 1,
+        "from_user_name": "User",
+        "text": "make it darker",
+        "media_type": "none",
+        "reply_to_msg_id": 640,
+        "reply_to_user_name": "User",
+    })
+
+    with patch.object(llm, "describe_and_reply_image", AsyncMock()) as mock_vision, \
+         patch.object(llm, "evaluate_and_reply", AsyncMock(return_value=(None, None, None, None))) as mock_text, \
+         patch.object(handlers, "_recall_deep_memory", AsyncMock(return_value="")):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=701)
+
+    mock_vision.assert_not_awaited()
+    mock_text.assert_awaited_once()
+    mock_bot.send_photo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_image_source_id_used_when_mode_is_generate(test_setup):
     """Source: <id> alone (without Mode: modify) still loads the referenced image."""
     p, s, m, llm, handlers = test_setup

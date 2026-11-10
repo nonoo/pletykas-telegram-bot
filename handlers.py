@@ -149,6 +149,8 @@ REPEAT_FUZZY_MIN_CHARS = 8
 IMAGE_REFERENCE_KEYWORDS = (
     "kép", "kep", "fotó", "foto", "photo", "image", "picture", "rajz", "ábra", "abra",
 )
+# Number of replied-to photos kept so a reply can edit an image older than the chat history window.
+REPLY_PHOTO_CACHE_SIZE = 8
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
@@ -373,6 +375,8 @@ class BotHandlers:
         self.llm = llm
         self._debounce_jobs: Dict[int, Any] = {}
         self._active_evaluations: set[int] = set()
+        # Message ID (str) → base64 photo of the message a user replied to, oldest evicted first.
+        self._reply_photo_cache: Dict[str, str] = {}
         self._waiting_for_memory_upload: set[int] = set()
         self._waiting_for_prompt_upload: set[int] = set()
         self._waiting_for_deepmemory_upload: set[int] = set()
@@ -1480,6 +1484,51 @@ class BotHandlers:
             return "generate"
         return value or "generate"
 
+    def _cache_reply_photo(self, message_id: str, media_b64: str) -> None:
+        """Stores a replied-to photo, evicting the oldest entry once the cap is reached."""
+        key = str(message_id).strip()
+        if not key or not media_b64:
+            return
+        self._reply_photo_cache.pop(key, None)
+        self._reply_photo_cache[key] = media_b64
+        while len(self._reply_photo_cache) > REPLY_PHOTO_CACHE_SIZE:
+            self._reply_photo_cache.pop(next(iter(self._reply_photo_cache)), None)
+
+    async def _cache_replied_photo(self, context: ContextTypes.DEFAULT_TYPE, message: Any) -> None:
+        """Caches the photo of the message the user replied to.
+
+        Telegram ships the replied message inside the update, so this works even when the
+        original photo has already been evicted from the bounded chat history.
+        """
+        reply = getattr(message, "reply_to_message", None)
+        photos = getattr(reply, "photo", None) if reply is not None else None
+        if not photos:
+            return
+        key = str(getattr(reply, "message_id", "") or "").strip()
+        if not key or key in self._reply_photo_cache:
+            return
+        # Photos still inside the history window are already available with their bytes.
+        if any(
+            str(item.get("id")) == key and item.get("media_type") == "photo" and item.get("media_b64")
+            for item in self.state.get_chat_history()
+        ):
+            return
+        try:
+            file_obj = await context.bot.get_file(photos[-1].file_id)
+            buf = io.BytesIO()
+            await file_obj.download_to_memory(buf)
+            compressed = compress_image(buf.getvalue(), max_dim=1280, quality=85)
+            self._cache_reply_photo(key, base64.b64encode(compressed).decode("utf-8"))
+        except Exception as e:
+            logger.warning("Failed to download replied-to photo %s: %s", key, e)
+
+    def _cached_photo_entry(self, message_id: Any) -> Optional[Dict[str, Any]]:
+        """Returns the cached replied-to photo entry for this Telegram message ID, if any."""
+        b64 = self._reply_photo_cache.get(str(message_id or "").strip())
+        if not b64:
+            return None
+        return {"id": str(message_id).strip(), "media_type": "photo", "media_b64": b64, "text": "[Photo]"}
+
     def _find_photo_by_id(self, message_id: Any) -> Optional[Dict[str, Any]]:
         """Returns the stored photo message with this Telegram message ID, if it still has bytes."""
         target = str(message_id).strip()
@@ -1492,23 +1541,23 @@ class BotHandlers:
                 and item.get("media_b64")
             ):
                 return item
-        return None
+        return self._cached_photo_entry(target)
 
     def _find_photo_in_reply_chain(self, message_id: Any) -> Optional[Dict[str, Any]]:
         """Walks up to three reply hops to find the photo a reply chain points at."""
         history = self.state.get_chat_history()
-        current = message_id
+        current = str(message_id or "").strip()
         seen = set()
         for _ in range(4):
-            if current is None or current in seen:
+            if not current or current in seen:
                 break
             seen.add(current)
-            entry = next((item for item in history if item.get("id") == current), None)
+            entry = next((item for item in history if str(item.get("id")) == current), None)
             if entry is None:
-                break
+                return self._cached_photo_entry(current)
             if entry.get("media_type") == "photo" and entry.get("media_b64"):
                 return entry
-            current = entry.get("reply_to_msg_id")
+            current = str(entry.get("reply_to_msg_id") or "").strip()
         return None
 
     @staticmethod
@@ -1653,18 +1702,20 @@ class BotHandlers:
 
             # Check if this message or its context involves an image
             photo_entry = None
+            reply_target_id = trigger_entry.get("reply_to_msg_id") if trigger_entry else None
             # 1. The trigger message itself is a photo
             if trigger_entry and trigger_entry.get("media_type") == "photo" and trigger_entry.get("media_b64"):
                 photo_entry = trigger_entry
             # 2. The trigger message replies to an earlier photo (possibly through a text reply)
-            elif trigger_entry and trigger_entry.get("reply_to_msg_id"):
-                photo_entry = self._find_photo_in_reply_chain(trigger_entry.get("reply_to_msg_id"))
-            # 3. An un-described photo from the same recent burst (e.g. photo then instruction)
-            if not photo_entry and trigger_entry:
+            elif reply_target_id:
+                photo_entry = self._find_photo_in_reply_chain(reply_target_id)
+            # 3./4. Heuristics only for non-replies: a reply is an explicit pointer, so guessing
+            # another photo would edit the wrong image (e.g. the bot's own newest generated image
+            # instead of the replied-to photo that fell out of the history window).
+            if not photo_entry and trigger_entry and not reply_target_id:
                 photo_entry = self._select_uninterpreted_photo(trigger_entry)
-            # 4. The trigger text references an image; attach it only when the choice is unambiguous
-            if not photo_entry and trigger_entry:
-                photo_entry = self._select_reference_photo(trigger_entry)
+                if not photo_entry:
+                    photo_entry = self._select_reference_photo(trigger_entry)
 
             reply_text: Optional[str] = None
             reaction: Optional[Tuple[str, Optional[int]]] = None
@@ -2144,6 +2195,10 @@ class BotHandlers:
         if message.from_user and message.from_user.id == context.bot.id:
             return
 
+        # Keep the replied-to photo available for edits even after it falls out of the
+        # bounded chat history (Telegram includes it in the update of the reply).
+        if not message.photo:
+            await self._cache_replied_photo(context, message)
 
         # Ingest media and text
         media_type = "none"
