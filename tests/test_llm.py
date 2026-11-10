@@ -275,6 +275,23 @@ def test_extract_image_description_tolerates_model_drift():
     assert cleaned == ""
     assert desc == "A dog"
 
+    # Production case: documented English block plus a translated duplicate wrapped as <IMAGE:...>
+    cleaned, desc = client._extract_image_description(
+        "<IMAGE_DESCRIPTION>\nA white airliner nose with peeled paint.\n</IMAGE_DESCRIPTION>\n"
+        '<IMAGE:Fotó egy repülőgép orr-részéről.</IMAGE>'
+    )
+    assert cleaned == ""
+    assert desc == "A white airliner nose with peeled paint."
+
+    # Tag-name drift only: the drifted block still counts as the description
+    cleaned, desc = client._extract_image_description("<IMAGE:Fotó egy repülőgép></IMAGE>")
+    assert cleaned == ""
+    assert desc == "Fotó egy repülőgép"
+
+    cleaned, desc = client._extract_image_description("<IMAGE>\nA red bicycle\n</IMAGE>")
+    assert cleaned == ""
+    assert desc == "A red bicycle"
+
 
 def test_sanitize_reply_text_strips_leftover_protocol_markup():
     assert sanitize_reply_text("<NO_REPLY>") == ""
@@ -285,6 +302,14 @@ def test_sanitize_reply_text_strips_leftover_protocol_markup():
     assert sanitize_reply_text("<WEB_SEARCH:weather budapest>") == ""
     assert sanitize_reply_text("<GENERATE_IMAGE>\nPrompt: x\nCaption: y\n</GENERATE_IMAGE>") == ""
     assert sanitize_reply_text("Szia! <SCHEDULE:cancel:sched_1>") == "Szia!"
+    # Drifted description tags must never reach the group as visible text either
+    assert sanitize_reply_text('<IMAGE:Fotó egy repülőgép orr-részéről></IMAGE>') == ""
+    assert sanitize_reply_text("<IMAGE>a red bicycle</IMAGE> Szia!") == "Szia!"
+    assert sanitize_reply_text("Szia!\n<IMAGE:leírás>") == "Szia!"
+    assert sanitize_reply_text("<IMAGE_DESCRIPTION: leírás>") == ""
+    assert sanitize_reply_text("Szia! <IMAGE-DESCRIPTION>") == "Szia!"
+    # Plain comparisons are not protocol markup
+    assert sanitize_reply_text("Ha x < y, akkor kisebb.") == "Ha x < y, akkor kisebb."
     # Transcript annotations keep their text but lose the marker
     assert sanitize_reply_text("[Generated Image: A portrait of a couple] Szia!") == "Szia!"
     assert sanitize_reply_text("[Photo: two guys on a plane] De jó kép!") == "De jó kép!"
@@ -383,6 +408,35 @@ async def test_describe_and_reply_image_no_reply_with_unclosed_description():
         )
     assert text is None
     assert desc == "A studio product photo of a vintage late-1990s Alcatel mobile phone."
+
+
+@pytest.mark.asyncio
+async def test_describe_and_reply_image_ignores_duplicate_drifted_description():
+    """Regression: the model returned the documented English block plus a Hungarian duplicate
+    wrapped as <IMAGE:...></IMAGE>; the duplicate was dispatched to the group as plain text."""
+    p = Params()
+    p.model_name = "small-model"
+    p.model_large_name = "large-model"
+    s = StateManager("test.json")
+    client = LLMClient(p, s)
+
+    raw = (
+        "<IMAGE_DESCRIPTION>\nA white airliner nose with peeled paint.\n</IMAGE_DESCRIPTION>\n"
+        '<IMAGE:Fotó egy repülőgép orr-részéről, ahol a festés rétegei leváltak.</IMAGE>'
+    )
+    with patch.object(client, "_call_vision_model", AsyncMock(return_value=(raw, 50, 10))):
+        text, reaction, img_spec, desc, sched_spec = await client.describe_and_reply_image(
+            system_prompt="sys",
+            memory_context="mem",
+            transcript="trans",
+            bot_username="pletykas_bot",
+            is_direct_trigger=False,
+            talkativeness=5,
+            image_bytes=b"fake-image-bytes",
+            caption="",
+        )
+    assert text is None
+    assert desc == "A white airliner nose with peeled paint."
 
 
 @pytest.mark.asyncio

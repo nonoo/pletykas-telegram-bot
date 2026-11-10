@@ -42,6 +42,20 @@ _IMAGE_DESCRIPTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tag-name drift for the same description block: models sometimes label it "<IMAGE:...>" or
+# "<IMAGE>...</IMAGE>" instead of the documented tag. Such a block is model metadata too, so it is
+# stripped from every dispatch, and used as the description when no documented block is present.
+_IMAGE_INLINE_DRIFT_RE = re.compile(
+    r"<IMAGE[\s_]*(?:DESC(?:RIPTION)?)?\s*:\s*([\s\S]*?)\s*>?(?:</IMAGE(?:_DESCRIPTION)?\s*>|\Z)",
+    re.IGNORECASE,
+)
+_IMAGE_BLOCK_DRIFT_RE = re.compile(
+    r"<IMAGE\s*>([\s\S]*?)(?:</IMAGE\s*>|\Z)|</IMAGE(?:_DESCRIPTION)?\s*>",
+    re.IGNORECASE,
+)
+# Final net for any other IMAGE-family remnant (unknown suffix, stray closing tag).
+_STRAY_IMAGE_TAG_RE = re.compile(r"</?IMAGE[^<>]*>", re.IGNORECASE)
+
 # Transcript annotation dialect: the bot's own history notes its past generations as
 # "[Generated Image: <prompt>] <caption>", and models sometimes imitate that note as their reply
 # instead of emitting a <GENERATE_IMAGE> block. Such a note is read as "send this image".
@@ -82,6 +96,9 @@ def sanitize_reply_text(text: str) -> str:
     if not text:
         return text
     cleaned = _IMAGE_DESCRIPTION_RE.sub("", text)
+    cleaned = _IMAGE_INLINE_DRIFT_RE.sub("", cleaned)
+    cleaned = _IMAGE_BLOCK_DRIFT_RE.sub("", cleaned)
+    cleaned = _STRAY_IMAGE_TAG_RE.sub("", cleaned)
     cleaned = _WEB_TOOL_TAG_RE.sub("", cleaned)
     cleaned = _LEFTOVER_BLOCK_RE.sub("", cleaned)
     cleaned = _IMAGE_ANNOTATION_RE.sub("", cleaned)
@@ -759,14 +776,25 @@ class LLMClient:
     def _extract_image_description(self, text: str) -> Tuple[str, str]:
         """Extracts <IMAGE_DESCRIPTION>...</IMAGE_DESCRIPTION> and strips it from text.
 
-        Tolerant of model formatting drift (tag case, stray whitespace, missing closing tag),
-        so a malformed block can never survive into the dispatched reply text.
+        Tolerant of model formatting drift (tag case, stray whitespace, missing closing tag, a
+        drifted "<IMAGE:...>"/"<IMAGE>...</IMAGE>" tag name), so a malformed block can never
+        survive into the dispatched reply text.
         """
+        desc = ""
         match = _IMAGE_DESCRIPTION_RE.search(text)
-        if not match:
-            return text.strip(), ""
-        desc, _ = strip_decision_tags(match.group(1))
-        return _IMAGE_DESCRIPTION_RE.sub("", text).strip(), desc
+        if match:
+            desc, _ = strip_decision_tags(match.group(1))
+            text = _IMAGE_DESCRIPTION_RE.sub("", text)
+        else:
+            inline = _IMAGE_INLINE_DRIFT_RE.search(text)
+            drifted = _IMAGE_BLOCK_DRIFT_RE.search(text)
+            if inline:
+                desc, _ = strip_decision_tags(inline.group(1))
+            elif drifted and drifted.group(1):
+                desc, _ = strip_decision_tags(drifted.group(1))
+        text = _IMAGE_INLINE_DRIFT_RE.sub("", text)
+        text = _IMAGE_BLOCK_DRIFT_RE.sub("", text)
+        return text.strip(), desc
 
     def _extract_schedule(self, text: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Extracts <SCHEDULE:oneshot>...</SCHEDULE:oneshot>, <SCHEDULE:periodic>...</SCHEDULE:periodic>,
@@ -1098,10 +1126,11 @@ The attached image is the image the user is talking about in this turn. If the u
 {instructions}
 
 [Special Image Requirement]
-In addition to your response and/or emoji reaction, you MUST include a detailed, objective visual description of this photo enclosed in:
+In addition to your response and/or emoji reaction, you MUST include exactly ONE detailed, objective visual description of this photo, written in English, enclosed in:
 <IMAGE_DESCRIPTION>
 (detailed objective description of image subjects, setting, mood, colors, and key details)
-</IMAGE_DESCRIPTION>"""
+</IMAGE_DESCRIPTION>
+This block is internal metadata for later turns and is NEVER shown to the group, so do NOT translate it into the chat language and do NOT repeat or duplicate it as chat text, with or without another tag (such as <IMAGE> or <IMAGE:...>)."""
 
     async def evaluate_and_reply(
         self,
