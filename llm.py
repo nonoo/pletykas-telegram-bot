@@ -64,6 +64,23 @@ _IMAGE_ANNOTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Model-native tool-call markup (DeepSeek "DSML" tokens, e.g. "<｜｜DSML｜｜tool_calls> ..."). The bot
+# exposes no tools to the model, so such a block is a generation artifact and must never reach the
+# group as visible text. Tokens are matched loosely because providers re-encode the special-token
+# bars ("tool▁calls", "tool_calls", a separate "DSML" marker); a missing closing tag swallows the
+# rest of the reply, mirroring the <GENERATE_IMAGE> rule.
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<(?=[^<>]*[｜|])[^<>]*?\btool[_\s▁]?calls\b[^<>]*>"
+    r"[\s\S]*?"
+    r"(?:<(?=[^<>]*[｜|])[^<>]*?\btool[_\s▁]?calls\b[^<>]*>|\Z)",
+    re.IGNORECASE,
+)
+# Any stray tool-call token left outside a matched block (<｜｜｜｜parameter ...>, </｜｜｜｜invoke>).
+_TOOL_CALL_TOKEN_RE = re.compile(
+    r"<(?=[^<>]*[｜|])[^<>]*?\b(?:tool[_\s▁]?calls|function[_\s]?calls|invoke|parameter)\b[^<>]*>",
+    re.IGNORECASE,
+)
+
 # Multi-line protocol blocks whose extractors run before dispatch: a parse miss must never leak them.
 # <POLL> and <FORGET> are excluded on purpose - their blocks are extracted later, in the dispatch pipeline.
 _LEFTOVER_BLOCK_RE = re.compile(
@@ -100,6 +117,8 @@ def sanitize_reply_text(text: str) -> str:
     cleaned = _IMAGE_BLOCK_DRIFT_RE.sub("", cleaned)
     cleaned = _STRAY_IMAGE_TAG_RE.sub("", cleaned)
     cleaned = _WEB_TOOL_TAG_RE.sub("", cleaned)
+    cleaned = _TOOL_CALL_BLOCK_RE.sub("", cleaned)
+    cleaned = _TOOL_CALL_TOKEN_RE.sub("", cleaned)
     cleaned = _LEFTOVER_BLOCK_RE.sub("", cleaned)
     cleaned = _IMAGE_ANNOTATION_RE.sub("", cleaned)
     cleaned = re.sub(r"\[(?:Photo|Poll|Voice message)[^\]]*\]", "", cleaned)

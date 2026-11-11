@@ -318,6 +318,26 @@ def test_sanitize_reply_text_strips_leftover_protocol_markup():
     assert "<POLL>" in sanitize_reply_text(poll)
 
 
+def test_sanitize_reply_text_strips_model_tool_call_markup():
+    """Production case: DeepSeek emitted DSML tool-call tokens as plain content and the block was
+    dispatched to the group verbatim. A reply consisting only of such a block is not a message."""
+    dsml = (
+        "<｜｜DSML｜｜tool_calls>\n"
+        '<｜｜｜DSML｜｜｜invoke name="Bash">\n'
+        '<｜｜｜｜DSML｜｜｜parameter name="command" string="true">echo "placeholder"</｜｜｜｜parameter>\n'
+        "</｜｜｜｜invoke>\n"
+        "</｜｜｜｜/｜｜DSML｜｜tool_calls>"
+    )
+    assert sanitize_reply_text(dsml) == ""
+    assert sanitize_reply_text(f"Szia! {dsml}") == "Szia!"
+    # Missing closing tag swallows the rest, mirroring a malformed <GENERATE_IMAGE> block
+    assert sanitize_reply_text("<｜tool▁calls｜>\n<｜｜tool▁calls｜>") == ""
+    # Stray tokens outside a matched block
+    assert sanitize_reply_text("Hello <｜｜｜｜invoke> world") == "Hello  world"
+    # Ordinary text with pipes/comparisons is untouched
+    assert sanitize_reply_text("a <| b | c") == "a <| b | c"
+
+
 def test_extract_generate_image_annotation_dialect():
     """The bot's own history note was imitated as a reply; it must become a real image request."""
     p = Params()
