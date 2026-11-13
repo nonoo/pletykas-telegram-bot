@@ -177,6 +177,21 @@ def is_repeated_message(previous_text: str, candidate_text: str) -> bool:
     return matcher.ratio() >= REPEAT_SIMILARITY_THRESHOLD
 
 
+def _is_model_timeout(exc: BaseException) -> bool:
+    """True when an exception represents a model/provider request timeout.
+
+    Covers asyncio.TimeoutError raised by the aiohttp chat path, *Timeout*
+    exception class names (httpx / Google GenAI SDK), and SDK-wrapped errors
+    whose message mentions a timeout.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if "timeout" in type(exc).__name__.lower():
+        return True
+    msg = str(exc).lower()
+    return "timed out" in msg or "timeout" in msg
+
+
 INTERVAL_UNIT_MAP = {
     "y": "years", "yr": "years", "yrs": "years", "year": "years", "years": "years",
     "mo": "months", "month": "months", "months": "months",
@@ -1720,35 +1735,38 @@ class BotHandlers:
             reply_text: Optional[str] = None
             reaction: Optional[Tuple[str, Optional[int]]] = None
             image_spec: Optional[Dict[str, str]] = None
+            img_desc = ""
             schedule_spec: Optional[Dict[str, Any]] = None
 
-            if photo_entry:
-                # Multimodal evaluation via Vision Model
-                photo_bytes = base64.b64decode(photo_entry["media_b64"])
-                user_caption = trigger_entry.get("text", "").replace("[Photo]", "").strip() if trigger_entry else ""
-                reply_text, reaction, image_spec, img_desc, schedule_spec = await self.llm.describe_and_reply_image(
-                    system_prompt=sys_prompt,
-                    memory_context=memory_ctx,
-                    transcript=transcript,
-                    bot_username=bot_username,
-                    is_direct_trigger=is_direct_trigger,
-                    talkativeness=talkativeness,
-                    image_bytes=photo_bytes,
-                    caption=user_caption,
-                )
-                # Enrich photo entry with visual description if not already enriched
-                if img_desc and ("[Photo: " not in photo_entry.get("text", "")):
-                    clean_caption = photo_entry.get("text", "").replace("[Photo]", "").strip()
-                    photo_entry["text"] = f"[Photo: {img_desc}] {clean_caption}".strip()
-                    self.state.save()
-            else:
+            async def _invoke_llm() -> Tuple[
+                Optional[str],
+                Optional[Tuple[str, Optional[int]]],
+                Optional[Dict[str, str]],
+                str,
+                Optional[Dict[str, Any]],
+            ]:
+                """Runs the evaluation model call; returns (text, reaction, image_spec, img_desc, schedule_spec)."""
+                if photo_entry:
+                    # Multimodal evaluation via Vision Model
+                    photo_bytes = base64.b64decode(photo_entry["media_b64"])
+                    user_caption = trigger_entry.get("text", "").replace("[Photo]", "").strip() if trigger_entry else ""
+                    return await self.llm.describe_and_reply_image(
+                        system_prompt=sys_prompt,
+                        memory_context=memory_ctx,
+                        transcript=transcript,
+                        bot_username=bot_username,
+                        is_direct_trigger=is_direct_trigger,
+                        talkativeness=talkativeness,
+                        image_bytes=photo_bytes,
+                        caption=user_caption,
+                    )
                 # Standard conversational evaluation
                 recall_query = self._build_recall_query(trigger_entry)
                 recalled = await self._recall_deep_memory(recall_query)
                 branch_memory_ctx = memory_ctx
                 if recalled:
                     branch_memory_ctx = f"{memory_ctx}\n\n{recalled}" if memory_ctx else recalled
-                reply_text, reaction, image_spec, schedule_spec = await self.llm.evaluate_and_reply(
+                text, rxn, img, sched = await self.llm.evaluate_and_reply(
                     system_prompt=sys_prompt,
                     memory_context=branch_memory_ctx,
                     transcript=transcript,
@@ -1756,6 +1774,23 @@ class BotHandlers:
                     is_direct_trigger=is_direct_trigger,
                     talkativeness=talkativeness,
                 )
+                return text, rxn, img, "", sched
+
+            try:
+                reply_text, reaction, image_spec, img_desc, schedule_spec = await _invoke_llm()
+            except Exception as e:
+                if not _is_model_timeout(e):
+                    raise
+                # Transient provider slowdown: retry the model call once before
+                # the error fallback apologizes to the group.
+                logger.warning("Model evaluation timed out (%s); retrying once", e)
+                reply_text, reaction, image_spec, img_desc, schedule_spec = await _invoke_llm()
+
+            # Enrich photo entry with visual description if not already enriched
+            if photo_entry and img_desc and ("[Photo: " not in photo_entry.get("text", "")):
+                clean_caption = photo_entry.get("text", "").replace("[Photo]", "").strip()
+                photo_entry["text"] = f"[Photo: {img_desc}] {clean_caption}".strip()
+                self.state.save()
 
             # Backstop: leftover protocol markup (e.g. a malformed <IMAGE_DESCRIPTION> block or a
             # stray <NO_REPLY>) must never reach the group as visible text.

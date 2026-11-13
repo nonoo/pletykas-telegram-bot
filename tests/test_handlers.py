@@ -586,6 +586,67 @@ async def test_reaction_dispatch_and_error_handling(test_setup):
 
 
 @pytest.mark.asyncio
+async def test_evaluation_retries_once_on_model_timeout(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=2001))
+    mock_context = MagicMock(bot=mock_bot)
+
+    eval_res = ("Hello there!", None, None, None)
+    mock_eval = AsyncMock(side_effect=[asyncio.TimeoutError("request timed out"), eval_res])
+    with patch.object(llm, "evaluate_and_reply", mock_eval):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+
+    # First attempt timed out, retry succeeded: the real reply was delivered, not the fallback
+    assert mock_eval.await_count == 2
+    assert mock_bot.send_message.call_args.kwargs["text"] == "Hello there!"
+
+
+@pytest.mark.asyncio
+async def test_evaluation_fallback_sent_after_second_timeout(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=2001))
+    mock_context = MagicMock(bot=mock_bot)
+
+    mock_eval = AsyncMock(side_effect=[asyncio.TimeoutError(), asyncio.TimeoutError()])
+    with patch.object(llm, "evaluate_and_reply", mock_eval):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+
+    # Retried once, still timed out: exactly one message, the error fallback, replying to the trigger
+    assert mock_eval.await_count == 2
+    assert mock_bot.send_message.await_count == 1
+    assert "tangled up" in mock_bot.send_message.call_args.kwargs["text"]
+    assert mock_bot.send_message.call_args.kwargs["reply_to_message_id"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_evaluation_no_retry_on_non_timeout_error(test_setup):
+    p, s, m, llm, handlers = test_setup
+
+    mock_bot = MagicMock()
+    mock_bot.id = 9999
+    mock_bot.first_name = "Pletykas"
+    mock_bot.send_message = AsyncMock(return_value=MagicMock(message_id=2001))
+    mock_context = MagicMock(bot=mock_bot)
+
+    mock_eval = AsyncMock(side_effect=RuntimeError("OpenAI compatible API error 500: upstream boom"))
+    with patch.object(llm, "evaluate_and_reply", mock_eval):
+        await handlers._execute_evaluation(mock_context, p.group_chat_id, is_direct_trigger=True, trigger_msg_id=1234)
+
+    # Only timeouts are retried; a provider 5xx goes straight to the fallback
+    assert mock_eval.await_count == 1
+    assert mock_bot.send_message.await_count == 1
+    assert "tangled up" in mock_bot.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
 async def test_trigger_spontaneous_message_errors(test_setup):
     p, s, m, llm, handlers = test_setup
     mock_context = MagicMock()
