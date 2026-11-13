@@ -2100,7 +2100,7 @@ class BotHandlers:
                 )
         except Exception as e:
             logger.error("Error during evaluation execution: %s", e, exc_info=True)
-            fallback_text = "sorry, got a bit tangled up in my thoughts... I'll be right back! 💫"
+            fallback_text = "Sorry, got a bit tangled up in my thoughts... I'll be right back! 💫"
             if is_direct_trigger and not self._suppress_repeated_reply(fallback_text, context):
                 try:
                     sent_err = await context.bot.send_message(
